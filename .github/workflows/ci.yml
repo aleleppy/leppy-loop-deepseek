@@ -19,12 +19,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.1
+          run_install: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22.19.0
           cache: pnpm
-      - run: corepack enable
-      - run: corepack prepare pnpm@10.28.1 --activate
       - run: pnpm install --frozen-lockfile
       - run: pnpm gate
 
@@ -33,12 +35,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.1
+          run_install: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: pnpm
-      - run: corepack enable
-      - run: corepack prepare pnpm@10.28.1 --activate
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test:smoke
