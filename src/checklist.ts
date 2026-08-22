@@ -4,6 +4,7 @@ import type {
   ChecklistLintOptions, ChecklistMark, ChecklistTask, LintDiagnostic,
   ModelCapability, ParsedChecklist, TaskKind, TaskMetadata,
 } from './types.js'
+import { physicalRelative } from './path.js'
 
 const CHECKBOX = /^(\s*[-*+]\s+\[)([ x?~])(\]\s+)(.*)$/i
 const PHASE = /^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/
@@ -128,9 +129,7 @@ function canonicalInside(repoRoot: string, candidate: string): boolean {
   }
   const existingReal = realpathSync(current)
   const suffix = relative(current, absolute)
-  const resolvedReal = resolve(existingReal, suffix)
-  const rel = relative(rootReal, resolvedReal)
-  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
+  return physicalRelative(rootReal, existingReal) !== undefined && !isAbsolute(suffix) && suffix !== '..' && !suffix.startsWith(`..${sep}`)
 }
 
 export function lintChecklist(parsed: ParsedChecklist, options: ChecklistLintOptions = {}): LintDiagnostic[] {
