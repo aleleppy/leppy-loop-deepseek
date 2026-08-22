@@ -11,7 +11,7 @@ const require = createRequire(import.meta.url)
 const dshPackage = require.resolve('@deepseek-ai/dsh/package.json')
 const dshManifest = JSON.parse(readFileSync(dshPackage, 'utf8'))
 const dshBin = resolve(dshPackage, '..', dshManifest.bin.dsh)
-const pnpmPackage = require.resolve('pnpm/package.json')
+const pnpmPackage = require.resolve('pnpm')
 const pnpmManifest = JSON.parse(readFileSync(pnpmPackage, 'utf8'))
 const pnpmBin = resolve(pnpmPackage, '..', pnpmManifest.bin.pnpm)
 
