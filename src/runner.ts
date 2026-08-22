@@ -45,6 +45,17 @@ interface RunState {
 function digest(text: string): string { return createHash('sha256').update(text).digest('hex') }
 function safeSlug(value: string): string { return value.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'default' }
 function inside(root: string, path: string): boolean { const rel = relative(root, path); return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel)) }
+function physicallyInside(root: string, candidate: string): boolean {
+  const rootIdentity = statSync(root, { bigint: true })
+  let current = statSync(candidate).isDirectory() ? candidate : dirname(candidate)
+  while (true) {
+    const identity = statSync(current, { bigint: true })
+    if (identity.dev === rootIdentity.dev && identity.ino === rootIdentity.ino) return true
+    const parent = dirname(current)
+    if (parent === current) return false
+    current = parent
+  }
+}
 
 function event(runId: string, type: RunEventType, phase: RunEvent['phase'], data: Record<string, unknown>, task?: ChecklistTask, attempt?: number): RunEvent {
   return { schemaVersion: 1, type, runId, timestamp: new Date().toISOString(), phase, ...(task ? { taskIndex: task.index } : {}), ...(attempt ? { attempt } : {}), data }
@@ -150,7 +161,7 @@ export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDep
   const runId = dependencies.runId?.() ?? randomUUID().replaceAll('-', '').slice(0, 12)
   const tasksAbsolute = realpathSync(resolve(options.tasks))
   const repoRoot = realpathSync(options.repoRoot ?? await resolveRepoRoot(dirname(tasksAbsolute)))
-  if (!inside(repoRoot, tasksAbsolute)) throw new Error('--tasks must be inside the source repository')
+  if (!physicallyInside(repoRoot, tasksAbsolute)) throw new Error('--tasks must be inside the source repository')
   const checklistRelative = relative(repoRoot, tasksAbsolute)
   await assertSourceReady(repoRoot, checklistRelative)
   const fallbackSelection = dependencies.defaultModel ? await dependencies.defaultModel() : { provider: options.provider, model: options.model ?? 'deepseek-v4-flash', ...(options.effort ? { effort: options.effort } : {}) }
