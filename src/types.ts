@@ -1,0 +1,137 @@
+export const RUN_EVENT_TYPES = [
+  'run-start', 'start', 'done', 'recovery-start', 'recovery-done',
+  'gate-start', 'gate-end', 'stall', 'timeout', 'gate-failed', 'run-end',
+] as const
+
+export type RunEventType = typeof RUN_EVENT_TYPES[number]
+export type Phase = 'setup' | 'worker' | 'closure' | 'gate' | 'recovery' | 'complete'
+export type TaskKind = 'task' | 'closure' | 'gate'
+export type ChecklistMark = ' ' | 'x' | '?' | '~'
+
+export interface TaskMetadata {
+  done?: string
+  paths: string[]
+  model?: string
+  effort?: string
+  gate?: string
+}
+
+export interface ChecklistTask {
+  index: number
+  line: number
+  phase: string
+  mark: ChecklistMark
+  kind: TaskKind
+  text: string
+  raw: string
+  metadata: TaskMetadata
+}
+
+export interface ParsedChecklist {
+  path: string
+  source: string
+  lines: string[]
+  tasks: ChecklistTask[]
+}
+
+export interface LintDiagnostic {
+  severity: 'error' | 'warning'
+  code: string
+  message: string
+  line?: number
+}
+
+export interface ModelCapability {
+  id: string
+  reasoningEfforts?: readonly string[]
+}
+
+export interface ChecklistLintOptions {
+  repoRoot?: string
+  controllerPath?: string
+  models?: readonly ModelCapability[]
+  provider?: string
+  defaultModel?: string
+  defaultEffort?: string
+  phaseGateCommand?: string
+}
+
+export interface LeppyLoopOptions {
+  tasks: string
+  syncBranch: string
+  phaseGateCommand?: string
+  dryRun?: boolean
+  maxIterations?: number
+  taskMatch?: string
+  recoverExistingWip?: boolean
+  syncMaxSeconds?: number
+  workerTimeoutMs?: number
+  workerOutputLimitBytes?: number
+  workerTranscriptLimitBytes?: number
+  artifactsDir?: string
+  provider?: string
+  model?: string
+  effort?: string
+  fallbackModel?: string
+  fetch?: boolean
+  repoRoot?: string
+}
+
+export interface RunEvent<T = Record<string, unknown>> {
+  schemaVersion: 1
+  type: RunEventType
+  runId: string
+  timestamp: string
+  phase: Phase
+  taskIndex?: number
+  attempt?: number
+  data: T
+}
+
+export interface RunResult {
+  runId: string
+  status: 'completed' | 'dry-run' | 'stalled' | 'failed' | 'interrupted'
+  branch?: string
+  worktree?: string
+  stateDir?: string
+  completedTasks: number
+  currentTask?: number
+  diagnostics: LintDiagnostic[]
+}
+
+export interface WorkerRequest {
+  runId: string
+  task: ChecklistTask
+  attempt: number
+  worktree: string
+  checklistPath: string
+  allowedPaths: string[]
+  model: string
+  effort?: string
+  provider: string
+  timeoutMs: number
+  outputLimitBytes: number
+  transcriptLimitBytes: number
+  stateDir: string
+  gateFingerprint?: string
+  instructions: string[]
+}
+
+export interface WorkerOutcome {
+  status: 'completed' | 'timeout' | 'output-limit' | 'transcript-limit' | 'unavailable' | 'failed' | 'interrupted'
+  output: string
+  transcriptPath?: string
+  error?: string
+}
+
+export interface WorkerAdapter {
+  run(request: WorkerRequest, signal: AbortSignal): Promise<WorkerOutcome>
+}
+
+export interface RunDependencies {
+  worker?: WorkerAdapter
+  now?: () => Date
+  runId?: () => string
+  modelCatalog?: (provider: string) => Promise<ModelCapability[]>
+  defaultModel?: () => Promise<{ provider: string; model: string; effort?: string }>
+}
