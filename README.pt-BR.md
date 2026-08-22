@@ -8,7 +8,7 @@ A versão `0.1.0` é fixada no DeepSeek Harness `0.1.1-rc.2`, commit [`b150a551b
 
 ## Instalação
 
-Requer Node `22.19+` e Git. Configure `DEEPSEEK_API_KEY` no serviço de credenciais do Harness:
+Requer Node `22.19+`, Git e pnpm `10.28.1`. O DeepSeek Harness repassa a gestão de plugins ao `pnpm` encontrado no `PATH`; pnpm 11 exige uma aprovação separada de builds nativos e não é uma combinação de instalação afirmada para `0.1.0`. Configure `DEEPSEEK_API_KEY` no serviço de credenciais do Harness:
 
 ```sh
 npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile leppy-loop add https://github.com/aleleppy/leppy-loop-deepseek/releases/download/v0.1.0/leppy-loop-deepseek-0.1.0.tgz
