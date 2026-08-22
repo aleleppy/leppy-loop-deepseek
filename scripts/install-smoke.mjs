@@ -11,16 +11,12 @@ const require = createRequire(import.meta.url)
 const dshPackage = require.resolve('@deepseek-ai/dsh/package.json')
 const dshManifest = JSON.parse(readFileSync(dshPackage, 'utf8'))
 const dshBin = resolve(dshPackage, '..', dshManifest.bin.dsh)
-
-function windowsQuote(value) {
-  if (/^[A-Za-z0-9_@:.\\/=-]+$/.test(value)) return value
-  return `"${value.replaceAll('"', '""').replaceAll('%', '%%')}"`
-}
+const pnpmPackage = require.resolve('pnpm/package.json')
+const pnpmManifest = JSON.parse(readFileSync(pnpmPackage, 'utf8'))
+const pnpmBin = resolve(pnpmPackage, '..', pnpmManifest.bin.pnpm)
 
 function run(command, args, env = process.env) {
-  const result = process.platform === 'win32' && command !== process.execPath
-    ? spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', [command, ...args.map(windowsQuote)].join(' ')], { cwd: project, env, encoding: 'utf8', windowsHide: true })
-    : spawnSync(command, args, { cwd: project, env, encoding: 'utf8' })
+  const result = spawnSync(command, args, { cwd: project, env, encoding: 'utf8', windowsHide: true })
   if (result.status !== 0) throw new Error(`${command} failed (${result.status ?? 'spawn'}):\n${result.stdout ?? ''}\n${result.stderr ?? ''}`)
   return result.stdout ?? ''
 }
@@ -29,7 +25,7 @@ const requestedSpec = process.env.LEPPY_INSTALL_SPEC
 let installSpec = requestedSpec
 let installedLabel = requestedSpec
 if (!installSpec) {
-  run('npm', ['pack', '--silent', '--pack-destination', scratch])
+  run(process.execPath, [pnpmBin, 'pack', '--pack-destination', scratch])
   const tarballs = readdirSync(scratch).filter(name => name.endsWith('.tgz'))
   if (tarballs.length !== 1) throw new Error(`expected one tarball, found ${tarballs.length}`)
   installSpec = join(scratch, tarballs[0])
