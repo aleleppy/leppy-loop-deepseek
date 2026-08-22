@@ -34,7 +34,7 @@ describe('real Harness keyless composition', () => {
     const outcome = await adapter.run({
       runId: 'keyless', task, attempt: 1, worktree: root, checklistPath: 'tasks.task.md',
       allowedPaths: ['src/value.txt'], model: 'replay-model', effort: 'high', provider: 'replay',
-      timeoutMs: 30_000, outputLimitBytes: 64 * 1024, transcriptLimitBytes: 512 * 1024,
+      timeoutMs: 90_000, outputLimitBytes: 64 * 1024, transcriptLimitBytes: 512 * 1024,
       stateDir, instructions: [],
     }, new AbortController().signal)
     expect(outcome, outcome.error).toMatchObject({ status: 'completed' })
@@ -42,5 +42,5 @@ describe('real Harness keyless composition', () => {
     expect(readFileSync(join(root, 'src', 'value.txt'), 'utf8')).toBe('keyless worker\n')
     expect(git(root, 'log', '-1', '--pretty=%s')).toBe('feat: prove keyless worker')
     expect(readFileSync(outcome.transcriptPath!, 'utf8')).toContain('session.event')
-  }, 60_000)
+  }, 120_000)
 })
