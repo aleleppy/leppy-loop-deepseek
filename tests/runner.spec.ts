@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -87,5 +87,14 @@ describe('controller state machine', () => {
     expect(result.status).toBe('dry-run')
     expect(result.currentTask).toBe(1)
     expect(worker.calls).toHaveLength(0)
+  })
+
+  it('canonicalizes a symlinked repository path before containment checks', async () => {
+    const repo = repository('- [ ] Alpha `src/value.txt` | Done: alpha\n')
+    const alias = `${repo.root}-alias`
+    symlinkSync(repo.root, alias, process.platform === 'win32' ? 'junction' : 'dir')
+    const result = await runLeppyLoop({ tasks: join(alias, 'tasks.task.md'), syncBranch: 'main', fetch: false, dryRun: true }, modelDeps)
+    expect(result.status).toBe('dry-run')
+    expect(result.currentTask).toBe(0)
   })
 })

@@ -148,7 +148,7 @@ function dryRunResult(runId: string, task: ChecklistTask | undefined, diagnostic
 export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDependencies = {}): Promise<RunResult> {
   const options = { ...DEFAULTS, ...input }
   const runId = dependencies.runId?.() ?? randomUUID().replaceAll('-', '').slice(0, 12)
-  const tasksAbsolute = resolve(options.tasks)
+  const tasksAbsolute = realpathSync(resolve(options.tasks))
   const repoRoot = realpathSync(options.repoRoot ?? await resolveRepoRoot(dirname(tasksAbsolute)))
   if (!inside(repoRoot, tasksAbsolute)) throw new Error('--tasks must be inside the source repository')
   const checklistRelative = relative(repoRoot, tasksAbsolute)
