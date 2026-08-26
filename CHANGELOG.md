@@ -2,6 +2,18 @@
 
 All notable changes are documented here.
 
+## [0.2.18] - 2026-08-26
+
+### Added
+
+- Tracked `.leppy-loop.json` `customInstructions` are forwarded to every scoped worker with strict object, type and byte limits.
+- Open `[human]`/`[human/live]` checkpoints stall without starting a worker and produce an exact recovery receipt.
+- Model-facing and direct-command dry runs now expose checklist lint diagnostics instead of silently returning only a preview status.
+
+### Changed
+
+- The checklist parser accepts indented Markdown continuation lines plus legacy `[closure]`/`[gate]`, `Paths:`, `Paths EXATOS:`, `Paths permitidos:` and multiline `Done:` forms while retaining the canonical one-line pipe format.
+
 ## [0.2.17] - 2026-08-26
 
 ### Changed

@@ -5,8 +5,8 @@ export const RUN_EVENT_TYPES = [
 ] as const
 
 export type RunEventType = typeof RUN_EVENT_TYPES[number]
-export type Phase = 'setup' | 'worker' | 'closure' | 'gate' | 'recovery' | 'publish' | 'complete'
-export type TaskKind = 'task' | 'closure' | 'gate'
+export type Phase = 'setup' | 'worker' | 'closure' | 'gate' | 'human' | 'recovery' | 'publish' | 'complete'
+export type TaskKind = 'task' | 'closure' | 'gate' | 'human'
 export type ChecklistMark = ' ' | 'x' | '?' | '~'
 export type WorkerPolicy = 'adaptive' | 'selected' | 'terra-high' | 'sol-low'
 

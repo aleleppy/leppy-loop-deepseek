@@ -26,14 +26,39 @@ function splitSegments(text: string): string[] {
 }
 
 function kindOf(mark: ChecklistMark, text: string): TaskKind {
-  if (mark === '?' || /^closure\s*:/i.test(text)) return 'closure'
-  if (mark === '~' || /^gate\s*:/i.test(text)) return 'gate'
+  if (/^\s*\[human(?:\/[^\]]+)?\]/i.test(text)) return 'human'
+  if (mark === '?' || /^\s*(?:\[closure\]\s*)?closure\s*:/i.test(text) || /^\s*\[closure\]/i.test(text)) return 'closure'
+  if (mark === '~' || /^\s*(?:\[gate\]\s*)?gate\s*:/i.test(text) || /^\s*\[gate\]/i.test(text)) return 'gate'
   return 'task'
+}
+
+function stripKindPrefix(text: string, kind: TaskKind): string {
+  if (kind === 'closure') return text.replace(/^\s*\[closure\]\s*/i, '').replace(/^closure\s*:\s*/i, '')
+  if (kind === 'gate') return text.replace(/^\s*\[gate\]\s*/i, '').replace(/^gate\s*:\s*/i, '')
+  if (kind === 'human') return text.replace(/^\s*\[human(?:\/[^\]]+)?\]\s*/i, '')
+  return text
 }
 
 function unquote(value: string): string {
   const trimmed = value.trim()
   return trimmed.startsWith('`') && trimmed.endsWith('`') ? trimmed.slice(1, -1) : trimmed
+}
+
+function extractLegacyFields(segment: string): { text: string; done?: string; paths: string[] } {
+  const markers = [...segment.matchAll(/(?:^|\s)(Done|Paths?(?:\s+(?:EXATOS?|permitidos?))?)\s*:\s*/gi)]
+  if (markers.length === 0) return { text: segment, paths: [] }
+  const first = markers[0]!
+  const text = segment.slice(0, first.index).trim()
+  let done: string | undefined
+  const paths: string[] = []
+  for (const [index, marker] of markers.entries()) {
+    const start = (marker.index ?? 0) + marker[0].length
+    const end = markers[index + 1]?.index ?? segment.length
+    const value = segment.slice(start, end).trim()
+    if (/^done$/i.test(marker[1]!)) done = value
+    else paths.push(...[...value.matchAll(/`([^`]+)`/g)].map(match => match[1]!).filter(looksLikePath))
+  }
+  return { text, ...(done ? { done } : {}), paths }
 }
 
 function parseMetadata(segments: string[], kind: TaskKind): { text: string; metadata: TaskMetadata } {
@@ -46,7 +71,10 @@ function parseMetadata(segments: string[], kind: TaskKind): { text: string; meta
     }
     const match = /^(Done|paths|model|effort|gate)\s*[:=]\s*(.*)$/i.exec(segment)
     if (!match) {
-      textParts.push(segment)
+      const legacy = extractLegacyFields(segment)
+      if (legacy.text) textParts.push(legacy.text)
+      if (legacy.done) metadata.done = legacy.done
+      if (legacy.paths.length > 0) metadata.paths.push(...legacy.paths)
       continue
     }
     const key = META_KEYS.find(candidate => candidate.toLowerCase() === match[1]?.toLowerCase())
@@ -59,10 +87,9 @@ function parseMetadata(segments: string[], kind: TaskKind): { text: string; meta
       case 'gate': metadata.gate = unquote(value); break
     }
   }
-  let text = textParts.join(' | ').trim()
-  if (kind === 'closure') text = text.replace(/^closure\s*:\s*/i, '')
-  if (kind === 'gate') text = text.replace(/^gate\s*:\s*/i, '')
-  if (metadata.paths.length === 0 && kind !== 'gate') {
+  const text = stripKindPrefix(textParts.join(' | ').trim(), kind)
+  metadata.paths = [...new Set(metadata.paths)]
+  if (metadata.paths.length === 0 && kind !== 'gate' && kind !== 'human') {
     const candidates = [...text.matchAll(/`([^`]+)`/g)].map(match => match[1]!).filter(looksLikePath)
     metadata.paths = [...new Set(candidates)]
   }
@@ -87,7 +114,18 @@ export function parseChecklist(sourceOrPath: string, path = '<memory>'): ParsedC
     const match = CHECKBOX.exec(raw)
     if (!match) continue
     const mark = match[2]!.toLowerCase() as ChecklistMark
-    const body = match[4]!.trim()
+    const continuation: string[] = []
+    for (let continuationIndex = lineIndex + 1; continuationIndex < lines.length; continuationIndex += 1) {
+      const candidate = lines[continuationIndex]!
+      if (CHECKBOX.test(candidate) || PHASE.test(candidate)) break
+      if (candidate.trim() === '') {
+        if (continuation.length > 0) continuation.push('')
+        continue
+      }
+      if (!/^\s{2,}\S/u.test(candidate)) break
+      continuation.push(candidate.trim())
+    }
+    const body = [match[4]!.trim(), ...continuation].filter(Boolean).join(' ')
     const provisionalKind = kindOf(mark, body)
     const parsed = parseMetadata(splitSegments(body), provisionalKind)
     tasks.push({
@@ -97,7 +135,7 @@ export function parseChecklist(sourceOrPath: string, path = '<memory>'): ParsedC
       mark,
       kind: provisionalKind,
       text: parsed.text,
-      raw,
+      raw: `${match[1]}${mark}${match[3]}${body}`,
       metadata: parsed.metadata,
     })
   }
@@ -147,7 +185,7 @@ export function lintChecklist(parsed: ParsedChecklist, options: ChecklistLintOpt
     if (task.kind === 'task' && task.mark !== 'x' && (task.metadata.done === undefined || task.metadata.done.trim() === '')) {
       diagnostics.push(diagnostic('missing-done', 'Open task requires a non-empty Done: contract.', task))
     }
-    if (task.kind !== 'gate' && task.mark !== 'x' && task.metadata.paths.length === 0) {
+    if (task.kind !== 'gate' && task.kind !== 'human' && task.mark !== 'x' && task.metadata.paths.length === 0) {
       diagnostics.push(diagnostic('missing-paths', 'Open worker line requires paths=... or repo-relative paths in backticks.', task))
     }
     for (const path of task.metadata.paths) {
@@ -175,15 +213,19 @@ export function lintChecklist(parsed: ParsedChecklist, options: ChecklistLintOpt
     if (task.kind === 'task' && (task.mark === '?' || task.mark === '~')) diagnostics.push(diagnostic('contradictory-kind', 'Task marker contradicts its line type.', task))
   }
   for (const tasks of byPhase.values()) {
-    const closures = tasks.filter(task => task.kind === 'closure')
-    const gates = tasks.filter(task => task.kind === 'gate')
+    const automated = tasks.filter(task => task.kind !== 'human')
+    const closures = automated.filter(task => task.kind === 'closure')
+    const gates = automated.filter(task => task.kind === 'gate')
+    const humans = tasks.filter(task => task.kind === 'human')
     if (closures.length > 1) diagnostics.push(diagnostic('multiple-closures', `Phase ${JSON.stringify(tasks[0]?.phase)} has multiple closure lines.`, closures[1]))
     if (gates.length > 1) diagnostics.push(diagnostic('multiple-gates', `Phase ${JSON.stringify(tasks[0]?.phase)} has multiple gate lines.`, gates[1]))
+    if (humans.length > 1) diagnostics.push(diagnostic('multiple-human-checkpoints', `Phase ${JSON.stringify(tasks[0]?.phase)} has multiple human checkpoints.`, humans[1]))
     const closure = closures[0]
     const gate = gates[0]
-    if (closure && tasks.at(-1) !== closure && tasks.at(-1) !== gate) diagnostics.push(diagnostic('closure-order', 'Closure must be the last worker line in its phase.', closure))
-    if (gate && tasks.at(-1) !== gate) diagnostics.push(diagnostic('gate-order', 'Gate must be the final line in its phase.', gate))
-    if (closure && gate && tasks.indexOf(gate) !== tasks.indexOf(closure) + 1) diagnostics.push(diagnostic('closure-gate-adjacency', 'Closure and gate must be adjacent.', gate))
+    if (closure && automated.at(-1) !== closure && automated.at(-1) !== gate) diagnostics.push(diagnostic('closure-order', 'Closure must be the last automated worker line in its phase.', closure))
+    if (gate && automated.at(-1) !== gate) diagnostics.push(diagnostic('gate-order', 'Gate must be the final automated line in its phase.', gate))
+    if (closure && gate && automated.indexOf(gate) !== automated.indexOf(closure) + 1) diagnostics.push(diagnostic('closure-gate-adjacency', 'Closure and gate must be adjacent.', gate))
+    if (humans[0] && tasks.at(-1) !== humans[0]) diagnostics.push(diagnostic('human-order', 'Human checkpoint must be the final line in its phase.', humans[0]))
   }
   return diagnostics
 }

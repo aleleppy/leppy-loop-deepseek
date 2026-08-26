@@ -4,17 +4,17 @@
 
 Leppy Loop is a native external Cordis bundle that executes a tracked Markdown checklist with a fresh DeepSeek Harness process and session for each worker line. The controller owns Git synchronization, the worktree, checklist transitions, closure, gates, durable recovery state, and process leases. Workers receive only the current line, its `Done:` contract, allowed paths, applicable repository instructions, and explicit prohibitions.
 
-Version `0.2.17` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). It registers a Host-side `/leppy-loop` command and a model-facing controller tool that the existing Web composer and agent discover without a client patch.
+Version `0.2.18` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). It registers a Host-side `/leppy-loop` command and a model-facing controller tool that the existing Web composer and agent discover without a client patch.
 
 ## Install
 
-Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.2.17`. Configure the credential for the model provider selected in the Harness Models page, then build and install the tarball into the profile used by the Web host. Workers reuse that provider, model profile, and credential automatically; `DEEPSEEK_API_KEY` is not required when another provider is selected:
+Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.2.18`. Configure the credential for the model provider selected in the Harness Models page, then build and install the tarball into the profile used by the Web host. Workers reuse that provider, model profile, and credential automatically; `DEEPSEEK_API_KEY` is not required when another provider is selected:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm build
 pnpm pack
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.2.17.tgz
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.2.18.tgz
 ```
 
 Restart the existing `dsh web` process after changing its profile. A browser refresh cannot compose a newly installed Host plugin. A published GitHub Release tarball may replace the local `.tgz` path; there is no claim of publication in a plugin registry.
@@ -69,7 +69,9 @@ Marks and line types:
 | `[~]` | open controller-only phase gate |
 | `[x]` | completed line of any type |
 
-Ordinary tasks require a non-empty `Done:` and explicit repo-relative paths, either through `paths=a,b` or path-shaped backtick spans. The commit capability stages the exact validated changed files; an ignored untracked file is eligible only when it sits beneath one of those explicit scopes, allowing intentionally versioned migrations without sweeping unrelated ignored material. `--task-match` is a literal substring, not a regular expression. A phase may omit closure, gate, or both; when both exist they must be adjacent and final. Markdown outside checkbox markers is preserved byte-for-byte except for the file's existing newline convention.
+Ordinary tasks require a non-empty `Done:` and explicit repo-relative paths, either through `paths=a,b` or path-shaped backtick spans. The canonical pipe format is preferred, but indented Markdown continuations and the historical `[closure]`/`[gate]`, `Paths:`, `Paths EXATOS:`, `Paths permitidos:` and multiline `Done:` forms are accepted. A `[?] [human]` or `[?] [human/live]` checkpoint is never sent to a worker: the run stalls with its preserved worktree until a human marks that row complete and recovers the exact run. The commit capability stages the exact validated changed files; an ignored untracked file is eligible only when it sits beneath one of those explicit scopes, allowing intentionally versioned migrations without sweeping unrelated ignored material. `--task-match` is a literal substring, not a regular expression. A phase may omit closure, gate, or both; when both exist they must be adjacent and final among automated rows. Markdown outside checkbox markers is preserved byte-for-byte except for the file's existing newline convention.
+
+A tracked root `.leppy-loop.json` may contain a string `customInstructions`; it is appended to the applicable `AGENTS.md`/`CLAUDE.md` instructions for every worker. Invalid shapes fail closed, the file is capped at 64 KiB, and the instruction string at 32 KiB. Dry-run results include all lint diagnostics through both the model-facing tool and direct command text.
 
 Paths are resolved through filesystem identity. Traversal, absolute paths, and symlinks/junctions escaping the worktree are rejected. The controlling checklist is always denied to workers.
 

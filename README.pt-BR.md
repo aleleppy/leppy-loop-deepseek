@@ -4,17 +4,17 @@
 
 Leppy Loop é um bundle Cordis externo e nativo que executa uma checklist Markdown rastreada com um processo e uma sessão novos do DeepSeek Harness por linha de worker. O controller é dono do Git, worktree, transições da checklist, closure, gates, recuperação durável e leases de processo.
 
-A versão `0.2.17` é fixada no DeepSeek Harness `0.1.1-rc.2`, commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). Ela registra o comando Host `/leppy-loop` e uma ferramenta de controller para o modelo, descobertos pelo composer Web e pelo agente sem patch de client.
+A versão `0.2.18` é fixada no DeepSeek Harness `0.1.1-rc.2`, commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). Ela registra o comando Host `/leppy-loop` e uma ferramenta de controller para o modelo, descobertos pelo composer Web e pelo agente sem patch de client.
 
 ## Instalação
 
-Requer Node `22.19+`, Git e pnpm `10.28.1`. O DeepSeek Harness repassa a gestão de plugins ao `pnpm` encontrado no `PATH`; pnpm 11 exige aprovação separada de builds nativos e não é uma combinação de instalação afirmada para `0.2.17`. Configure a credencial do provedor selecionado na página Models do Harness, gere o pacote e instale no profile usado pelo Web host. Os workers reutilizam automaticamente o provedor, o perfil do modelo e a credencial selecionados; `DEEPSEEK_API_KEY` não é necessária quando outro provedor está ativo:
+Requer Node `22.19+`, Git e pnpm `10.28.1`. O DeepSeek Harness repassa a gestão de plugins ao `pnpm` encontrado no `PATH`; pnpm 11 exige aprovação separada de builds nativos e não é uma combinação de instalação afirmada para `0.2.18`. Configure a credencial do provedor selecionado na página Models do Harness, gere o pacote e instale no profile usado pelo Web host. Os workers reutilizam automaticamente o provedor, o perfil do modelo e a credencial selecionados; `DEEPSEEK_API_KEY` não é necessária quando outro provedor está ativo:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm build
 pnpm pack
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.2.17.tgz
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.2.18.tgz
 ```
 
 Reinicie o processo `dsh web` existente depois de alterar o profile. Refresh do navegador não compõe um plugin Host recém-instalado. Um tarball publicado no GitHub Release pode substituir o path do `.tgz` local; não há afirmação de publicação em registry de plugins.
@@ -65,7 +65,9 @@ Prévia sem worker ou consumo de credencial:
 - `[~]`: gate do controller aberto.
 - `[x]`: linha concluída de qualquer tipo.
 
-Tarefa comum exige `Done:` não vazio e paths repo-relative explícitos em `paths=` ou entre crases. A capability de commit faz stage somente dos arquivos alterados exatos já validados; um arquivo ignorado e não rastreado só é elegível quando está sob um desses escopos explícitos, permitindo migrations intencionalmente versionadas sem varrer material ignorado não relacionado. `--task-match` é substring literal. Paths passam por `realpath`; traversal, absoluto e symlink/junction escapando do repositório são recusados. O worker nunca pode ler ou editar a checklist controladora.
+Tarefa comum exige `Done:` não vazio e paths repo-relative explícitos em `paths=` ou entre crases. O formato canônico com pipes é preferido, mas continua compatível com continuações Markdown indentadas e as formas históricas `[closure]`/`[gate]`, `Paths:`, `Paths EXATOS:`, `Paths permitidos:` e `Done:` multiline. Um checkpoint `[?] [human]` ou `[?] [human/live]` nunca inicia worker: o run para com o worktree preservado até um humano marcar a row e recuperar o ID exato. A capability de commit faz stage somente dos arquivos alterados exatos já validados; um arquivo ignorado e não rastreado só é elegível quando está sob um desses escopos explícitos, permitindo migrations intencionalmente versionadas sem varrer material ignorado não relacionado. `--task-match` é substring literal. Paths passam por `realpath`; traversal, absoluto e symlink/junction escapando do repositório são recusados. O worker nunca pode ler ou editar a checklist controladora.
+
+Um `.leppy-loop.json` rastreado na raiz pode fornecer `customInstructions` string, anexada às instruções `AGENTS.md`/`CLAUDE.md` aplicáveis. Shapes inválidos falham fechados; o arquivo tem limite de 64 KiB e a string, 32 KiB. Dry-run expõe todos os diagnósticos de lint na ferramenta do modelo e no texto do comando direto.
 
 ## Semântica
 

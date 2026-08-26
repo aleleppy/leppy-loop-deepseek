@@ -23,6 +23,24 @@ describe('checklist parser and lint', () => {
     expect(markTaskDone(parsed, parsed.tasks[0]!)).toContain('- [x] Implement')
   })
 
+  it('parses legacy multiline rows, role tags and metadata without discarding context', () => {
+    const parsed = parseChecklist(`## Legacy
+- [ ] R1 — implement the bounded queue.
+  Paths EXATOS: \`src/queue.ts\`, \`src/queue.test.ts\`
+  Done: queue rejects overflow and focused tests pass.
+- [ ] [closure] Audit the queue invariants. | paths=src/queue.ts,src/queue.test.ts
+- [ ] [gate] Gate the phase. | gate=\`pnpm test\`
+- [?] [human/live] Confirm behavior in the release client.
+`)
+    expect(parsed.tasks.map(task => task.kind)).toEqual(['task', 'closure', 'gate', 'human'])
+    expect(parsed.tasks[0]?.metadata).toMatchObject({
+      paths: ['src/queue.ts', 'src/queue.test.ts'],
+      done: 'queue rejects overflow and focused tests pass.',
+    })
+    expect(parsed.tasks[0]?.raw).toContain('bounded queue. Paths EXATOS:')
+    expect(lintChecklist(parsed)).toEqual([])
+  })
+
   it('selects exactly one open line with literal substring matching', () => {
     const parsed = parseChecklist(valid)
     expect(selectTask(parsed, 'src/a.ts')?.index).toBe(0)

@@ -111,6 +111,20 @@ function selectedModel(
   }
 }
 
+function legacyCustomInstructions(root: string): string[] {
+  const path = join(root, '.leppy-loop.json')
+  if (!existsSync(path)) return []
+  const body = readFileSync(path, 'utf8')
+  if (Buffer.byteLength(body) > 64 * 1024) throw new Error('.leppy-loop.json exceeds 64 KiB')
+  const parsed = JSON.parse(body) as unknown
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('.leppy-loop.json must contain an object')
+  const custom = (parsed as { customInstructions?: unknown }).customInstructions
+  if (custom === undefined || custom === '') return []
+  if (typeof custom !== 'string') throw new Error('.leppy-loop.json customInstructions must be a string')
+  if (Buffer.byteLength(custom) > 32 * 1024) throw new Error('.leppy-loop.json customInstructions exceeds 32 KiB')
+  return [`Applicable tracked legacy instructions from .leppy-loop.json:\n${custom}`]
+}
+
 async function discoverInstructions(root: string, paths: readonly string[]): Promise<string[]> {
   const candidates = new Set<string>([join(root, 'AGENTS.md'), join(root, 'CLAUDE.md')])
   for (const scoped of paths) {
@@ -354,6 +368,15 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       const progressStartedAtMs = clock().getTime()
       await dependencies.onProgress?.(taskProgress(state, task, totalTasks, 'task-start', 0))
       activeProgress = { task, totalTasks, attempt: state.attempt, startedAtMs: progressStartedAtMs }
+      if (task.kind === 'human') {
+        const reason = 'human checkpoint requires direct approval; mark this row complete in the preserved worktree, then recover the same run'
+        appendEvent(eventsPath, event(state.runId, 'stall', 'human', { reason, worktree: state.worktree }, task, state.attempt))
+        state.status = 'stalled'
+        writeState(join(stateDir, 'run.json'), state)
+        atomicWriteJson(join(stateDir, 'resume.json'), { runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: 'human', worktree: state.worktree, command: `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)}` })
+        await settleProgress('task-failed', reason)
+        return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
+      }
       if (task.kind === 'gate') {
         const command = task.metadata.gate ?? options.phaseGateCommand!
         const key = `${task.index}:${fingerprint(command)}`
@@ -395,7 +418,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       validateModelSelection(catalog, model.model, model.effort)
       const controllerHash = digest(readFileSync(checklistPath, 'utf8'))
       const previousHead = await head(state.worktree)
-      const instructions = await discoverInstructions(state.worktree, task.metadata.paths)
+      const instructions = [...legacyCustomInstructions(state.worktree), ...await discoverInstructions(state.worktree, task.metadata.paths)]
       const request: WorkerRequest = {
         runId: state.runId, task, attempt: state.attempt, worktree: state.worktree,
         checklistPath: checklistRelative, allowedPaths: task.metadata.paths,

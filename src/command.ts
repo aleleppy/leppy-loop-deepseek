@@ -59,6 +59,7 @@ export interface LeppyLoopStartResult {
   stateDir?: string
   currentTask?: number
   pullRequestUrl?: string
+  diagnostics: RunResult['diagnostics']
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -90,6 +91,9 @@ function resultText(result: RunResult): string {
   if (result.preview) {
     facts.push(`selected=${result.preview.selectedLine ?? '<none>'}`)
   }
+  if (result.diagnostics.length > 0) {
+    facts.push(`diagnostics=${result.diagnostics.map(item => `${item.line ?? '-'}:${item.code}:${item.message}`).join('; ')}`)
+  }
   return `Leppy Loop ${result.status}. ${facts.join(' | ')}`
 }
 
@@ -98,6 +102,7 @@ function resultValue(result: RunResult): LeppyLoopStartResult {
     status: result.status,
     runId: result.runId,
     completedTasks: result.completedTasks,
+    diagnostics: result.diagnostics,
     ...(result.branch ? { branch: result.branch } : {}),
     ...(result.worktree ? { worktree: result.worktree } : {}),
     ...(result.stateDir ? { stateDir: result.stateDir } : {}),
@@ -251,6 +256,18 @@ export function apply(ctx: Context): void {
           stateDir: { type: 'string' },
           currentTask: { type: 'number' },
           pullRequestUrl: { type: 'string' },
+          diagnostics: {
+            type: 'array', required: true,
+            items: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                severity: { type: 'string', required: true },
+                code: { type: 'string', required: true },
+                message: { type: 'string', required: true },
+                line: { type: 'number' },
+              },
+            },
+          },
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],

@@ -129,6 +129,37 @@ describe('controller state machine', () => {
     ])
   }, 90_000)
 
+  it('forwards bounded tracked legacy custom instructions to the worker', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    writeFileSync(join(repo.root, '.leppy-loop.json'), JSON.stringify({ customInstructions: 'Run the focal command literally.' }))
+    git(repo.root, 'add', '--', '.leppy-loop.json')
+    git(repo.root, 'commit', '-m', 'chore: add leppy instructions')
+    const worker = new FakeWorker()
+
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, worker },
+    )
+
+    expect(result.status).toBe('completed')
+    expect(worker.calls[0]?.instructions).toContain('Applicable tracked legacy instructions from .leppy-loop.json:\nRun the focal command literally.')
+  }, 90_000)
+
+  it('stalls at a human checkpoint without starting a worker', async () => {
+    const repo = repository('- [?] [human/live] Confirm behavior in the release client.\n')
+    const worker = new FakeWorker()
+
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, worker },
+    )
+
+    expect(result.status).toBe('stalled')
+    expect(result.currentTask).toBe(0)
+    expect(worker.calls).toHaveLength(0)
+    expect(readFileSync(join(result.stateDir!, 'resume.json'), 'utf8')).toContain('"status": "human"')
+  }, 90_000)
+
   it('preserves WIP and the same open row after timeout', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
     const worker = new FakeWorker([{ status: 'timeout', output: '', error: 'timeout' }])
