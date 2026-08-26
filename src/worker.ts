@@ -7,8 +7,14 @@ import type { WorkerAdapter, WorkerOutcome, WorkerRequest } from './types.js'
 import { createLeaseKey } from './state.js'
 import { redact, scrubEnvironment } from './security.js'
 
+export interface WorkerCredential {
+  envName?: string
+  value?: string
+  providerProfile?: Record<string, unknown>
+}
+
 export interface HarnessWorkerAdapterOptions {
-  credential: () => Promise<string>
+  credential: (provider: string) => Promise<WorkerCredential>
   workerHostPath?: string
   workerConfigPath?: string
   /** Non-secret runtime facts for deterministic/keyless test compositions. */
@@ -17,17 +23,27 @@ export interface HarnessWorkerAdapterOptions {
 
 function byteLength(value: string): number { return Buffer.byteLength(value, 'utf8') }
 
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  throw new Error(typeof signal.reason === 'string' ? signal.reason : 'worker aborted')
+}
+
 export class HarnessWorkerAdapter implements WorkerAdapter {
   constructor(private readonly options: HarnessWorkerAdapterOptions) {}
 
   async run(request: WorkerRequest, signal: AbortSignal): Promise<WorkerOutcome> {
+    throwIfAborted(signal)
     mkdirSync(join(request.stateDir, 'outputs'), { recursive: true })
     mkdirSync(join(request.stateDir, 'transcripts'), { recursive: true })
     mkdirSync(join(request.stateDir, 'sessions'), { recursive: true })
     mkdirSync(join(request.stateDir, 'leases'), { recursive: true })
     createLeaseKey(request.stateDir)
-    const apiKey = await this.options.credential()
-    if (apiKey.trim() === '') return { status: 'failed', output: '', error: 'DeepSeek credential service returned an empty key' }
+    const credential = await this.options.credential(request.provider)
+    throwIfAborted(signal)
+    if ((credential.envName === undefined) !== (credential.value === undefined)) throw new Error('worker credential name/value mismatch')
+    if (credential.value !== undefined && credential.value.trim() === '') return { status: 'failed', output: '', error: `${credential.envName} resolved to an empty credential` }
+    const secrets = credential.value === undefined ? [] : [credential.value]
     const suffix = `${request.task.index}-${request.attempt}`
     const outputPath = join(request.stateDir, 'outputs', `${suffix}.txt`)
     const transcriptPath = join(request.stateDir, 'transcripts', `${suffix}.jsonl`)
@@ -35,10 +51,14 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
     const host = this.options.workerHostPath ?? fileURLToPath(new URL('./worker-host.js', import.meta.url))
     const config = this.options.workerConfigPath ?? fileURLToPath(new URL('../worker.cordis.yml', import.meta.url))
     const prompt = workerPrompt(request)
+    const piAiProviders = request.provider === 'deepseek-official'
+      ? {}
+      : { [request.provider]: { ...credential.providerProfile, ...(credential.envName ? { apiKeyEnv: credential.envName } : {}) } }
     const env = {
-      ...scrubEnvironment(process.env),
+      ...scrubEnvironment(process.env, ['DSH_HOME']),
       ...this.options.runtimeEnv,
-      DEEPSEEK_API_KEY: apiKey,
+      ...(credential.envName && credential.value ? { [credential.envName]: credential.value } : {}),
+      LEPPY_PI_AI_PROVIDERS: JSON.stringify(piAiProviders),
       LEPPY_RUN_ID: request.runId,
       LEPPY_TASK_INDEX: String(request.task.index),
       LEPPY_ATTEMPT: String(request.attempt),
@@ -74,21 +94,22 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
     const abort = (): void => { void harness.close() }
     signal.addEventListener('abort', abort, { once: true })
     try {
+      throwIfAborted(signal)
       const result = await harness.run(prompt, { onNotification(notification: HarnessNotification) {
         if (overflow) return
-        const line = `${JSON.stringify(redact(notification, [apiKey]))}\n`
+        const line = `${JSON.stringify(redact(notification, secrets))}\n`
         transcriptBytes += byteLength(line)
         if (transcriptBytes > request.transcriptLimitBytes) { overflow = 'transcript-limit'; void harness.close(); return }
         notifications.push(line)
       } })
-      const output = redact(result.finalResponse, [apiKey])
+      const output = redact(result.finalResponse, secrets)
       if (byteLength(output) > request.outputLimitBytes) overflow = 'output-limit'
       writeFileSync(outputPath, output, 'utf8')
       writeFileSync(transcriptPath, notifications.join(''), 'utf8')
       if (overflow) return { status: overflow, output, transcriptPath }
       return { status: 'completed', output, transcriptPath }
     } catch (error) {
-      const message = redact(error instanceof Error ? error.message : String(error), [apiKey])
+      const message = redact(error instanceof Error ? error.message : String(error), secrets)
       writeFileSync(transcriptPath, notifications.join(''), 'utf8')
       if (overflow) return { status: overflow, output: '', transcriptPath, error: message }
       if (signal.aborted) return { status: 'interrupted', output: '', transcriptPath, error: message }

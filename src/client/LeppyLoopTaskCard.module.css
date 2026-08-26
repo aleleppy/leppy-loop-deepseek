@@ -1,0 +1,87 @@
+.leppy-loop-task-card {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.leppy-loop-task-card__row {
+  position: relative;
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  overflow: hidden;
+}
+
+.leppy-loop-task-card[data-state='running'] .leppy-loop-task-card__row::after {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: 300px;
+  background: linear-gradient(90deg, transparent 0%, color-mix(in srgb, var(--dsw-alias-bg-base) 60%, transparent) 55%, transparent 100%);
+  animation: leppy-command-row-sweep 2.6s ease-out infinite;
+  pointer-events: none;
+}
+
+@keyframes leppy-command-row-sweep {
+  0% { left: -300px; }
+  90%, 100% { left: 100%; }
+}
+
+.leppy-loop-task-card__leading {
+  z-index: 1;
+  display: inline-flex;
+  width: 20px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+}
+
+.leppy-loop-task-card__leading[data-state='running'] {
+  color: var(--dsw-alias-state-warning-primary);
+}
+
+.leppy-loop-task-card__leading[data-state='error'] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.leppy-loop-task-card__title {
+  z-index: 1;
+  flex: none;
+  color: var(--dsw-alias-label-primary);
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 24px;
+}
+
+.leppy-loop-task-card__separator {
+  z-index: 1;
+  width: 2px;
+  height: 2px;
+  margin: 0 8px;
+  flex: none;
+  border-radius: 1px;
+  background: var(--dsw-alias-label-caption);
+}
+
+.leppy-loop-task-card__summary {
+  z-index: 1;
+  min-width: 0;
+  overflow: hidden;
+  flex: 1 1 auto;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 14px;
+  line-height: 24px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.leppy-loop-task-card__summary[data-error] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .leppy-loop-task-card[data-state='running'] .leppy-loop-task-card__row::after { animation: none; }
+}

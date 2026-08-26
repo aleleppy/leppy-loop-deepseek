@@ -4,34 +4,49 @@
 
 Leppy Loop is a native external Cordis bundle that executes a tracked Markdown checklist with a fresh DeepSeek Harness process and session for each worker line. The controller owns Git synchronization, the worktree, checklist transitions, closure, gates, durable recovery state, and process leases. Workers receive only the current line, its `Done:` contract, allowed paths, applicable repository instructions, and explicit prohibitions.
 
-Version `0.1.0` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e).
+Version `0.2.17` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). It registers a Host-side `/leppy-loop` command and a model-facing controller tool that the existing Web composer and agent discover without a client patch.
 
 ## Install
 
-Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.1.0`. Configure `DEEPSEEK_API_KEY` through the Harness credential service, then install the release tarball in a dedicated profile:
+Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.2.17`. Configure the credential for the model provider selected in the Harness Models page, then build and install the tarball into the profile used by the Web host. Workers reuse that provider, model profile, and credential automatically; `DEEPSEEK_API_KEY` is not required when another provider is selected:
 
 ```sh
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile leppy-loop add https://github.com/aleleppy/leppy-loop-deepseek/releases/download/v0.1.0/leppy-loop-deepseek-0.1.0.tgz
+pnpm install --frozen-lockfile
+pnpm build
+pnpm pack
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.2.17.tgz
 ```
 
-Bundles are intentionally distributed through a GitHub Release tarball and Git URL. There is no claim of publication in a plugin registry.
+Restart the existing `dsh web` process after changing its profile. A browser refresh cannot compose a newly installed Host plugin. A published GitHub Release tarball may replace the local `.tgz` path; there is no claim of publication in a plugin registry.
 
 ## Quickstart
 
-Create a tracked checklist such as [`examples/feature.task.md`](examples/feature.task.md), commit it, and start from a clean checkout:
+Create a tracked checklist such as [`examples/feature.task.md`](examples/feature.task.md), commit it, start a Web session whose workspace is that clean checkout, and invoke the command without arguments:
 
-```sh
-npx @deepseek-ai/dsh@0.1.1-rc.2 --profile leppy-loop \
-  --tasks ./tasks/feature.task.md \
-  --sync-branch origin/main \
-  --phase-gate-command "pnpm test"
+```text
+/leppy-loop
 ```
 
-Preview exactly one selected line without starting a process or reading a credential:
+The command queues an AI turn that inspects the conversation and repository, resolves the intended tracked checklist and authoritative Git base, and calls the private `leppy_loop_start` tool. If the target is genuinely ambiguous, the AI asks one concise question instead of guessing. Natural language after the command is forwarded as intent instead of parsed as CLI arguments, for example `/leppy-loop continue the checklist from this conversation`.
 
-```sh
-npx @deepseek-ai/dsh@0.1.1-rc.2 --profile leppy-loop \
-  --tasks ./tasks/feature.task.md --sync-branch origin/main --dry-run
+The deterministic explicit form remains available only when the input starts with an option such as `--tasks`:
+
+```text
+/leppy-loop --tasks ./tasks/feature.task.md --sync-branch origin/main --phase-gate-command "pnpm test"
+```
+
+Relative checklist and artifact paths resolve from the receiving session's workspace. Explicit arguments use a non-evaluating quoted argv grammar; the gate remains one explicitly quoted opaque argument.
+
+The default `adaptive` worker policy uses `gpt-5.6-terra` at `high` for ordinary OpenAI Codex tasks, then `gpt-5.6-sol` at `low` for closures and recovery of a stalled task. A clean ordinary-task completion with zero commits is retried once automatically under the recovery policy. If that independent retry proves the `Done:` contract is already satisfied through the exact terminal evidence marker and leaves a clean unchanged branch, the controller closes only the checklist; dirty WIP, missing evidence, and an unverified repeated zero-commit result still fail closed. Inline `model=`/`effort=` metadata and explicit `--model`/`--effort` options take priority. Use `--worker-policy selected`, `terra-high`, or `sol-low` to choose another global behavior. The default transcript cap is 8192 KiB and remains configurable with `--worker-transcript-limit-kb`. Resume receipts include `--recover-run <id>` so recovery remains deterministic even when older failed runs still exist. Supplying an exact run ID may also continue a completed selective run on the next open checklist row in its preserved branch/worktree; completed runs are never chosen implicitly.
+
+While a Web run is active, every selected row creates a durable progress card in chat at start. Its plugin-owned browser renderer updates that task attempt's elapsed wall-clock time locally once per second, then the same card settles with the completed/total count and final task duration on success, stall, or failure (for example, `Task completed — 14/57 — 3m 12s elapsed.`). A recovered interrupted row starts a new attempt card and timer; an internal no-commit verification remains inside the original card and duration. Only the start and terminal command-lifecycle records are durable and both remain excluded from model context, so the live timer writes no per-second events, consumes no tokens, and does not split tool-call/result pairing.
+
+Web runs complete locally by default after every checklist row and gate succeeds. Only a direct, human-authored `--open-pr` slash command can make the controller fetch and rebase onto the remote base, push its exact Leppy branch, create or find the GitHub pull request with `gh`, store the URL, and return it to the chat. The autonomous model tool cannot enable publication, and workers cannot push or use `gh`. Install and authenticate GitHub CLI first (`gh auth status`) before opting in.
+
+Preview exactly one selected line without starting a worker or reading a credential:
+
+```text
+/leppy-loop --tasks ./tasks/feature.task.md --sync-branch origin/main --dry-run
 ```
 
 ## Checklist contract
@@ -54,7 +69,7 @@ Marks and line types:
 | `[~]` | open controller-only phase gate |
 | `[x]` | completed line of any type |
 
-Ordinary tasks require a non-empty `Done:` and explicit repo-relative paths, either through `paths=a,b` or path-shaped backtick spans. `--task-match` is a literal substring, not a regular expression. A phase may omit closure, gate, or both; when both exist they must be adjacent and final. Markdown outside checkbox markers is preserved byte-for-byte except for the file's existing newline convention.
+Ordinary tasks require a non-empty `Done:` and explicit repo-relative paths, either through `paths=a,b` or path-shaped backtick spans. The commit capability stages the exact validated changed files; an ignored untracked file is eligible only when it sits beneath one of those explicit scopes, allowing intentionally versioned migrations without sweeping unrelated ignored material. `--task-match` is a literal substring, not a regular expression. A phase may omit closure, gate, or both; when both exist they must be adjacent and final. Markdown outside checkbox markers is preserved byte-for-byte except for the file's existing newline convention.
 
 Paths are resolved through filesystem identity. Traversal, absolute paths, and symlinks/junctions escaping the worktree are rejected. The controlling checklist is always denied to workers.
 
@@ -98,7 +113,7 @@ The event type union is exactly:
 
 `run-start`, `start`, `done`, `recovery-start`, `recovery-done`, `gate-start`, `gate-end`, `stall`, `timeout`, `gate-failed`, `run-end`.
 
-The package exports `runLeppyLoop`, `parseChecklist`, `lintChecklist`, `HarnessWorkerAdapter`, `LeppyLoopOptions`, `RunResult`, and `RunEvent`.
+The package exports `runLeppyLoop`, `executeLeppyLoopCommand`, `parseLeppyLoopCommandInput`, `parseChecklist`, `lintChecklist`, `HarnessWorkerAdapter`, `LeppyLoopOptions`, `RunResult`, `RunPreview`, and `RunEvent`.
 
 ## Recovery
 
@@ -126,15 +141,15 @@ The official sandbox does not confine network access. A malicious repository scr
 
 ## Costs and limitations
 
-Each line starts an independent context, so shared conversational cache is intentionally lost and model cost may be higher. Version `0.1.0` supports only the tested Harness pin. Network confinement, automatic push, PR mutation, release publication, package publication, and deployment are not provided. No remote action is automatic.
+Each line starts an independent context, so shared conversational cache is intentionally lost and model cost may be higher. Version `0.2.0` supports only the tested Harness pin. Network confinement, automatic push, PR mutation, release publication, package publication, and deployment are not provided. No remote action is automatic.
 
 ## Uninstall
 
 ```sh
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile leppy-loop remove leppy-loop-deepseek
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web remove leppy-loop-deepseek
 ```
 
-Remove the profile separately if you no longer need it. Worktrees and preserved WIP are never deleted automatically.
+Restart the Web host after removal. Remove a dedicated CLI profile separately if you created one. Worktrees and preserved WIP are never deleted automatically.
 
 ## Troubleshooting
 

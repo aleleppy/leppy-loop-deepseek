@@ -1,12 +1,14 @@
 export const RUN_EVENT_TYPES = [
   'run-start', 'start', 'done', 'recovery-start', 'recovery-done',
-  'gate-start', 'gate-end', 'stall', 'timeout', 'gate-failed', 'run-end',
+  'gate-start', 'gate-end', 'publish-start', 'publish-done',
+  'stall', 'timeout', 'gate-failed', 'run-end',
 ] as const
 
 export type RunEventType = typeof RUN_EVENT_TYPES[number]
-export type Phase = 'setup' | 'worker' | 'closure' | 'gate' | 'recovery' | 'complete'
+export type Phase = 'setup' | 'worker' | 'closure' | 'gate' | 'recovery' | 'publish' | 'complete'
 export type TaskKind = 'task' | 'closure' | 'gate'
 export type ChecklistMark = ' ' | 'x' | '?' | '~'
+export type WorkerPolicy = 'adaptive' | 'selected' | 'terra-high' | 'sol-low'
 
 export interface TaskMetadata {
   done?: string
@@ -64,6 +66,7 @@ export interface LeppyLoopOptions {
   maxIterations?: number
   taskMatch?: string
   recoverExistingWip?: boolean
+  recoverRunId?: string
   syncMaxSeconds?: number
   workerTimeoutMs?: number
   workerOutputLimitBytes?: number
@@ -72,8 +75,10 @@ export interface LeppyLoopOptions {
   provider?: string
   model?: string
   effort?: string
+  workerPolicy?: WorkerPolicy
   fallbackModel?: string
   fetch?: boolean
+  openPullRequest?: boolean
   repoRoot?: string
 }
 
@@ -88,6 +93,16 @@ export interface RunEvent<T = Record<string, unknown>> {
   data: T
 }
 
+export interface RunPreview {
+  selectedLine: string | null
+  model: { provider: string; model: string; effort?: string }
+  paths: string[]
+  branch: string
+  worktree: string
+  gate: string | null
+  diagnostics: LintDiagnostic[]
+}
+
 export interface RunResult {
   runId: string
   status: 'completed' | 'dry-run' | 'stalled' | 'failed' | 'interrupted'
@@ -97,6 +112,8 @@ export interface RunResult {
   completedTasks: number
   currentTask?: number
   diagnostics: LintDiagnostic[]
+  pullRequestUrl?: string
+  preview?: RunPreview
 }
 
 export interface WorkerRequest {
@@ -128,10 +145,35 @@ export interface WorkerAdapter {
   run(request: WorkerRequest, signal: AbortSignal): Promise<WorkerOutcome>
 }
 
+export interface RunProgress {
+  type: 'task-start' | 'task-done' | 'task-failed'
+  runId: string
+  taskIndex: number
+  attempt: number
+  kind: TaskKind
+  phase: string
+  text: string
+  completedTasks: number
+  totalTasks: number
+  elapsedMs: number
+  error?: string
+}
+
+export interface PullRequestRequest {
+  runId: string
+  repoRoot: string
+  worktree: string
+  branch: string
+  syncBranch: string
+}
+
 export interface RunDependencies {
   worker?: WorkerAdapter
   now?: () => Date
   runId?: () => string
   modelCatalog?: (provider: string) => Promise<ModelCapability[]>
   defaultModel?: () => Promise<{ provider: string; model: string; effort?: string }>
+  publishPullRequest?: (request: PullRequestRequest, signal: AbortSignal) => Promise<string>
+  onProgress?: (progress: RunProgress) => void | Promise<void>
+  signal?: AbortSignal
 }

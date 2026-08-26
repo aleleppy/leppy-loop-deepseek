@@ -11,7 +11,7 @@ import { isConventional } from './git.js'
 export const name = 'leppy-loop-worker-tools'
 export const inject = ['tools', 'subprocess', 'sandbox', 'sandboxPolicy']
 
-interface WorkerPolicy {
+export interface WorkerPolicy {
   root: string
   checklist: string
   allowed: string[]
@@ -82,6 +82,32 @@ async function gitCommand(ctx: Context, policy: WorkerPolicy, args: readonly str
 
 function nulPaths(text: string): string[] { return text.split('\0').filter(Boolean) }
 
+type GitResult = { exitCode: number; stdout: string; stderr: string }
+type GitRunner = (args: readonly string[]) => Promise<GitResult>
+
+/** Validate and commit exactly the changed paths inside one worker's declared scope. */
+export async function commitTaskChanges(policy: WorkerPolicy, message: string, runGit: GitRunner): Promise<string> {
+  if (!isConventional(message)) throw new Error('commit message must be conventional')
+  const relativeScopes = policy.allowed.map(path => relative(policy.root, path))
+  const probes = await Promise.all([
+    runGit(['diff', '--name-only', '-z']),
+    runGit(['diff', '--cached', '--name-only', '-z']),
+    runGit(['ls-files', '--others', '--exclude-standard', '-z']),
+    runGit(['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', ...relativeScopes]),
+  ])
+  if (probes.some(result => result.exitCode !== 0)) throw new Error(`cannot inspect Git changes: ${probes.map(result => result.stderr).join('\n')}`)
+  const changed = [...new Set(probes.flatMap(result => nulPaths(result.stdout)))]
+  if (changed.length === 0) throw new Error('no task changes to commit')
+  for (const path of changed) resolveAllowed(policy, path, true)
+  const add = await runGit(['add', '-f', '--', ...changed])
+  if (add.exitCode !== 0) throw new Error(`git add failed: ${add.stderr}`)
+  const commit = await runGit(['commit', '-m', message])
+  if (commit.exitCode !== 0) throw new Error(`git commit failed: ${commit.stderr}`)
+  const id = await runGit(['rev-parse', 'HEAD'])
+  if (id.exitCode !== 0) throw new Error(`cannot resolve commit: ${id.stderr}`)
+  return id.stdout.trim()
+}
+
 export function apply(ctx: Context): void {
   const policy = loadPolicy()
   ctx.tools.register(defineTool({
@@ -99,24 +125,8 @@ export function apply(ctx: Context): void {
     parameters: { message: { type: 'string', required: true } },
     output: { schema: { type: 'object', additionalProperties: false, properties: { commit: { type: 'string', required: true } } }, render: (_args, value) => textOutput(value) },
     async execute(args) {
-      if (!isConventional(args.message)) throw new Error('commit message must be conventional')
-      const probes = await Promise.all([
-        gitCommand(ctx, policy, ['diff', '--name-only', '-z']),
-        gitCommand(ctx, policy, ['diff', '--cached', '--name-only', '-z']),
-        gitCommand(ctx, policy, ['ls-files', '--others', '--exclude-standard', '-z']),
-      ])
-      if (probes.some(result => result.exitCode !== 0)) throw new Error(`cannot inspect Git changes: ${probes.map(result => result.stderr).join('\n')}`)
-      const changed = [...new Set(probes.flatMap(result => nulPaths(result.stdout)))]
-      if (changed.length === 0) throw new Error('no task changes to commit')
-      for (const path of changed) resolveAllowed(policy, path, true)
-      const relativeScopes = policy.allowed.map(path => relative(policy.root, path))
-      const add = await gitCommand(ctx, policy, ['add', '--', ...relativeScopes])
-      if (add.exitCode !== 0) throw new Error(`git add failed: ${add.stderr}`)
-      const commit = await gitCommand(ctx, policy, ['commit', '-m', args.message])
-      if (commit.exitCode !== 0) throw new Error(`git commit failed: ${commit.stderr}`)
-      const id = await gitCommand(ctx, policy, ['rev-parse', 'HEAD'])
-      if (id.exitCode !== 0) throw new Error(`cannot resolve commit: ${id.stderr}`)
-      return { commit: id.stdout.trim() }
+      const commit = await commitTaskChanges(policy, args.message, command => gitCommand(ctx, policy, command))
+      return { commit }
     },
   }))
   ctx.tools.register(defineTool({

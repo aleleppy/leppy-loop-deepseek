@@ -11,28 +11,37 @@ export interface GitSetup {
   checklistRelative: string
 }
 
-export async function resolveRepoRoot(start: string): Promise<string> {
-  return realpathSync((await runFile('git', ['rev-parse', '--show-toplevel'], { cwd: start })).stdout.trim())
+export async function resolveRepoRoot(start: string, signal?: AbortSignal): Promise<string> {
+  return realpathSync((await runFile('git', ['rev-parse', '--show-toplevel'], { cwd: start, signal })).stdout.trim())
 }
 
-export async function assertSourceReady(repoRoot: string, checklistPath: string): Promise<void> {
-  const status = (await runFile('git', ['status', '--porcelain=v1', '--untracked-files=normal'], { cwd: repoRoot })).stdout
+export async function assertSourceReady(repoRoot: string, checklistPath: string, signal?: AbortSignal): Promise<void> {
+  const status = (await runFile('git', ['status', '--porcelain=v1', '--untracked-files=normal'], { cwd: repoRoot, signal })).stdout
   if (status.trim() !== '') throw new Error('source checkout must be clean before Leppy Loop starts')
-  const tracked = await runFile('git', ['ls-files', '--error-unmatch', '--', checklistPath], { cwd: repoRoot, allowFailure: true })
+  const tracked = await runFile('git', ['ls-files', '--error-unmatch', '--', checklistPath], { cwd: repoRoot, allowFailure: true, signal })
   if (tracked.exitCode !== 0) throw new Error('controlling checklist must be tracked by Git')
 }
 
-export async function createRunWorktree(repoRoot: string, checklistRelative: string, syncBranch: string, runId: string, fetch: boolean, syncMaxSeconds: number): Promise<GitSetup> {
-  await assertSourceReady(repoRoot, checklistRelative)
-  if (fetch) await runFile('git', ['fetch', '--prune'], { cwd: repoRoot, timeoutMs: syncMaxSeconds * 1000 })
-  const base = (await runFile('git', ['rev-parse', '--verify', `${syncBranch}^{commit}`], { cwd: repoRoot })).stdout.trim()
+export async function createRunWorktree(repoRoot: string, checklistRelative: string, syncBranch: string, runId: string, fetch: boolean, syncMaxSeconds: number, signal?: AbortSignal): Promise<GitSetup> {
+  await assertSourceReady(repoRoot, checklistRelative, signal)
+  if (fetch) await runFile('git', ['fetch', '--prune'], { cwd: repoRoot, timeoutMs: syncMaxSeconds * 1000, signal })
+  const base = (await runFile('git', ['rev-parse', '--verify', `${syncBranch}^{commit}`], { cwd: repoRoot, signal })).stdout.trim()
+  signal?.throwIfAborted()
   const slug = basename(checklistRelative).replace(/\.task\.md$/i, '').replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'tasks'
   const branch = `leppy-loop/${slug}-${runId}`
   const worktree = resolve(dirname(repoRoot), `${basename(repoRoot)}-${slug}-${runId}`)
+  // Worktree creation is a short critical section. Finish it and persist run
+  // ownership before the controller observes a cancellation.
   await runFile('git', ['worktree', 'add', '-b', branch, worktree, base], { cwd: repoRoot })
   const commonRaw = (await runFile('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot })).stdout.trim()
   const commonDir = realpathSync(resolve(repoRoot, commonRaw))
   return { repoRoot, commonDir, sourceHead: base, branch, worktree, checklistRelative }
+}
+
+/** Roll back a worktree that this invocation created but has not started using. */
+export async function discardUnstartedRunWorktree(repoRoot: string, worktree: string, branch: string): Promise<void> {
+  await runFile('git', ['worktree', 'remove', '--force', worktree], { cwd: repoRoot })
+  await runFile('git', ['branch', '-D', branch], { cwd: repoRoot })
 }
 
 export async function head(cwd: string): Promise<string> {

@@ -1,7 +1,4 @@
-- id: hmr
-  disabled: true
-
 - insert:
-    - id: leppy-loop-startup
-      name: leppy-loop-deepseek/startup
-      inject: [cmdlineArgs, llm, agentDefaultModel]
+    - id: leppy-loop-command
+      name: leppy-loop-deepseek
+      inject: [commands, tools, credentials, settings, llm, agentDefaultModel]

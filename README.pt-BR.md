@@ -4,30 +4,49 @@
 
 Leppy Loop é um bundle Cordis externo e nativo que executa uma checklist Markdown rastreada com um processo e uma sessão novos do DeepSeek Harness por linha de worker. O controller é dono do Git, worktree, transições da checklist, closure, gates, recuperação durável e leases de processo.
 
-A versão `0.1.0` é fixada no DeepSeek Harness `0.1.1-rc.2`, commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e).
+A versão `0.2.17` é fixada no DeepSeek Harness `0.1.1-rc.2`, commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). Ela registra o comando Host `/leppy-loop` e uma ferramenta de controller para o modelo, descobertos pelo composer Web e pelo agente sem patch de client.
 
 ## Instalação
 
-Requer Node `22.19+`, Git e pnpm `10.28.1`. O DeepSeek Harness repassa a gestão de plugins ao `pnpm` encontrado no `PATH`; pnpm 11 exige uma aprovação separada de builds nativos e não é uma combinação de instalação afirmada para `0.1.0`. Configure `DEEPSEEK_API_KEY` no serviço de credenciais do Harness:
+Requer Node `22.19+`, Git e pnpm `10.28.1`. O DeepSeek Harness repassa a gestão de plugins ao `pnpm` encontrado no `PATH`; pnpm 11 exige aprovação separada de builds nativos e não é uma combinação de instalação afirmada para `0.2.17`. Configure a credencial do provedor selecionado na página Models do Harness, gere o pacote e instale no profile usado pelo Web host. Os workers reutilizam automaticamente o provedor, o perfil do modelo e a credencial selecionados; `DEEPSEEK_API_KEY` não é necessária quando outro provedor está ativo:
 
 ```sh
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile leppy-loop add https://github.com/aleleppy/leppy-loop-deepseek/releases/download/v0.1.0/leppy-loop-deepseek-0.1.0.tgz
+pnpm install --frozen-lockfile
+pnpm build
+pnpm pack
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.2.17.tgz
 ```
+
+Reinicie o processo `dsh web` existente depois de alterar o profile. Refresh do navegador não compõe um plugin Host recém-instalado. Um tarball publicado no GitHub Release pode substituir o path do `.tgz` local; não há afirmação de publicação em registry de plugins.
 
 ## Uso rápido
 
-```sh
-npx @deepseek-ai/dsh@0.1.1-rc.2 --profile leppy-loop \
-  --tasks ./tasks/feature.task.md \
-  --sync-branch origin/main \
-  --phase-gate-command "pnpm test"
+Abra uma sessão Web cujo workspace seja o checkout limpo que contém a checklist rastreada e use apenas:
+
+```text
+/leppy-loop
 ```
 
-Prévia sem processo ou consumo de credencial:
+O comando enfileira um turno da IA. Ela inspeciona a conversa e o repositório, resolve a checklist rastreada pretendida e a base Git autoritativa, e chama a ferramenta privada `leppy_loop_start`. Se houver ambiguidade real, a IA faz uma única pergunta curta em vez de adivinhar. Texto natural depois do comando vira intenção para a IA, não argv; por exemplo: `/leppy-loop continue a checklist desta conversa`.
 
-```sh
-npx @deepseek-ai/dsh@0.1.1-rc.2 --profile leppy-loop \
-  --tasks ./tasks/feature.task.md --sync-branch origin/main --dry-run
+A forma determinística explícita continua disponível apenas quando a entrada começa com uma opção como `--tasks`:
+
+```text
+/leppy-loop --tasks ./tasks/feature.task.md --sync-branch origin/main --phase-gate-command "pnpm test"
+```
+
+Paths relativos partem do workspace da sessão. Argumentos explícitos usam uma gramática argv com aspas, sem avaliação de shell; o gate continua sendo um único argumento opaco explicitamente citado.
+
+A política padrão `adaptive` usa `gpt-5.6-terra` com esforço `high` nas tarefas comuns do OpenAI Codex e muda para `gpt-5.6-sol` com esforço `low` nas closures e na recuperação de uma tarefa parada. Uma tarefa comum que informa conclusão com árvore limpa e zero commits recebe automaticamente uma única nova tentativa pela política de recuperação. Se essa tentativa independente provar que o contrato `Done:` já está satisfeito pelo marcador terminal exato e deixar o branch limpo e inalterado, o controller fecha somente a checklist; WIP sujo, evidência ausente e zero commits repetido sem verificação continuam falhando de forma fechada. Metadados `model=`/`effort=` na linha e opções explícitas `--model`/`--effort` têm prioridade. Use `--worker-policy selected`, `terra-high` ou `sol-low` para escolher outro comportamento global. O limite padrão de transcript é 8192 KiB e pode ser alterado com `--worker-transcript-limit-kb`. Os recibos de retomada incluem `--recover-run <id>` para evitar ambiguidade quando ainda existem runs antigos com falha. Um ID exato também pode continuar um run seletivo já concluído na próxima linha aberta do branch/worktree preservado; runs concluídos nunca são escolhidos implicitamente.
+
+Durante um run Web, cada row selecionada cria um card durável no chat quando começa. O renderer Web do plugin atualiza localmente a duração daquela tentativa de tarefa a cada segundo; depois o mesmo card é finalizado com a contagem concluída/total e a duração final da tarefa em sucesso, stall ou falha (por exemplo, `Task completed — 14/57 — 3m 12s elapsed.`). Uma row interrompida e recuperada começa um novo card e timer de tentativa; uma verificação interna de no-commit permanece no card e na duração originais. Somente os registros inicial e terminal são duráveis e ambos ficam fora do contexto do modelo, portanto o timer ao vivo não grava eventos por segundo, não consome tokens nem quebra o pareamento entre tool call e resultado.
+
+Runs Web agora terminam apenas localmente por padrão depois que todas as linhas e gates passam. Somente um slash command direto e escrito pelo humano com `--open-pr` pode fazer o controller buscar e rebasear a base remota, enviar o branch Leppy, criar ou encontrar a pull request com `gh`, salvar a URL e devolvê-la ao chat. A ferramenta autônoma do modelo não pode habilitar publicação, e workers continuam sem permissão para push ou `gh`. Instale e autentique o GitHub CLI (`gh auth status`) antes de optar pela publicação.
+
+Prévia sem worker ou consumo de credencial:
+
+```text
+/leppy-loop --tasks ./tasks/feature.task.md --sync-branch origin/main --dry-run
 ```
 
 ## Contrato da checklist
@@ -46,7 +65,7 @@ npx @deepseek-ai/dsh@0.1.1-rc.2 --profile leppy-loop \
 - `[~]`: gate do controller aberto.
 - `[x]`: linha concluída de qualquer tipo.
 
-Tarefa comum exige `Done:` não vazio e paths repo-relative explícitos em `paths=` ou entre crases. `--task-match` é substring literal. Paths passam por `realpath`; traversal, absoluto e symlink/junction escapando do repositório são recusados. O worker nunca pode ler ou editar a checklist controladora.
+Tarefa comum exige `Done:` não vazio e paths repo-relative explícitos em `paths=` ou entre crases. A capability de commit faz stage somente dos arquivos alterados exatos já validados; um arquivo ignorado e não rastreado só é elegível quando está sob um desses escopos explícitos, permitindo migrations intencionalmente versionadas sem varrer material ignorado não relacionado. `--task-match` é substring literal. Paths passam por `realpath`; traversal, absoluto e symlink/junction escapando do repositório são recusados. O worker nunca pode ler ou editar a checklist controladora.
 
 ## Semântica
 

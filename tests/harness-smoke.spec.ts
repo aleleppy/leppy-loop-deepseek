@@ -23,7 +23,7 @@ describe('real Harness keyless composition', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'leppy-keyless-state-'))
     const task: ChecklistTask = { index: 0, line: 1, phase: 'P', mark: ' ', kind: 'task', text: 'change value', raw: '- [ ] change', metadata: { done: 'value changed', paths: ['src/value.txt'] } }
     const adapter = new HarnessWorkerAdapter({
-      credential: async () => 'keyless-unused',
+      credential: async () => ({ envName: 'REPLAY_API_KEY', value: 'keyless-unused', providerProfile: {} }),
       workerHostPath: join(project, 'dist', 'worker-host.js'),
       workerConfigPath: join(project, 'tests', 'fixtures', 'keyless-worker.cordis.yml'),
       runtimeEnv: {

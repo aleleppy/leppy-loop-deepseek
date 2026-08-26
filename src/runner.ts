@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSyn
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   assertSourceReady, assertTaskCommit, branch as gitBranch, commitControllerChange,
-  commitCount, commitSubject, createRunWorktree, head, isConventional, resolveRepoRoot,
+  commitCount, commitSubject, createRunWorktree, discardUnstartedRunWorktree, head, isConventional, resolveRepoRoot,
   status as gitStatus, summarizeDiff, writeChecklistAndAmend,
 } from './git.js'
 import { lintChecklist, markTaskDone, parseChecklist, selectTask } from './checklist.js'
@@ -14,7 +14,7 @@ import { runFile, runOpaqueShell } from './process.js'
 import { physicalRelative } from './path.js'
 import type {
   ChecklistTask, LeppyLoopOptions, ModelCapability, RunDependencies, RunEvent,
-  RunEventType, RunResult, WorkerRequest,
+  RunEventType, RunProgress, RunResult, WorkerRequest,
 } from './types.js'
 
 const DEFAULTS = {
@@ -22,8 +22,9 @@ const DEFAULTS = {
   syncMaxSeconds: 120,
   workerTimeoutMs: 30 * 60_000,
   workerOutputLimitBytes: 192 * 1024,
-  workerTranscriptLimitBytes: 2 * 1024 * 1024,
-  provider: 'deepseek-official',
+  workerTranscriptLimitBytes: 8 * 1024 * 1024,
+  workerPolicy: 'adaptive',
+  openPullRequest: false,
 } as const
 
 interface RunState {
@@ -40,22 +41,73 @@ interface RunState {
   attempt: number
   completedTasks: number
   gateAttempts: Record<string, number>
+  pullRequestUrl?: string
   updatedAt: string
 }
 
 function digest(text: string): string { return createHash('sha256').update(text).digest('hex') }
 function safeSlug(value: string): string { return value.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'default' }
+function commandArgument(value: string): string { return `"${value.replaceAll('"', '\\"')}"` }
 function inside(root: string, path: string): boolean { const rel = relative(root, path); return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel)) }
 
 function event(runId: string, type: RunEventType, phase: RunEvent['phase'], data: Record<string, unknown>, task?: ChecklistTask, attempt?: number): RunEvent {
   return { schemaVersion: 1, type, runId, timestamp: new Date().toISOString(), phase, ...(task ? { taskIndex: task.index } : {}), ...(attempt ? { attempt } : {}), data }
 }
 
-function selectedModel(task: ChecklistTask, options: LeppyLoopOptions, fallback: { provider: string; model: string; effort?: string }): { provider: string; model: string; effort?: string } {
+function alreadySatisfiedEvidence(output: string): boolean {
+  const lines = output.trimEnd().split(/\r?\n/u)
+  const evidence = lines.filter(line => /^LEPPY_ALREADY_SATISFIED:\s+\S/u.test(line))
+  return evidence.length === 1 && lines.at(-1) === evidence[0]
+}
+
+function taskProgress(state: RunState, task: ChecklistTask, totalTasks: number, type: RunProgress['type'], elapsedMs: number, error?: string, attempt = state.attempt): RunProgress {
   return {
-    provider: options.provider ?? fallback.provider,
-    model: task.metadata.model ?? options.model ?? fallback.model,
-    ...(task.metadata.effort ?? options.effort ?? fallback.effort ? { effort: task.metadata.effort ?? options.effort ?? fallback.effort } : {}),
+    type,
+    runId: state.runId,
+    taskIndex: task.index,
+    attempt,
+    kind: task.kind,
+    phase: task.phase,
+    text: task.text,
+    completedTasks: state.completedTasks,
+    totalTasks,
+    elapsedMs: Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0,
+    ...(error ? { error } : {}),
+  }
+}
+
+function policySelection(
+  provider: string,
+  policy: NonNullable<LeppyLoopOptions['workerPolicy']>,
+  task: ChecklistTask,
+  retry: boolean,
+  catalog: readonly ModelCapability[],
+): { model: string; effort: string } | undefined {
+  if (provider !== 'openai-codex' || policy === 'selected') return undefined
+  const desired = policy === 'terra-high'
+    ? { model: 'gpt-5.6-terra', effort: 'high' }
+    : policy === 'sol-low'
+      ? { model: 'gpt-5.6-sol', effort: 'low' }
+      : retry || task.kind === 'closure'
+        ? { model: 'gpt-5.6-sol', effort: 'low' }
+        : { model: 'gpt-5.6-terra', effort: 'high' }
+  return catalog.some(entry => entry.id === desired.model) ? desired : undefined
+}
+
+function selectedModel(
+  task: ChecklistTask,
+  options: LeppyLoopOptions,
+  fallback: { provider: string; model: string; effort?: string },
+  catalog: readonly ModelCapability[],
+  retry = false,
+): { provider: string; model: string; effort?: string } {
+  const provider = options.provider ?? fallback.provider
+  const policy = policySelection(provider, options.workerPolicy ?? 'adaptive', task, retry, catalog)
+  const effort = task.metadata.effort ?? options.effort ?? policy?.effort ?? fallback.effort
+  return {
+    provider,
+    model: task.metadata.model ?? options.model ?? policy?.model ?? fallback.model,
+    ...(effort ? { effort } : {}),
   }
 }
 
@@ -107,7 +159,7 @@ async function terminateAuthenticatedLease(stateDir: string, runId: string): Pro
   }
 }
 
-async function recoverState(base: string, repoRoot: string, checklistRelative: string): Promise<{ state: RunState; dir: string } | undefined> {
+async function recoverState(base: string, repoRoot: string, checklistRelative: string, requestedRunId?: string): Promise<{ state: RunState; dir: string } | undefined> {
   if (!existsSync(base)) return undefined
   const matches: { state: RunState; dir: string }[] = []
   for (const name of readdirSync(base)) {
@@ -116,13 +168,20 @@ async function recoverState(base: string, repoRoot: string, checklistRelative: s
     const proof = join(dir, 'ownership.hmac')
     if (!existsSync(path) || !existsSync(proof)) continue
     const state = JSON.parse(readFileSync(path, 'utf8')) as RunState
-    if (state.status === 'completed' || state.repoRoot !== repoRoot || state.checklistRelative !== checklistRelative) continue
+    if (state.repoRoot !== repoRoot || state.checklistRelative !== checklistRelative) continue
+    if (requestedRunId && state.runId !== requestedRunId) continue
+    if (state.status === 'completed' && !requestedRunId) continue
     const key = createLeaseKey(dir)
     if (readFileSync(proof, 'utf8').trim() !== ownership(state, key)) continue
     matches.push({ state, dir })
   }
-  if (matches.length > 1) throw new Error('multiple authenticated matching runs exist; recovery is ambiguous')
-  const match = matches[0]
+  let candidates = matches
+  if (!requestedRunId && matches.length > 1) {
+    const intentionallyRecoverable = matches.filter(entry => entry.state.status === 'stalled' || entry.state.status === 'interrupted')
+    if (intentionallyRecoverable.length === 1) candidates = intentionallyRecoverable
+    else throw new Error(`multiple authenticated matching runs exist; select one with --recover-run <id>: ${matches.map(entry => entry.state.runId).join(', ')}`)
+  }
+  const match = candidates[0]
   if (!match) return undefined
   if (!existsSync(match.state.worktree) || await gitBranch(match.state.worktree) !== match.state.branch) throw new Error('authenticated run worktree or branch no longer matches')
   await terminateAuthenticatedLease(match.dir, match.state.runId)
@@ -142,28 +201,50 @@ function dryRunResult(runId: string, task: ChecklistTask | undefined, diagnostic
     gate: options.phaseGateCommand ?? task?.metadata.gate ?? null,
     diagnostics,
   }
-  process.stdout.write(`${JSON.stringify(preview, null, 2)}\n`)
-  return { runId, status: 'dry-run', branch, worktree, completedTasks: 0, ...(task ? { currentTask: task.index } : {}), diagnostics }
+  return { runId, status: 'dry-run', branch, worktree, completedTasks: 0, ...(task ? { currentTask: task.index } : {}), diagnostics, preview }
+}
+
+function abortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason
+  return new Error(typeof signal.reason === 'string' ? signal.reason : 'interrupted')
 }
 
 export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDependencies = {}): Promise<RunResult> {
+  const processAbort = new AbortController()
+  const interrupt = (): void => processAbort.abort(new Error('interrupted'))
+  process.once('SIGINT', interrupt)
+  process.once('SIGTERM', interrupt)
+  const signal = dependencies.signal
+    ? AbortSignal.any([dependencies.signal, processAbort.signal])
+    : processAbort.signal
+  try {
+    if (signal.aborted) throw abortReason(signal)
+    return await runLeppyLoopControlled(input, dependencies, signal)
+  } finally {
+    process.removeListener('SIGINT', interrupt)
+    process.removeListener('SIGTERM', interrupt)
+  }
+}
+
+async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: RunDependencies, signal: AbortSignal): Promise<RunResult> {
   const options = { ...DEFAULTS, ...input }
+  const clock = dependencies.now ?? (() => new Date())
   const runId = dependencies.runId?.() ?? randomUUID().replaceAll('-', '').slice(0, 12)
   const tasksAbsolute = realpathSync(resolve(options.tasks))
-  const repoRoot = realpathSync(options.repoRoot ?? await resolveRepoRoot(dirname(tasksAbsolute)))
+  const repoRoot = realpathSync(options.repoRoot ?? await resolveRepoRoot(dirname(tasksAbsolute), signal))
   const checklistRelative = physicalRelative(repoRoot, tasksAbsolute)
   if (checklistRelative === undefined) throw new Error('--tasks must be inside the source repository')
-  await assertSourceReady(repoRoot, checklistRelative)
-  const fallbackSelection = dependencies.defaultModel ? await dependencies.defaultModel() : { provider: options.provider, model: options.model ?? 'deepseek-v4-flash', ...(options.effort ? { effort: options.effort } : {}) }
+  await assertSourceReady(repoRoot, checklistRelative, signal)
+  const fallbackSelection = dependencies.defaultModel ? await dependencies.defaultModel() : { provider: options.provider ?? 'deepseek-official', model: options.model ?? 'deepseek-v4-flash', ...(options.effort ? { effort: options.effort } : {}) }
   const provider = options.provider ?? fallbackSelection.provider
   const catalog = dependencies.modelCatalog ? await dependencies.modelCatalog(provider) : [{ id: options.model ?? fallbackSelection.model }]
   const parsedSource = parseChecklist(tasksAbsolute)
   const initialTask = selectTask(parsedSource, options.taskMatch)
-  const previewModel = initialTask ? selectedModel(initialTask, options, fallbackSelection) : fallbackSelection
-  const defaultEffort = options.effort ?? fallbackSelection.effort
+  const previewModel = initialTask ? selectedModel(initialTask, options, fallbackSelection, catalog) : fallbackSelection
+  const defaultEffort = previewModel.effort
   const diagnostics = lintChecklist(parsedSource, {
     repoRoot, controllerPath: tasksAbsolute, models: catalog, provider,
-    defaultModel: options.model ?? fallbackSelection.model,
+    defaultModel: previewModel.model,
     ...(defaultEffort ? { defaultEffort } : {}),
     ...(options.phaseGateCommand ? { phaseGateCommand: options.phaseGateCommand } : {}),
   })
@@ -171,28 +252,37 @@ export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDep
   if (diagnostics.some(item => item.severity === 'error')) throw new Error(`checklist lint failed:\n${diagnostics.map(item => `${item.line ?? '-'} ${item.code}: ${item.message}`).join('\n')}`)
   if (!dependencies.worker) throw new Error('runLeppyLoop requires a WorkerAdapter outside the Harness bundle')
 
-  const commonRaw = (await runFile('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot })).stdout.trim()
+  const commonRaw = (await runFile('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot, signal })).stdout.trim()
   const commonDir = realpathSync(resolve(repoRoot, commonRaw))
   const stateBase = resolve(options.artifactsDir ?? join(commonDir, 'leppy-loop', 'runs'))
   mkdirSync(stateBase, { recursive: true })
   let state: RunState
   let stateDir: string
   let releaseLock: (() => void) | undefined
-  const recovered = options.recoverExistingWip ? await recoverState(stateBase, repoRoot, checklistRelative) : undefined
-  if (options.recoverExistingWip && !recovered) throw new Error('no authenticated matching WIP run exists')
+  const recovered = options.recoverExistingWip ? await recoverState(stateBase, repoRoot, checklistRelative, options.recoverRunId) : undefined
+  if (options.recoverExistingWip && !recovered) throw new Error('no authenticated matching run exists')
+  if (!recovered && !initialTask) throw new Error('checklist contains no open executable rows')
   if (recovered) {
     state = recovered.state
     stateDir = recovered.dir
     releaseLock = acquireLock(commonDir, state.runId)
-    appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-start', 'recovery', { worktree: state.worktree }))
+    const previousStatus = state.status
+    state.status = 'running'
+    writeState(join(stateDir, 'run.json'), state)
+    appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-start', 'recovery', { worktree: state.worktree, previousStatus }))
     appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', { taskIndex: state.currentTask ?? null }))
   } else {
     releaseLock = acquireLock(commonDir, runId)
     try {
-      const setup = await createRunWorktree(repoRoot, checklistRelative, options.syncBranch, runId, options.fetch ?? true, options.syncMaxSeconds)
+      const setup = await createRunWorktree(repoRoot, checklistRelative, options.syncBranch, runId, options.fetch ?? true, options.syncMaxSeconds, signal)
+      const baseTask = selectTask(parseChecklist(join(setup.worktree, checklistRelative)), options.taskMatch)
+      if (!baseTask) {
+        await discardUnstartedRunWorktree(repoRoot, setup.worktree, setup.branch)
+        throw new Error('authoritative base checklist contains no open executable rows')
+      }
       stateDir = statePath(stateBase, runId)
       mkdirSync(stateDir, { recursive: true })
-      state = { schemaVersion: 1, runId, status: 'running', repoRoot, checklistRelative, sourceHead: setup.sourceHead, branch: setup.branch, worktree: setup.worktree, syncBranch: options.syncBranch, attempt: 0, completedTasks: 0, gateAttempts: {}, updatedAt: new Date().toISOString() }
+      state = { schemaVersion: 1, runId, status: 'running', repoRoot, checklistRelative, sourceHead: setup.sourceHead, branch: setup.branch, worktree: setup.worktree, syncBranch: options.syncBranch, attempt: 0, completedTasks: 0, gateAttempts: {}, updatedAt: clock().toISOString() }
       const key = createLeaseKey(stateDir)
       writeState(join(stateDir, 'run.json'), state)
       writeFileSync(join(stateDir, 'ownership.hmac'), `${ownership(state, key)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
@@ -205,43 +295,87 @@ export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDep
   }
 
   const eventsPath = join(stateDir, 'events.jsonl')
-  const abort = new AbortController()
-  const interrupt = (): void => abort.abort(new Error('interrupted'))
-  process.once('SIGINT', interrupt)
-  process.once('SIGTERM', interrupt)
+  let activeProgress: { task: ChecklistTask; totalTasks: number; attempt: number; startedAtMs: number } | undefined
+  const settleProgress = async (type: 'task-done' | 'task-failed', error?: string): Promise<void> => {
+    const active = activeProgress
+    if (!active) return
+    activeProgress = undefined
+    const elapsedMs = clock().getTime() - active.startedAtMs
+    await dependencies.onProgress?.(taskProgress(state, active.task, active.totalTasks, type, elapsedMs, error, active.attempt))
+  }
   try {
     for (let iteration = 0; iteration < options.maxIterations; iteration += 1) {
+      if (signal.aborted) throw abortReason(signal)
       const checklistPath = join(state.worktree, checklistRelative)
       const parsed = parseChecklist(checklistPath)
       const task = selectTask(parsed, options.taskMatch)
       if (!task) {
-        state.status = 'completed'
         delete state.currentTask
+        if (options.openPullRequest && !state.pullRequestUrl) {
+          if (!dependencies.publishPullRequest) throw new Error('pull request publication is unavailable in this composition')
+          appendEvent(eventsPath, event(state.runId, 'publish-start', 'publish', { branch: state.branch, syncBranch: state.syncBranch }))
+          try {
+            state.pullRequestUrl = await dependencies.publishPullRequest({
+              runId: state.runId,
+              repoRoot: state.repoRoot,
+              worktree: state.worktree,
+              branch: state.branch,
+              syncBranch: state.syncBranch,
+            }, signal)
+            writeState(join(stateDir, 'run.json'), state)
+            appendEvent(eventsPath, event(state.runId, 'publish-done', 'publish', { url: state.pullRequestUrl }))
+          } catch (error) {
+            const message = redact(error instanceof Error ? error.message : String(error))
+            state.status = 'stalled'
+            writeState(join(stateDir, 'run.json'), state)
+            appendEvent(eventsPath, event(state.runId, 'stall', 'publish', { reason: message }))
+            atomicWriteJson(join(stateDir, 'resume.json'), {
+              schemaVersion: 1,
+              runId: state.runId,
+              reason: 'pull request publication stalled',
+              command: `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)}`,
+            })
+            return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, diagnostics }
+          }
+        }
+        state.status = 'completed'
         writeState(join(stateDir, 'run.json'), state)
-        appendEvent(eventsPath, event(state.runId, 'run-end', 'complete', { status: 'completed', completedTasks: state.completedTasks }))
-        return { runId: state.runId, status: 'completed', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, diagnostics }
+        appendEvent(eventsPath, event(state.runId, 'run-end', 'complete', { status: 'completed', completedTasks: state.completedTasks, pullRequestUrl: state.pullRequestUrl ?? null }))
+        return { runId: state.runId, status: 'completed', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, diagnostics, ...(state.pullRequestUrl ? { pullRequestUrl: state.pullRequestUrl } : {}) }
       }
+      const retryingRecoveredTask = Boolean(recovered && state.currentTask === task.index)
+      const literalMatch = options.taskMatch
+      const remainingTasks = parsed.tasks.filter(candidate =>
+        candidate.mark !== 'x' && (literalMatch === undefined || candidate.raw.includes(literalMatch)))
+      const totalTasks = state.completedTasks + remainingTasks.length
       state.currentTask = task.index
       state.attempt += 1
       writeState(join(stateDir, 'run.json'), state)
+      const progressStartedAtMs = clock().getTime()
+      await dependencies.onProgress?.(taskProgress(state, task, totalTasks, 'task-start', 0))
+      activeProgress = { task, totalTasks, attempt: state.attempt, startedAtMs: progressStartedAtMs }
       if (task.kind === 'gate') {
         const command = task.metadata.gate ?? options.phaseGateCommand!
         const key = `${task.index}:${fingerprint(command)}`
         if ((state.gateAttempts[key] ?? 0) > 0) {
-          appendEvent(eventsPath, event(state.runId, 'stall', 'gate', { reason: 'gate requires an explicit new invocation after any prior attempt' }, task, state.attempt))
+          const reason = 'gate requires an explicit new invocation after any prior attempt'
+          appendEvent(eventsPath, event(state.runId, 'stall', 'gate', { reason }, task, state.attempt))
           state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
+          await settleProgress('task-failed', reason)
           return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
         }
         state.gateAttempts[key] = 1
         writeState(join(stateDir, 'run.json'), state)
         appendEvent(eventsPath, event(state.runId, 'gate-start', 'gate', { commandFingerprint: fingerprint(command) }, task, state.attempt))
-        const gate = await runOpaqueShell(command, state.worktree, abort.signal, scrubEnvironment(process.env))
+        const gate = await runOpaqueShell(command, state.worktree, signal, scrubEnvironment(process.env))
+        if (signal.aborted) throw abortReason(signal)
         const receipt = { schemaVersion: 1, runId: state.runId, taskIndex: task.index, attempt: state.attempt, commandFingerprint: fingerprint(command), exitCode: gate.exitCode, stdout: redact(gate.stdout), stderr: redact(gate.stderr), timestamp: new Date().toISOString() }
         mkdirSync(join(stateDir, 'receipts'), { recursive: true })
         atomicWriteJson(join(stateDir, 'receipts', `gate-${task.index}-${state.attempt}.json`), receipt)
         if (gate.exitCode !== 0) {
           appendEvent(eventsPath, event(state.runId, 'gate-failed', 'gate', { exitCode: gate.exitCode }, task, state.attempt))
           state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
+          await settleProgress('task-failed', `gate exited with code ${gate.exitCode}`)
           return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
         }
         const completed = markTaskDone(parsed, task)
@@ -253,10 +387,11 @@ export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDep
         state.completedTasks += 1
         writeState(join(stateDir, 'run.json'), state)
         appendEvent(eventsPath, event(state.runId, 'gate-end', 'gate', { exitCode: 0 }, task, state.attempt))
+        await settleProgress('task-done')
         continue
       }
 
-      const model = selectedModel(task, options, fallbackSelection)
+      const model = selectedModel(task, options, fallbackSelection, catalog, retryingRecoveredTask)
       validateModelSelection(catalog, model.model, model.effort)
       const controllerHash = digest(readFileSync(checklistPath, 'utf8'))
       const previousHead = await head(state.worktree)
@@ -271,22 +406,82 @@ export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDep
         instructions,
       }
       appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: model.model, effort: model.effort ?? null, paths: task.metadata.paths }, task, state.attempt))
-      let outcome = await dependencies.worker.run(request, abort.signal)
-      if (outcome.status === 'unavailable' && options.fallbackModel && options.fallbackModel !== model.model) {
-        validateModelSelection(catalog, options.fallbackModel, model.effort)
-        outcome = await dependencies.worker.run({ ...request, model: options.fallbackModel, attempt: state.attempt + 1 }, abort.signal)
+      if (signal.aborted) throw abortReason(signal)
+      let outcome = await dependencies.worker.run(request, signal)
+      let outcomeAttempt = state.attempt
+      let retryUsed = false
+      let verifyingNoCommit = false
+      if (outcome.status === 'unavailable') {
+        const retryModel = options.fallbackModel
+          ? { ...model, model: options.fallbackModel }
+          : selectedModel(task, options, fallbackSelection, catalog, true)
+        if (retryModel.model !== model.model || retryModel.effort !== model.effort) {
+          validateModelSelection(catalog, retryModel.model, retryModel.effort)
+          if (signal.aborted) throw abortReason(signal)
+          outcomeAttempt += 1
+          const retryRequest: WorkerRequest = {
+            ...request,
+            model: retryModel.model,
+            attempt: outcomeAttempt,
+            ...(retryModel.effort ? { effort: retryModel.effort } : {}),
+          }
+          if (!retryModel.effort) delete retryRequest.effort
+          appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'availability' }, task, outcomeAttempt))
+          outcome = await dependencies.worker.run(retryRequest, signal)
+          retryUsed = true
+        }
       }
+      if (signal.aborted) throw abortReason(signal)
       if (digest(readFileSync(checklistPath, 'utf8')) !== controllerHash) throw new Error('worker altered the controlling checklist')
+      if (task.kind === 'task'
+        && outcome.status === 'completed'
+        && !retryUsed
+        && await commitCount(state.worktree, previousHead) === 0
+        && (await gitStatus(state.worktree)).trim() === '') {
+        const retryModel = selectedModel(task, options, fallbackSelection, catalog, true)
+        validateModelSelection(catalog, retryModel.model, retryModel.effort)
+        if (signal.aborted) throw abortReason(signal)
+        outcomeAttempt += 1
+        const retryRequest: WorkerRequest = {
+          ...request,
+          model: retryModel.model,
+          attempt: outcomeAttempt,
+          instructions: [
+            ...request.instructions,
+            'A prior attempt reported completion but produced no commit. Independently re-evaluate the Done contract. If work is missing, implement it and finish with exactly one conventional commit. If the Done contract is already fully satisfied and no repository change is needed, leave the tree clean and end with exactly one evidence line: LEPPY_ALREADY_SATISFIED: <concrete evidence>. Do not use that marker when any required work remains.',
+          ],
+          ...(retryModel.effort ? { effort: retryModel.effort } : {}),
+        }
+        if (!retryModel.effort) delete retryRequest.effort
+        appendEvent(eventsPath, event(state.runId, 'start', 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'no-commit' }, task, outcomeAttempt))
+        verifyingNoCommit = true
+        outcome = await dependencies.worker.run(retryRequest, signal)
+        retryUsed = true
+        if (signal.aborted) throw abortReason(signal)
+        if (digest(readFileSync(checklistPath, 'utf8')) !== controllerHash) throw new Error('worker altered the controlling checklist')
+      }
+      if (outcomeAttempt !== state.attempt) {
+        state.attempt = outcomeAttempt
+        writeState(join(stateDir, 'run.json'), state)
+      }
       if (outcome.status !== 'completed') {
         const type = outcome.status === 'timeout' ? 'timeout' : 'stall'
-        appendEvent(eventsPath, event(state.runId, type, task.kind === 'closure' ? 'closure' : 'worker', { status: outcome.status, error: outcome.error ?? null }, task, state.attempt))
+        appendEvent(eventsPath, event(state.runId, type, task.kind === 'closure' ? 'closure' : 'worker', { status: outcome.status, error: outcome.error ?? null }, task, outcomeAttempt))
         state.status = outcome.status === 'interrupted' ? 'interrupted' : 'stalled'
         writeState(join(stateDir, 'run.json'), state)
-        atomicWriteJson(join(stateDir, 'resume.json'), { runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: outcome.status, worktree: state.worktree, command: `dsh --profile leppy-loop --tasks ${JSON.stringify(checklistRelative)} --sync-branch ${JSON.stringify(state.syncBranch)} --recover-existing-wip` })
+        atomicWriteJson(join(stateDir, 'resume.json'), { runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: outcome.status, worktree: state.worktree, command: `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)}` })
+        await settleProgress('task-failed', outcome.error ?? outcome.status)
         return { runId: state.runId, status: state.status, branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
       }
-      if (task.kind === 'task') {
+      const verifiedAlreadySatisfied = task.kind === 'task'
+        && verifyingNoCommit
+        && await commitCount(state.worktree, previousHead) === 0
+        && (await gitStatus(state.worktree)).trim() === ''
+        && alreadySatisfiedEvidence(outcome.output)
+      if (task.kind === 'task' && !verifiedAlreadySatisfied) {
         await assertTaskCommit(state.worktree, previousHead, state.branch)
+      } else if (task.kind === 'task') {
+        if (await gitBranch(state.worktree) !== state.branch) throw new Error('verification worker changed the run branch')
       } else {
         if (await gitBranch(state.worktree) !== state.branch) throw new Error('closure changed the run branch')
         const count = await commitCount(state.worktree, previousHead)
@@ -304,19 +499,24 @@ export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDep
       state.completedTasks += 1
       writeState(join(stateDir, 'run.json'), state)
       writeFileSync(join(stateDir, `diff-${task.index}.txt`), await summarizeDiff(state.worktree, previousHead), 'utf8')
-      appendEvent(eventsPath, event(state.runId, 'done', task.kind === 'closure' ? 'closure' : 'worker', { commit: await head(state.worktree) }, task, state.attempt))
+      appendEvent(eventsPath, event(state.runId, 'done', task.kind === 'closure' ? 'closure' : 'worker', { commit: await head(state.worktree), ...(verifiedAlreadySatisfied ? { verifiedAlreadySatisfied: true } : {}) }, task, outcomeAttempt))
+      await settleProgress('task-done')
     }
     appendEvent(eventsPath, event(state.runId, 'stall', 'complete', { reason: 'max iterations reached' }))
     state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
     return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, ...(state.currentTask !== undefined ? { currentTask: state.currentTask } : {}), diagnostics }
   } catch (error) {
-    if (state.status === 'running') state.status = abort.signal.aborted ? 'interrupted' : 'failed'
+    const message = redact(error instanceof Error ? error.message : String(error))
+    if (state.status === 'running') state.status = signal.aborted ? 'interrupted' : 'failed'
     writeState(join(stateDir, 'run.json'), state)
-    appendEvent(eventsPath, event(state.runId, 'run-end', 'complete', { status: state.status, error: redact(error instanceof Error ? error.message : String(error)) }))
+    appendEvent(eventsPath, event(state.runId, 'run-end', 'complete', { status: state.status, error: message }))
+    try {
+      await settleProgress('task-failed', message)
+    } catch {
+      // Preserve the controller failure even if the best-effort progress card cannot settle.
+    }
     throw error
   } finally {
-    process.removeListener('SIGINT', interrupt)
-    process.removeListener('SIGTERM', interrupt)
     releaseLock?.()
   }
 }
