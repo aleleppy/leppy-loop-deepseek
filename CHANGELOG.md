@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [0.2.20] - 2026-08-27
+
+### Fixed
+
+- Terminal `turn/end` and streaming `finish` errors emitted by the isolated Harness SDK runtime are now propagated even when `run()` resolves with an empty final response.
+- Codex overload, temporary-unavailability, rate-limit and HTTP 502/503 terminal notifications are classified as availability failures, selecting the configured/adaptive Sol recovery once and otherwise stalling with an exact resume receipt instead of entering zero-commit verification.
+
 ## [0.2.19] - 2026-08-27
 
 ### Fixed

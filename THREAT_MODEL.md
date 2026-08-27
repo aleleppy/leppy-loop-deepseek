@@ -14,7 +14,7 @@
 - Checklist denied by file tools and verified by digest after every worker.
 - Exact argv tool; worker shell interpreters, dynamic eval, remote clients, `git push`, `gh`, publication/deploy, integration, and worktree commands denied.
 - Ordinary commands wrapped by the official `workspace-write` sandbox with no escalation path.
-- Narrow commit capability validates every changed path and stages only the exact changed-path set. Ignored untracked files are discovered only beneath explicitly declared task scopes before a narrow force-add, so a scoped versioned migration is permitted without sweeping unrelated ignored material. A completed clean-tree ordinary attempt with zero commits may retry once. The controller never manufactures an empty commit: it accepts a repeated zero-commit result only with one exact final already-satisfied evidence marker from the independent retry on a clean unchanged branch, then records a checklist-only closure commit; dirty WIP or missing evidence still fails.
+- Narrow commit capability validates every changed path and stages only the exact changed-path set. Ignored untracked files are discovered only beneath explicitly declared task scopes before a narrow force-add, so a scoped versioned migration is permitted without sweeping unrelated ignored material. A completed clean-tree ordinary attempt with zero commits may retry once. Terminal Agent errors observed in SDK notifications are classified before this branch, so provider overload cannot masquerade as a completed no-commit task. The controller never manufactures an empty commit: it accepts a repeated zero-commit result only with one exact final already-satisfied evidence marker from the independent retry on a clean unchanged branch, then records a checklist-only closure commit; dirty WIP or missing evidence still fails.
 - The selected provider credential is resolved by Harness or its isolated credential store and remains inside the model runtime; model-facing tools never expose it, and their subprocess environments are scrubbed.
 - Recursive redaction of sensitive names, known values, headers, and URL userinfo.
 - Atomic state, per-common-dir lock, HMAC ownership proofs and leases, PID plus process-start identity checks, and tree-scoped termination.
@@ -26,7 +26,7 @@
 
 ## Explicit non-goals
 
-The Harness filesystem sandbox does not confine network. Existing repository scripts may access network, invoke native code, exploit the OS account, or hide behavior behind an otherwise permitted test command. The v0.2.19 boundary assumes the repository and its existing scripts are trusted.
+The Harness filesystem sandbox does not confine network. Existing repository scripts may access network, invoke native code, exploit the OS account, or hide behavior behind an otherwise permitted test command. The v0.2.20 boundary assumes the repository and its existing scripts are trusted.
 
 The narrow Git commit bridge writes shared Git metadata. Validation prevents it from staging out-of-scope worktree paths, but a hostile repository with crafted Git configuration/hooks could affect commit execution. Leppy sets no blanket claim against malicious Git hooks; use clean trusted repositories and review local Git configuration.
 

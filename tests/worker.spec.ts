@@ -2,7 +2,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { HarnessWorkerAdapter } from '../src/worker.js'
+import { HarnessWorkerAdapter, workerFailureFromNotification, workerStatusForFailure } from '../src/worker.js'
 import type { WorkerRequest } from '../src/types.js'
 
 function request(stateDir: string): WorkerRequest {
@@ -42,6 +42,27 @@ describe('Harness worker cancellation', () => {
     control.abort(new Error('request canceled'))
     releaseCredential({ envName: 'UNUSED_API_KEY', value: 'unused-key' })
     await expect(running).rejects.toThrow('request canceled')
+  })
+
+  it('classifies terminal SDK overload notifications as unavailable', () => {
+    const terminal = {
+      method: 'session.event',
+      params: { event: { type: 'turn/end', data: { reason: { kind: 'error', error: { message: 'Codex error: Our servers are currently overloaded. Please try again later.', code: 'PI_AI_ERROR' } } } } },
+    }
+    const chunk = {
+      method: 'session.event',
+      params: { event: { type: 'assistant/chunk', data: { chunk: { type: 'finish', reason: { kind: 'error', failure: { message: '503 temporarily unavailable' } } } } } },
+    }
+    expect(workerFailureFromNotification(terminal)).toContain('overloaded')
+    expect(workerStatusForFailure(workerFailureFromNotification(terminal)!)).toBe('unavailable')
+    expect(workerFailureFromNotification(chunk)).toBe('503 temporarily unavailable')
+    expect(workerStatusForFailure('request timeout after 30s')).toBe('timeout')
+    expect(workerStatusForFailure('invalid response')).toBe('failed')
+  })
+
+  it('ignores successful and unrelated SDK notifications', () => {
+    expect(workerFailureFromNotification({ method: 'session.event', params: { event: { type: 'turn/end', data: { reason: { kind: 'completed' } } } } })).toBeUndefined()
+    expect(workerFailureFromNotification({ method: 'session.status', params: { status: 'idle' } })).toBeUndefined()
   })
 
   it('rejects a pre-aborted signal before requesting credentials', async () => {

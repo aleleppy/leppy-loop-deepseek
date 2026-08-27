@@ -23,6 +23,37 @@ export interface HarnessWorkerAdapterOptions {
 
 function byteLength(value: string): number { return Buffer.byteLength(value, 'utf8') }
 
+function nestedRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' ? value as Record<string, unknown> : undefined
+}
+
+/** Extract an Agent failure because SDK run() may resolve after a terminal error notification. */
+export function workerFailureFromNotification(notification: unknown): string | undefined {
+  const envelope = nestedRecord(notification)
+  if (envelope?.method !== 'session.event') return undefined
+  const params = nestedRecord(envelope.params)
+  const event = nestedRecord(params?.event)
+  const data = nestedRecord(event?.data)
+  if (event?.type === 'turn/end') {
+    const reason = nestedRecord(data?.reason)
+    const error = nestedRecord(reason?.error)
+    if (reason?.kind === 'error' && typeof error?.message === 'string') return error.message
+  }
+  if (event?.type === 'assistant/chunk') {
+    const chunk = nestedRecord(data?.chunk)
+    const reason = nestedRecord(chunk?.reason)
+    const failure = nestedRecord(reason?.failure)
+    if (chunk?.type === 'finish' && reason?.kind === 'error' && typeof failure?.message === 'string') return failure.message
+  }
+  return undefined
+}
+
+export function workerStatusForFailure(message: string): Exclude<WorkerOutcome['status'], 'completed'> {
+  if (/timeout/i.test(message)) return 'timeout'
+  if (/(rate.?limit|temporar|unavailable|overload|429|502|503)/i.test(message)) return 'unavailable'
+  return 'failed'
+}
+
 function throwIfAborted(signal: AbortSignal): void {
   if (!signal.aborted) return
   if (signal.reason instanceof Error) throw signal.reason
@@ -91,11 +122,14 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
     const notifications: string[] = []
     let transcriptBytes = 0
     let overflow: WorkerOutcome['status'] | undefined
+    let runtimeFailure: string | undefined
     const abort = (): void => { void harness.close() }
     signal.addEventListener('abort', abort, { once: true })
     try {
       throwIfAborted(signal)
       const result = await harness.run(prompt, { onNotification(notification: HarnessNotification) {
+        const failure = workerFailureFromNotification(notification)
+        if (failure && !runtimeFailure) runtimeFailure = redact(failure, secrets)
         if (overflow) return
         const line = `${JSON.stringify(redact(notification, secrets))}\n`
         transcriptBytes += byteLength(line)
@@ -107,15 +141,14 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
       writeFileSync(outputPath, output, 'utf8')
       writeFileSync(transcriptPath, notifications.join(''), 'utf8')
       if (overflow) return { status: overflow, output, transcriptPath }
+      if (runtimeFailure) return { status: workerStatusForFailure(runtimeFailure), output, transcriptPath, error: runtimeFailure }
       return { status: 'completed', output, transcriptPath }
     } catch (error) {
       const message = redact(error instanceof Error ? error.message : String(error), secrets)
       writeFileSync(transcriptPath, notifications.join(''), 'utf8')
       if (overflow) return { status: overflow, output: '', transcriptPath, error: message }
       if (signal.aborted) return { status: 'interrupted', output: '', transcriptPath, error: message }
-      if (/timeout/i.test(message)) return { status: 'timeout', output: '', transcriptPath, error: message }
-      if (/(rate.?limit|temporar|unavailable|overload|429|502|503)/i.test(message)) return { status: 'unavailable', output: '', transcriptPath, error: message }
-      return { status: 'failed', output: '', transcriptPath, error: message }
+      return { status: workerStatusForFailure(message), output: '', transcriptPath, error: message }
     } finally {
       signal.removeEventListener('abort', abort)
       await harness.close().catch(() => {})

@@ -362,6 +362,24 @@ describe('controller state machine', () => {
     expect(events).toContain('"type":"publish-done"')
   }, 90_000)
 
+  it('stalls recoverably after both availability attempts fail without misclassifying zero commits', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    const worker = new FakeWorker([
+      { status: 'unavailable', output: '', error: 'Codex servers overloaded' },
+      { status: 'unavailable', output: '', error: 'Codex servers still overloaded' },
+    ])
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...adaptiveDeps, worker })
+    expect(result.status).toBe('stalled')
+    expect(worker.calls.map(call => [call.model, call.effort])).toEqual([
+      ['gpt-5.6-terra', 'high'],
+      ['gpt-5.6-sol', 'low'],
+    ])
+    const events = readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')
+    expect(events).toContain('"retry":"availability"')
+    expect(events).not.toContain('"retry":"no-commit"')
+    expect(readFileSync(join(result.stateDir!, 'resume.json'), 'utf8')).toContain('"status": "unavailable"')
+  }, 90_000)
+
   it('uses fallback once only for availability failures', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
     const worker = new FakeWorker([{ status: 'unavailable', output: '', error: '429' }])
