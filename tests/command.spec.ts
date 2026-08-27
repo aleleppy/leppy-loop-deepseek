@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   apply, createChatProgressReporter, executeLeppyLoopCommand, executeLeppyLoopControl,
 } from '../src/command.js'
+import { selectControllerForPublication } from '../src/controller-auth.js'
 import type { AuthenticatedController } from '../src/controller-auth.js'
 import { HumanGrantStore } from '../src/human-grant.js'
 import { parseLeppyLoopCommandInput, tokenizeLeppyLoopCommandInput } from '../src/options.js'
@@ -167,7 +168,30 @@ describe('simple human slash surface', () => {
       operation: 'continue', recovery: 'resume', runId: finished.runId,
       tasks: finished.checklistRelative, syncBranch: finished.syncBranch, fetch: false,
     })
-    expect(observed).toMatchObject({ recoverRunId: finished.runId, openPullRequest: true })
+    expect(observed).toMatchObject({ recoverRunId: finished.runId, openPullRequest: true, publicationRepairCycles: 3 })
+  })
+
+  it('prioritizes the authenticated interrupted publication over unrelated completed controllers', () => {
+    const unrelated = controller({ runId: '8073b13ed018', status: 'completed', completedTasks: 2, updatedAt: '2026-08-28T00:00:00.000Z' })
+    delete unrelated.currentTask
+    delete unrelated.openTask
+    const intended = controller({ status: 'stalled', completedTasks: 18, attempt: 33, publicationRebase: true, updatedAt: '2026-08-27T17:57:57.286Z' })
+    delete intended.currentTask
+    delete intended.openTask
+    expect(selectControllerForPublication([unrelated, intended])?.runId).toBe('44c85fb806c6')
+  })
+
+  it('/leppy-loop publicar can retry an authenticated publication-only stall', async () => {
+    const messages: unknown[] = []
+    const owner = agent('publish-stalled-agent', message => { messages.push(message) })
+    const stalled = controller({ status: 'stalled', completedTasks: 18, attempt: 33 })
+    delete stalled.currentTask
+    delete stalled.openTask
+    const accepted = await executeLeppyLoopCommand(
+      context(), invocation(owner, 'publicar'), runtime({ inspectControllers: async () => [stalled] }),
+    )
+    expect(accepted).toMatchObject({ kind: 'success', text: expect.stringContaining(stalled.runId) })
+    expect(JSON.stringify(messages[0])).toContain('status: stalled')
   })
 
   it('rejects the old technical flag UX instead of awaiting a foreground loop', async () => {

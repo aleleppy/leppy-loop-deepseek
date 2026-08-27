@@ -12,14 +12,16 @@ import type { SignedLease } from './state.js'
 import { fingerprint, redact, scrubEnvironment } from './security.js'
 import { runFile, runOpaqueShell } from './process.js'
 import { physicalRelative } from './path.js'
+import { abortInterruptedPublicationRebase, isAuthenticatedPublicationRebase } from './publish.js'
 import type {
   ChecklistTask, LeppyLoopOptions, ModelCapability, RunDependencies, RunEvent,
-  RunEventType, RunProgress, RunResult, WorkerRequest,
+  PublicationConflict, RunEventType, RunProgress, RunResult, WorkerRequest,
 } from './types.js'
 
 const DEFAULTS = {
   maxIterations: 64,
   repairCycles: 3,
+  publicationRepairCycles: 3,
   syncMaxSeconds: 120,
   workerTimeoutMs: 30 * 60_000,
   workerOutputLimitBytes: 192 * 1024,
@@ -238,7 +240,15 @@ async function recoverState(base: string, repoRoot: string, checklistRelative: s
   }
   const match = candidates[0]
   if (!match) return undefined
-  if (!existsSync(match.state.worktree) || await gitBranch(match.state.worktree) !== match.state.branch) throw new Error('authenticated run worktree or branch no longer matches')
+  if (!existsSync(match.state.worktree)) throw new Error('authenticated run worktree no longer exists')
+  const attachedBranch = await gitBranch(match.state.worktree)
+  if (attachedBranch !== match.state.branch && !await isAuthenticatedPublicationRebase({
+    runId: match.state.runId,
+    repoRoot: match.state.repoRoot,
+    worktree: match.state.worktree,
+    branch: match.state.branch,
+    syncBranch: match.state.syncBranch,
+  }, new AbortController().signal)) throw new Error('authenticated run worktree or publication rebase no longer matches')
   if (adopt) await terminateAuthenticatedLease(match.dir, match.state.runId)
   return match
 }
@@ -287,6 +297,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   if ((options.repairPaths?.length ?? 0) > 0 && !options.repairGate) throw new Error('--repair-path requires --repair-gate')
   if (input.repairCycles !== undefined && !options.repairGate) throw new Error('--repair-cycles requires --repair-gate')
   if (!Number.isSafeInteger(options.repairCycles) || options.repairCycles < 1 || options.repairCycles > 8) throw new Error('--repair-cycles must be an integer from 1 to 8')
+  if (!Number.isSafeInteger(options.publicationRepairCycles) || options.publicationRepairCycles < 1 || options.publicationRepairCycles > 8) throw new Error('publication repair cycles must be an integer from 1 to 8')
   const clock = dependencies.now ?? (() => new Date())
   const runId = dependencies.runId?.() ?? randomUUID().replaceAll('-', '').slice(0, 12)
   const requestedTasks = resolve(options.tasks)
@@ -379,6 +390,138 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     const elapsedMs = clock().getTime() - active.startedAtMs
     await dependencies.onProgress?.(taskProgress(state, active.task, active.totalTasks, type, elapsedMs, error, active.attempt))
   }
+  let publicationRepairsUsed = 0
+  let publicationChecklistDigest: string | undefined
+  let publicationOriginalHead: string | undefined
+  let publicationValidationReceipt: string | undefined
+  let publicationGate: { task: ChecklistTask; command: string } | undefined
+  const repairPublicationConflict = async (conflict: PublicationConflict): Promise<string> => {
+    if (publicationRepairsUsed >= options.publicationRepairCycles) throw new Error(`publication conflict repair cycle limit exhausted after ${publicationRepairsUsed} workers`)
+    if (!publicationChecklistDigest || !publicationGate) throw new Error('publication conflict repair lacks a frozen checklist and final gate')
+    const checklistPath = join(state.worktree, checklistRelative)
+    const rebaseStepChecklistDigest = digest(readFileSync(checklistPath, 'utf8'))
+    const publicationRequest = { runId: state.runId, repoRoot: state.repoRoot, worktree: state.worktree, branch: state.branch, syncBranch: state.syncBranch }
+    if (!await isAuthenticatedPublicationRebase(publicationRequest, signal)) throw new Error('publication conflict worker requires the authenticated live rebase')
+    const normalizeConflictPath = (path: string): string => {
+      const absolute = resolve(state.worktree, path)
+      const scoped = existsSync(absolute)
+        ? physicalRelative(state.worktree, absolute)
+        : inside(state.worktree, absolute) ? relative(state.worktree, absolute) : undefined
+      if (!scoped || scoped === checklistRelative) throw new Error(`publication conflict path escapes worker scope: ${path}`)
+      return scoped
+    }
+    const requestedPaths = conflict.paths.map(normalizeConflictPath)
+    const liveRaw = (await runFile('git', ['diff', '--name-only', '--diff-filter=U', '-z'], { cwd: state.worktree, signal })).stdout
+    const livePaths = liveRaw.split('\0').filter(Boolean).map(normalizeConflictPath)
+    const requestedSet = [...new Set(requestedPaths)].sort()
+    const liveSet = [...new Set(livePaths)].sort()
+    if (requestedSet.length !== requestedPaths.length || JSON.stringify(requestedSet) !== JSON.stringify(liveSet)) throw new Error('publication conflict scope does not exactly match Git unmerged paths')
+    const allowedPaths = liveSet
+    publicationRepairsUsed += 1
+    state.attempt += 1
+    writeState(join(stateDir, 'run.json'), state)
+    const task: ChecklistTask = {
+      index: 10_000 + publicationRepairsUsed,
+      line: 0,
+      phase: 'Publication rebase repair',
+      mark: '?',
+      kind: 'task',
+      text: `Resolve authenticated publication rebase conflict (${publicationRepairsUsed}/${options.publicationRepairCycles})`,
+      raw: `Publication rebase conflict repair | paths=${allowedPaths.join(',')}`,
+      metadata: {
+        done: 'All conflict markers are resolved by preserving the completed feature and compatible authoritative-base changes; create exactly one conventional commit and leave no unmerged path.',
+        paths: allowedPaths,
+      },
+    }
+    const model = selectedModel(task, options, fallbackSelection, catalog, true)
+    validateModelSelection(catalog, model.model, model.effort)
+    const previousHead = await head(state.worktree)
+    const gateCommand = publicationGate.command
+    const request: WorkerRequest = {
+      runId: state.runId,
+      task,
+      attempt: state.attempt,
+      worktree: state.worktree,
+      checklistPath: checklistRelative,
+      allowedPaths,
+      model: model.model,
+      provider: model.provider,
+      ...(model.effort ? { effort: model.effort } : {}),
+      timeoutMs: options.workerTimeoutMs,
+      outputLimitBytes: options.workerOutputLimitBytes,
+      transcriptLimitBytes: options.workerTranscriptLimitBytes,
+      stateDir,
+      ...(gateCommand ? { gateFingerprint: fingerprint([process.platform === 'win32' ? 'cmd.exe' : '/bin/sh', gateCommand].join('\0')) } : {}),
+      instructions: [
+        ...legacyCustomInstructions(state.worktree),
+        ...await discoverInstructions(state.worktree, allowedPaths),
+        `The controller is in an authenticated Git rebase stopped by conflicts. Resolve only these unmerged paths: ${allowedPaths.join(', ')}.`,
+        `Preserve both the completed Leppy work and compatible changes from the authoritative base. Conflict detail: ${redact(conflict.detail)}`,
+        'Do not run git, rebase, merge, push, gh, gates, or edit the checklist. Use leppy_commit exactly once after resolving every marker.',
+      ],
+    }
+    appendEvent(eventsPath, event(state.runId, 'recovery-start', 'publish', { publicationConflict: true, cycle: publicationRepairsUsed, paths: allowedPaths }, task, state.attempt))
+    await dependencies.onProgress?.(taskProgress(state, task, state.completedTasks, 'task-start', 0))
+    const startedAt = clock().getTime()
+    const outcome = await dependencies.worker!.run(request, signal)
+    if (signal.aborted) throw abortReason(signal)
+    if (digest(readFileSync(checklistPath, 'utf8')) !== rebaseStepChecklistDigest) throw new Error('publication repair worker altered the controlling checklist')
+    if (outcome.status !== 'completed') throw new Error(`publication conflict worker ${outcome.status}: ${outcome.error ?? 'no error detail'}`)
+    const count = await commitCount(state.worktree, previousHead)
+    if (count !== 1) throw new Error(`publication conflict worker must create exactly one commit; observed ${count}`)
+    if (!isConventional(await commitSubject(state.worktree))) throw new Error('publication conflict worker commit is not conventional')
+    if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('publication conflict worker must resolve every unmerged path and leave a clean tree')
+    const commit = await head(state.worktree)
+    appendEvent(eventsPath, event(state.runId, 'recovery-done', 'publish', { publicationConflict: true, cycle: publicationRepairsUsed, commit }, task, state.attempt))
+    await dependencies.onProgress?.(taskProgress(state, task, state.completedTasks, 'task-done', clock().getTime() - startedAt))
+    return commit
+  }
+  const restorePrePublicationHead = async (): Promise<void> => {
+    if (!publicationOriginalHead) throw new Error('publication rollback lacks the authenticated original HEAD')
+    await runFile('git', ['reset', '--hard', publicationOriginalHead], { cwd: state.worktree, timeoutMs: 30_000 })
+    if (await gitBranch(state.worktree) !== state.branch) throw new Error('publication rollback did not restore the authenticated branch')
+    if (await head(state.worktree) !== publicationOriginalHead) throw new Error('publication rollback did not restore the authenticated HEAD')
+    if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('publication rollback did not restore a clean worktree')
+  }
+  const validatePublicationBase = async (targetCommit: string): Promise<string> => {
+    if (!publicationChecklistDigest || !publicationOriginalHead || !publicationGate) throw new Error('publication requires a frozen completed checklist and final gate')
+    try {
+      const currentDigest = digest(readFileSync(join(state.worktree, checklistRelative), 'utf8'))
+      if (currentDigest !== publicationChecklistDigest) throw new Error('rebase altered the controlling checklist')
+      const currentHead = await head(state.worktree)
+      const based = await runFile('git', ['merge-base', '--is-ancestor', targetCommit, currentHead], { cwd: state.worktree, signal, allowFailure: true })
+      if (based.exitCode !== 0) throw new Error('rebased HEAD does not contain the exact publication target commit')
+      const { task: gate, command } = publicationGate
+      state.attempt += 1
+      const key = `${gate.index}:${fingerprint(command)}`
+      state.gateAttempts[key] = (state.gateAttempts[key] ?? 0) + 1
+      writeState(join(stateDir, 'run.json'), state)
+      appendEvent(eventsPath, event(state.runId, 'gate-start', 'publish', { commandFingerprint: fingerprint(command), publicationValidation: true, targetCommit }, gate, state.attempt))
+      const result = await runOpaqueShell(command, state.worktree, signal, scrubEnvironment(process.env))
+      const validationReceipt = createHash('sha256').update(JSON.stringify({
+        runId: state.runId,
+        head: currentHead,
+        targetCommit,
+        checklistDigest: publicationChecklistDigest,
+        gateFingerprint: fingerprint(command),
+        nonce: randomUUID(),
+      })).digest('hex')
+      const receipt = { schemaVersion: 1, runId: state.runId, taskIndex: gate.index, attempt: state.attempt, commandFingerprint: fingerprint(command), exitCode: result.exitCode, stdout: redact(result.stdout), stderr: redact(result.stderr), timestamp: new Date().toISOString(), publicationValidation: true, targetCommit, validationReceipt }
+      mkdirSync(join(stateDir, 'receipts'), { recursive: true })
+      atomicWriteJson(join(stateDir, 'receipts', `publication-gate-${state.attempt}.json`), receipt)
+      if (result.exitCode !== 0) throw new Error(`post-rebase publication gate failed (${result.exitCode}): ${redact(result.stderr || result.stdout)}`)
+      publicationValidationReceipt = validationReceipt
+      appendEvent(eventsPath, event(state.runId, 'gate-end', 'publish', { exitCode: 0, publicationValidation: true, targetCommit }, gate, state.attempt))
+      return validationReceipt
+    } catch (error) {
+      try {
+        await restorePrePublicationHead()
+      } catch (rollbackError) {
+        throw new Error(`${error instanceof Error ? error.message : String(error)}; publication rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`)
+      }
+      throw error
+    }
+  }
   const reopenRepairClosure = async (): Promise<void> => {
     if (repairCyclesRemaining < 1) throw new Error('gate repair cycle limit exhausted')
     const parsed = parseChecklist(join(state.worktree, checklistRelative))
@@ -414,6 +557,14 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     if (options.repairGate) await reopenRepairClosure()
     for (let iteration = 0; iteration < options.maxIterations; iteration += 1) {
       if (signal.aborted) throw abortReason(signal)
+      const publicationRequest = {
+        runId: state.runId,
+        repoRoot: state.repoRoot,
+        worktree: state.worktree,
+        branch: state.branch,
+        syncBranch: state.syncBranch,
+      }
+      if (options.openPullRequest && !state.pullRequestUrl) await abortInterruptedPublicationRebase(publicationRequest, signal)
       const checklistPath = join(state.worktree, checklistRelative)
       const parsed = parseChecklist(checklistPath)
       const task = selectTask(parsed, options.taskMatch)
@@ -423,13 +574,19 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           if (!dependencies.publishPullRequest) throw new Error('pull request publication is unavailable in this composition')
           appendEvent(eventsPath, event(state.runId, 'publish-start', 'publish', { branch: state.branch, syncBranch: state.syncBranch }))
           try {
-            state.pullRequestUrl = await dependencies.publishPullRequest({
-              runId: state.runId,
-              repoRoot: state.repoRoot,
-              worktree: state.worktree,
-              branch: state.branch,
-              syncBranch: state.syncBranch,
-            }, signal)
+            publicationChecklistDigest = digest(parsed.source)
+            publicationOriginalHead = await head(state.worktree)
+            const finalGate = [...parsed.tasks].reverse().find(candidate => candidate.kind === 'gate' && candidate.mark === 'x')
+            const finalGateCommand = finalGate?.metadata.gate ?? options.phaseGateCommand
+            if (!finalGate || !finalGateCommand) throw new Error('publication requires a completed final gate with an authenticated command')
+            publicationGate = { task: finalGate, command: finalGateCommand }
+            publicationValidationReceipt = undefined
+            const published = await dependencies.publishPullRequest(publicationRequest, signal, {
+              repairConflict: repairPublicationConflict,
+              validateBeforePush: validatePublicationBase,
+            })
+            if (!publicationValidationReceipt || published.validationReceipt !== publicationValidationReceipt) throw new Error('publisher did not consume the controller-owned final-gate receipt')
+            state.pullRequestUrl = published.url
             writeState(join(stateDir, 'run.json'), state)
             appendEvent(eventsPath, event(state.runId, 'publish-done', 'publish', { url: state.pullRequestUrl }))
           } catch (error) {

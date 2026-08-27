@@ -2,6 +2,18 @@
 
 All notable changes are documented here.
 
+## [0.3.2] - 2026-08-27
+
+### Added
+
+- Explicit publication can recover an interrupted Git rebase through fresh workers scoped only to exact unmerged paths, with at most three controller-side repair cycles per human grant.
+- The final checklist gate is rerun on the rebased branch before any push or pull-request mutation.
+
+### Security
+
+- A new publish grant authenticates and aborts any prior interrupted merge/apply rebase, so manual or partially staged resolutions never cross jobs. Live conflict paths must exactly equal Git's unmerged index before a worker can receive them; workers cannot access the checklist, sequencer, gate, push, or `gh`.
+- Publication freezes the completed checklist, original branch HEAD, exact base target and final-gate fingerprint. A one-shot gate receipt bound to the rebased HEAD is mandatory before push; every integrity or gate failure restores and verifies the clean pre-publication branch.
+
 ## [0.3.1] - 2026-08-27
 
 ### Added

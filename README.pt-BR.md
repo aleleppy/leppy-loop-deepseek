@@ -4,17 +4,17 @@
 
 Leppy Loop é um bundle Cordis externo e nativo que executa uma checklist Markdown rastreada com um processo e uma sessão novos do DeepSeek Harness por linha de worker. O controller é dono do Git, worktree, transições da checklist, closure, gates, recuperação durável e leases de processo.
 
-A versão `0.3.1` é fixada no DeepSeek Harness `0.1.1-rc.2`, commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). Ela registra um comando Host humano simples, uma tool de controller restrita ao agente e validada por grants, e cards Web sem patch do Harness.
+A versão `0.3.2` é fixada no DeepSeek Harness `0.1.1-rc.2`, commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). Ela registra um comando Host humano simples, uma tool de controller restrita ao agente e validada por grants, e cards Web sem patch do Harness.
 
 ## Instalação
 
-Requer Node `22.19+`, Git e pnpm `10.28.1`. O DeepSeek Harness repassa a gestão de plugins ao `pnpm` encontrado no `PATH`; pnpm 11 exige aprovação separada de builds nativos e não é uma combinação de instalação afirmada para `0.3.1`. Configure a credencial do provedor selecionado na página Models do Harness, gere o pacote e instale no profile usado pelo Web host. Os workers reutilizam automaticamente o provedor, o perfil do modelo e a credencial selecionados; `DEEPSEEK_API_KEY` não é necessária quando outro provedor está ativo:
+Requer Node `22.19+`, Git e pnpm `10.28.1`. O DeepSeek Harness repassa a gestão de plugins ao `pnpm` encontrado no `PATH`; pnpm 11 exige aprovação separada de builds nativos e não é uma combinação de instalação afirmada para `0.3.2`. Configure a credencial do provedor selecionado na página Models do Harness, gere o pacote e instale no profile usado pelo Web host. Os workers reutilizam automaticamente o provedor, o perfil do modelo e a credencial selecionados; `DEEPSEEK_API_KEY` não é necessária quando outro provedor está ativo:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm build
 pnpm pack
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.3.1.tgz
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.3.2.tgz
 ```
 
 Reinicie o processo `dsh web` existente depois de alterar o profile. Refresh do navegador não compõe um plugin Host recém-instalado. Um tarball publicado no GitHub Release pode substituir o path do `.tgz` local; não há afirmação de publicação em registry de plugins.
@@ -40,7 +40,7 @@ A política padrão `adaptive` usa `gpt-5.6-terra` com esforço `high` nas taref
 
 Durante um run Web, cada row selecionada mantém um card durável. `Running`, attempt e elapsed time ficam em elementos separados que não encolhem; somente a label longa sofre ellipsis, e o resultado terminal fecha o mesmo card. O controller geral possui card de background com status, timer e botão Stop. Timers locais não gravam eventos por segundo nem consomem tokens.
 
-Runs Web terminam localmente por padrão. Linguagem humana explícita como `/leppy-loop continuar e publicar quando tudo passar` adiciona publicação remota ao grant de continuação; depois de um run local já concluído, `/leppy-loop publicar` seleciona o controller concluído autenticado mais recente e cria um grant somente de publicação sem reabrir trabalho. O modelo não pode acrescentar nem repetir essa autoridade, e workers continuam sem push ou `gh`. Instale e autentique o GitHub CLI (`gh auth status`) antes de optar pela publicação.
+Runs Web terminam localmente por padrão. Linguagem humana explícita como `/leppy-loop continuar e publicar quando tudo passar` adiciona publicação remota ao grant de continuação; depois de um run local já concluído, `/leppy-loop publicar` seleciona o controller autenticado mais recente concluído ou parado na publicação e cria um grant somente de publicação sem reabrir rows. Um novo grant de publicação autentica e aborta qualquer rebase anterior interrompido, descartando resolução parcial/manual. Se o rebase novo parar em conflitos, no máximo três workers frescos recebem apenas os paths não mesclados exatos; o controller valida um commit convencional de resolução por conflito no mesmo job, continua o rebase e repete o gate final congelado antes de qualquer push ou PR. O modelo não pode acrescentar nem repetir essa autoridade, e workers continuam sem push ou `gh`. Instale e autentique o GitHub CLI (`gh auth status`) antes de optar pela publicação.
 
 ## Contrato da checklist
 

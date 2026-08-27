@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { runLeppyLoop } from '../src/runner.js'
-import type { RunProgress, WorkerAdapter, WorkerOutcome, WorkerRequest } from '../src/types.js'
+import { PublicationConflictError } from '../src/publish.js'
+import type { PublicationHooks, PullRequestRequest, RunProgress, WorkerAdapter, WorkerOutcome, WorkerRequest } from '../src/types.js'
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
@@ -19,6 +20,7 @@ function repository(checklist: string): { root: string; tasks: string } {
   git(root, 'init', '-b', 'main')
   git(root, 'config', 'user.email', 'tests@example.invalid')
   git(root, 'config', 'user.name', 'Leppy Tests')
+  git(root, 'config', 'core.autocrlf', 'false')
   git(root, 'add', '--', 'tasks.task.md', 'src/value.txt')
   git(root, 'commit', '-m', 'chore: seed')
   return { root, tasks }
@@ -476,15 +478,16 @@ describe('controller state machine', () => {
   }, 90_000)
 
   it('publishes once after completion and returns the pull request URL', async () => {
-    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n- [~] Gate: node version | gate=`node --version`\n')
     const worker = new FakeWorker()
     const published: string[] = []
     const dependencies = {
       ...modelDeps,
       worker,
-      publishPullRequest: async (request: { branch: string }) => {
+      publishPullRequest: async (request: PullRequestRequest, _signal: AbortSignal, hooks: PublicationHooks) => {
         published.push(request.branch)
-        return 'https://github.com/example/repo/pull/7'
+        const receipt = await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
+        return { url: 'https://github.com/example/repo/pull/7', validationReceipt: receipt }
       },
     }
     const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true }, dependencies)
@@ -496,6 +499,97 @@ describe('controller state machine', () => {
     const events = readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')
     expect(events).toContain('"type":"publish-start"')
     expect(events).toContain('"type":"publish-done"')
+  }, 90_000)
+
+  it('rejects a publisher that ignores the mandatory final-gate receipt', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n- [~] Gate: node version | gate=`node --version`\n')
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true },
+      {
+        ...modelDeps,
+        worker: new FakeWorker(),
+        publishPullRequest: async () => ({ url: 'https://example.invalid/unvalidated', validationReceipt: 'forged' }),
+      },
+    )
+    expect(result.status).toBe('stalled')
+    expect(result.pullRequestUrl).toBeUndefined()
+  }, 90_000)
+
+  it('refuses publication without a completed authenticated final gate', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    const worker = new FakeWorker()
+    let publishCalls = 0
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true },
+      { ...modelDeps, worker, publishPullRequest: async () => { publishCalls += 1; return { url: 'https://example.invalid/should-not-open', validationReceipt: 'invalid' } } },
+    )
+    expect(result.status).toBe('stalled')
+    expect(publishCalls).toBe(0)
+  }, 90_000)
+
+  it('rejects checklist mutation before the post-rebase gate and remote publication', async () => {
+    const repo = repository(`- [ ] Change \`src/value.txt\` | Done: value says done
+- [~] Gate: node version | gate=\`node --version\`
+`)
+    const worker = new FakeWorker()
+    let remoteMutationReached = false
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true },
+      {
+        ...modelDeps,
+        worker,
+        publishPullRequest: async (request, _signal, hooks) => {
+          writeFileSync(join(request.worktree, 'tasks.task.md'), '# unauthorized base mutation\n')
+          const receipt = await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
+          remoteMutationReached = true
+          return { url: 'https://example.invalid/should-not-open', validationReceipt: receipt }
+        },
+      },
+    )
+    expect(result.status).toBe('stalled')
+    expect(remoteMutationReached).toBe(false)
+    expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('[x]')
+    expect(git(result.worktree!, 'status', '--porcelain')).toBe('')
+  }, 90_000)
+
+  it('repairs bounded publication conflicts and reruns the final gate before push', async () => {
+    const repo = repository(`- [ ] Change \`src/value.txt\` | Done: value says done
+- [~] Gate: node version | gate=\`node --version\`
+`)
+    git(repo.root, 'remote', 'add', 'origin', repo.root)
+    git(repo.root, 'fetch', 'origin')
+    const worker = new FakeWorker()
+    let publicationCalls = 0
+    let validationCalls = 0
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'origin/main', fetch: false, openPullRequest: true, publicationRepairCycles: 2 },
+      {
+        ...modelDeps,
+        worker,
+        publishPullRequest: async (request, _signal, hooks) => {
+          publicationCalls += 1
+          writeFileSync(join(request.repoRoot, 'src', 'value.txt'), 'authoritative-base\n')
+          git(request.repoRoot, 'add', '--', 'src/value.txt')
+          git(request.repoRoot, 'commit', '-m', 'fix: advance publication base')
+          git(request.repoRoot, 'fetch', 'origin')
+          expect(() => git(request.worktree, 'rebase', 'origin/main')).toThrow()
+          const paths = git(request.worktree, 'diff', '--name-only', '--diff-filter=U').split(/\r?\n/u).filter(Boolean)
+          await hooks.repairConflict(new PublicationConflictError(paths, 'real rebase conflict'))
+          git(request.worktree, 'rebase', '--continue')
+          validationCalls += 1
+          const receipt = await hooks.validateBeforePush(git(request.worktree, 'rev-parse', 'origin/main'))
+          return { url: 'https://github.com/example/repo/pull/8', validationReceipt: receipt }
+        },
+      },
+    )
+    if (result.status !== 'completed') throw new Error(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8'))
+    expect(result).toMatchObject({ status: 'completed', pullRequestUrl: 'https://github.com/example/repo/pull/8', completedTasks: 2 })
+    expect(publicationCalls).toBe(1)
+    expect(validationCalls).toBe(1)
+    expect(worker.calls).toHaveLength(2)
+    expect(worker.calls[1]).toMatchObject({ allowedPaths: [join('src', 'value.txt')], gateFingerprint: expect.any(String) })
+    expect(worker.calls[1]!.instructions.join('\n')).toContain('authenticated Git rebase stopped by conflicts')
+    expect(readdirSync(join(result.stateDir!, 'receipts'))).toContainEqual(expect.stringMatching(/^publication-gate-/u))
   }, 90_000)
 
   it('stalls recoverably after both availability attempts fail without misclassifying zero commits', async () => {

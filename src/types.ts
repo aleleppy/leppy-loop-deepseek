@@ -71,6 +71,7 @@ export interface LeppyLoopOptions {
   repairGate?: boolean
   repairPaths?: string[]
   repairCycles?: number
+  publicationRepairCycles?: number
   syncMaxSeconds?: number
   workerTimeoutMs?: number
   workerOutputLimitBytes?: number
@@ -163,6 +164,21 @@ export interface RunProgress {
   error?: string
 }
 
+export interface PublicationConflict {
+  paths: string[]
+  detail: string
+}
+
+export interface PublicationHooks {
+  repairConflict: (conflict: PublicationConflict) => Promise<string>
+  validateBeforePush: (targetCommit: string) => Promise<string>
+}
+
+export interface PublishedPullRequest {
+  url: string
+  validationReceipt: string
+}
+
 export interface PullRequestRequest {
   runId: string
   repoRoot: string
@@ -177,7 +193,7 @@ export interface RunDependencies {
   runId?: () => string
   modelCatalog?: (provider: string) => Promise<ModelCapability[]>
   defaultModel?: () => Promise<{ provider: string; model: string; effort?: string }>
-  publishPullRequest?: (request: PullRequestRequest, signal: AbortSignal) => Promise<string>
+  publishPullRequest?: (request: PullRequestRequest, signal: AbortSignal, hooks: PublicationHooks) => Promise<PublishedPullRequest>
   onProgress?: (progress: RunProgress) => void | Promise<void>
   signal?: AbortSignal
 }

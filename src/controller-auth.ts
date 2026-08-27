@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { parseChecklist, selectTask } from './checklist.js'
 import { branch as gitBranch, resolveRepoRoot } from './git.js'
+import { isAuthenticatedPublicationRebase } from './publish.js'
 import { runFile } from './process.js'
 import type { ChecklistTask, RunResult } from './types.js'
 
@@ -41,6 +42,7 @@ export interface AuthenticatedController {
   updatedAt: string
   openTask?: ChecklistTask
   pullRequestUrl?: string
+  publicationRebase?: boolean
 }
 
 function ownershipPayload(state: StoredRunState): string {
@@ -104,17 +106,35 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
     const key = Buffer.from(readFileSync(keyPath, 'utf8').trim(), 'base64')
     const expected = createHmac('sha256', key).update(ownershipPayload(state)).digest('base64url')
     if (!equalProof(readFileSync(proofPath, 'utf8').trim(), expected)) continue
-    if (await gitBranch(state.worktree) !== state.branch) continue
+    const attachedBranch = await gitBranch(state.worktree)
+    const publicationRebase = attachedBranch !== state.branch && await isAuthenticatedPublicationRebase({
+      runId: state.runId,
+      repoRoot: state.repoRoot,
+      worktree: state.worktree,
+      branch: state.branch,
+      syncBranch: state.syncBranch,
+    }, new AbortController().signal)
+    if (attachedBranch !== state.branch && !publicationRebase) continue
     const controllerPath = join(state.worktree, state.checklistRelative)
     if (!existsSync(controllerPath)) continue
-    const controllerSource = readFileSync(controllerPath, 'utf8')
-    const openTask = selectTask(parseChecklist(controllerSource, controllerPath))
+    let controllerSource = readFileSync(controllerPath, 'utf8')
+    if (publicationRebase) {
+      const original = await runFile('git', ['show', `refs/heads/${state.branch}:${state.checklistRelative.replaceAll('\\', '/')}`], { cwd: state.worktree, allowFailure: true })
+      if (original.exitCode !== 0) continue
+      controllerSource = original.stdout
+      if (selectTask(parseChecklist(controllerSource, controllerPath))) continue
+    }
+    const openTask = publicationRebase ? undefined : selectTask(parseChecklist(controllerSource, controllerPath))
+    const worktreeHead = (await runFile('git', ['rev-parse', 'HEAD'], { cwd: state.worktree })).stdout.trim()
+    const unmergedIndex = (await runFile('git', ['ls-files', '-u', '-z'], { cwd: state.worktree })).stdout
     const authorityDigest = createHash('sha256').update(JSON.stringify({
       runId: state.runId,
       repoRoot,
       checklistRelative: state.checklistRelative,
       checklistDigest: createHash('sha256').update(controllerSource).digest('hex'),
       sourceHead: state.sourceHead,
+      worktreeHead,
+      unmergedIndexDigest: createHash('sha256').update(unmergedIndex).digest('hex'),
       branch: state.branch,
       worktree: resolve(state.worktree),
       syncBranch: state.syncBranch,
@@ -140,6 +160,7 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       updatedAt: state.updatedAt,
       ...(openTask ? { openTask } : {}),
       ...(state.pullRequestUrl ? { pullRequestUrl: state.pullRequestUrl } : {}),
+      ...(publicationRebase ? { publicationRebase: true } : {}),
     })
   }
   return controllers.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
@@ -151,7 +172,12 @@ export function selectControllerForHumanIntent(controllers: readonly Authenticat
     && ['running', 'stalled', 'interrupted', 'failed', 'completed'].includes(controller.status))
 }
 
-/** Select the newest authenticated completed controller for explicit post-run publication. */
+/** Select the newest authenticated completed or publication-stalled controller with no open work. */
 export function selectControllerForPublication(controllers: readonly AuthenticatedController[]): AuthenticatedController | undefined {
-  return controllers.find(controller => controller.status === 'completed' && controller.openTask === undefined)
+  return [...controllers]
+    .filter(controller => ['completed', 'stalled'].includes(controller.status) && controller.openTask === undefined)
+    .sort((left, right) => {
+      const recoveryPriority = Number(Boolean(right.publicationRebase)) - Number(Boolean(left.publicationRebase))
+      return recoveryPriority || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
+    })[0]
 }

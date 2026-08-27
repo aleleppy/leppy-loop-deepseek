@@ -208,6 +208,7 @@ function controllerOptions(
     workerPolicy: args.workerPolicy ?? 'adaptive',
     maxIterations: grant.maxIterations,
     openPullRequest: grant.publishRemote,
+    ...(grant.publishRemote ? { publicationRepairCycles: grant.maxRepairCycles } : {}),
     repoRoot,
   }
   if (args.operation === 'continue') {
