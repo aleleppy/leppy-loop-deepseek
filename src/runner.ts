@@ -56,6 +56,15 @@ function digest(text: string): string { return createHash('sha256').update(text)
 function safeSlug(value: string): string { return value.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'default' }
 function commandArgument(value: string): string { return `"${value.replaceAll('"', '\\"')}"` }
 function inside(root: string, path: string): boolean { const rel = relative(root, path); return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel)) }
+function existingAncestor(path: string): string {
+  let current = resolve(path)
+  while (!existsSync(current)) {
+    const parent = dirname(current)
+    if (parent === current) throw new Error(`no existing ancestor for ${path}`)
+    current = parent
+  }
+  return current
+}
 
 function latestGateFailureInstruction(stateDir: string, gateIndex: number): string {
   const receiptsDir = join(stateDir, 'receipts')
@@ -197,7 +206,7 @@ async function terminateAuthenticatedLease(stateDir: string, runId: string): Pro
   }
 }
 
-async function recoverState(base: string, repoRoot: string, checklistRelative: string, requestedRunId?: string): Promise<{ state: RunState; dir: string } | undefined> {
+async function recoverState(base: string, repoRoot: string, checklistRelative: string, requestedRunId?: string, adopt = true): Promise<{ state: RunState; dir: string } | undefined> {
   if (!existsSync(base)) return undefined
   const matches: { state: RunState; dir: string }[] = []
   for (const name of readdirSync(base)) {
@@ -222,7 +231,7 @@ async function recoverState(base: string, repoRoot: string, checklistRelative: s
   const match = candidates[0]
   if (!match) return undefined
   if (!existsSync(match.state.worktree) || await gitBranch(match.state.worktree) !== match.state.branch) throw new Error('authenticated run worktree or branch no longer matches')
-  await terminateAuthenticatedLease(match.dir, match.state.runId)
+  if (adopt) await terminateAuthenticatedLease(match.dir, match.state.runId)
   return match
 }
 
@@ -269,20 +278,33 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   if ((options.retryGate || options.repairGate) && (!options.recoverExistingWip || !options.recoverRunId)) throw new Error('--retry-gate/--repair-gate require --recover-existing-wip and an exact --recover-run')
   const clock = dependencies.now ?? (() => new Date())
   const runId = dependencies.runId?.() ?? randomUUID().replaceAll('-', '').slice(0, 12)
-  const tasksAbsolute = realpathSync(resolve(options.tasks))
-  const repoRoot = realpathSync(options.repoRoot ?? await resolveRepoRoot(dirname(tasksAbsolute), signal))
-  const checklistRelative = physicalRelative(repoRoot, tasksAbsolute)
+  const requestedTasks = resolve(options.tasks)
+  const repoRoot = realpathSync(options.repoRoot ?? await resolveRepoRoot(existingAncestor(dirname(requestedTasks)), signal))
+  const tasksAbsolute = existsSync(requestedTasks) ? realpathSync(requestedTasks) : requestedTasks
+  const checklistRelative = existsSync(tasksAbsolute)
+    ? physicalRelative(repoRoot, tasksAbsolute)
+    : inside(repoRoot, tasksAbsolute) ? relative(repoRoot, tasksAbsolute) : undefined
   if (checklistRelative === undefined) throw new Error('--tasks must be inside the source repository')
-  await assertSourceReady(repoRoot, checklistRelative, signal)
+  if (!existsSync(tasksAbsolute) && !options.recoverExistingWip) throw new Error(`controlling checklist does not exist: ${tasksAbsolute}`)
+
+  const commonRaw = (await runFile('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot, signal })).stdout.trim()
+  const commonDir = realpathSync(resolve(repoRoot, commonRaw))
+  const stateBase = resolve(options.artifactsDir ?? join(commonDir, 'leppy-loop', 'runs'))
+  const recoveryPreview = options.recoverExistingWip ? await recoverState(stateBase, repoRoot, checklistRelative, options.recoverRunId, false) : undefined
+  if (options.recoverExistingWip && !recoveryPreview) throw new Error('no authenticated matching run exists')
+  if (!recoveryPreview) await assertSourceReady(repoRoot, checklistRelative, signal)
+  const controllerPath = recoveryPreview ? join(recoveryPreview.state.worktree, checklistRelative) : tasksAbsolute
+  const controllerRoot = recoveryPreview?.state.worktree ?? repoRoot
+
   const fallbackSelection = dependencies.defaultModel ? await dependencies.defaultModel() : { provider: options.provider ?? 'deepseek-official', model: options.model ?? 'deepseek-v4-flash', ...(options.effort ? { effort: options.effort } : {}) }
   const provider = options.provider ?? fallbackSelection.provider
   const catalog = dependencies.modelCatalog ? await dependencies.modelCatalog(provider) : [{ id: options.model ?? fallbackSelection.model }]
-  const parsedSource = parseChecklist(tasksAbsolute)
+  const parsedSource = parseChecklist(controllerPath)
   const initialTask = selectTask(parsedSource, options.taskMatch)
   const previewModel = initialTask ? selectedModel(initialTask, options, fallbackSelection, catalog) : fallbackSelection
   const defaultEffort = previewModel.effort
   const diagnostics = lintChecklist(parsedSource, {
-    repoRoot, controllerPath: tasksAbsolute, models: catalog, provider,
+    repoRoot: controllerRoot, controllerPath, models: catalog, provider,
     defaultModel: previewModel.model,
     ...(defaultEffort ? { defaultEffort } : {}),
     ...(options.phaseGateCommand ? { phaseGateCommand: options.phaseGateCommand } : {}),
@@ -291,15 +313,12 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   if (diagnostics.some(item => item.severity === 'error')) throw new Error(`checklist lint failed:\n${diagnostics.map(item => `${item.line ?? '-'} ${item.code}: ${item.message}`).join('\n')}`)
   if (!dependencies.worker) throw new Error('runLeppyLoop requires a WorkerAdapter outside the Harness bundle')
 
-  const commonRaw = (await runFile('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot, signal })).stdout.trim()
-  const commonDir = realpathSync(resolve(repoRoot, commonRaw))
-  const stateBase = resolve(options.artifactsDir ?? join(commonDir, 'leppy-loop', 'runs'))
   mkdirSync(stateBase, { recursive: true })
   let state: RunState
   let stateDir: string
   let releaseLock: (() => void) | undefined
   const recovered = options.recoverExistingWip ? await recoverState(stateBase, repoRoot, checklistRelative, options.recoverRunId) : undefined
-  if (options.recoverExistingWip && !recovered) throw new Error('no authenticated matching run exists')
+  if (options.recoverExistingWip && !recovered) throw new Error('authenticated run disappeared during recovery')
   if (!recovered && !initialTask) throw new Error('checklist contains no open executable rows')
   if (recovered) {
     state = recovered.state

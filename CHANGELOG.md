@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [0.2.22] - 2026-08-27
+
+### Fixed
+
+- Exact authenticated recovery now resolves and lints the checklist from the preserved run worktree before adoption, so it continues even when the receiving source checkout switched to a branch without that checklist or contains unrelated dirty changes.
+- A missing source-side checklist path no longer fails in `realpath` before the exact run can be authenticated; fresh runs retain the clean tracked source-checkout requirement.
+
 ## [0.2.21] - 2026-08-27
 
 ### Added

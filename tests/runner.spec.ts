@@ -373,6 +373,29 @@ describe('controller state machine', () => {
     expect(progress[0]?.attempt).not.toBe(progress[2]?.attempt)
   }, 90_000)
 
+  it('recovers from the authenticated worktree when the source branch removed the checklist and is dirty', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    const worker = new FakeWorker([{ status: 'transcript-limit', output: '', error: 'limit' }])
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...adaptiveDeps, worker })
+    expect(first.status).toBe('stalled')
+
+    git(repo.root, 'rm', '--', 'tasks.task.md')
+    git(repo.root, 'commit', '-m', 'chore: remove controller from current source branch')
+    writeFileSync(join(repo.root, 'src', 'value.txt'), 'unrelated dirty source checkout\n')
+
+    const resumed = await runLeppyLoop({
+      tasks: repo.tasks,
+      syncBranch: 'main',
+      fetch: false,
+      recoverExistingWip: true,
+      recoverRunId: first.runId,
+    }, { ...adaptiveDeps, worker })
+    expect(resumed.status).toBe('completed')
+    expect(resumed.runId).toBe(first.runId)
+    expect(readFileSync(join(resumed.worktree!, 'tasks.task.md'), 'utf8')).toContain('[x]')
+    expect(readFileSync(join(repo.root, 'src', 'value.txt'), 'utf8')).toBe('unrelated dirty source checkout\n')
+  }, 90_000)
+
   it('continues an exact completed selective run on its next open row', async () => {
     const repo = repository('- [ ] Alpha `src/value.txt` | Done: alpha\n- [ ] Beta `src/value.txt` | Done: beta\n')
     const worker = new FakeWorker()
