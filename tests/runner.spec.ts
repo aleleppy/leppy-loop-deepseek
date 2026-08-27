@@ -148,7 +148,7 @@ describe('controller state machine', () => {
       expect(readFileSync(join(first.stateDir!, 'resume.json'), 'utf8')).toContain('gate-retry-authorization-required')
 
       await expect(runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, retryGate: true }, { ...modelDeps, worker }))
-        .rejects.toThrow('--retry-gate requires')
+        .rejects.toThrow('--retry-gate/--repair-gate require')
       writeFileSync(flag, 'pass')
       const retried = await runLeppyLoop({
         tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId, retryGate: true,
@@ -160,6 +160,58 @@ describe('controller state machine', () => {
     } finally {
       // The unique temp flag is intentionally harmless and cannot affect another test.
     }
+  }, 90_000)
+
+  it('reopens the preceding closure in a fresh worker and retries the exact failed gate', async () => {
+    const suffix = Math.random().toString(16).slice(2)
+    const gateScript = join(tmpdir(), `leppy-repair-gate-${suffix}.cjs`).replaceAll('\\', '/')
+    writeFileSync(gateScript, "const fs=require('fs'); const path=require('path'); const flag=path.join(process.cwd(),'src','gate-pass.flag'); if(!fs.existsSync(flag)){console.error('REPAIR_ME');process.exit(1)}\n")
+    const repo = repository(`## Phase\n- [ ] Change \`src/value.txt\` | Done: value says done\n- [?] Closure: inspect and repair src | paths=src\n- [~] Gate: controlled repair | gate=\`node ${gateScript}\`\n`)
+    let closureCalls = 0
+    const calls: WorkerRequest[] = []
+    const worker: WorkerAdapter = {
+      run: async request => {
+        calls.push(request)
+        if (request.task.kind === 'task') {
+          writeFileSync(join(request.worktree, 'src', 'value.txt'), 'done\n')
+          git(request.worktree, 'add', '--', 'src/value.txt')
+          git(request.worktree, 'commit', '-m', 'feat: finish ordinary task')
+        } else {
+          closureCalls += 1
+          if (closureCalls === 2) {
+            writeFileSync(join(request.worktree, 'src', 'gate-pass.flag'), 'repaired\n')
+            git(request.worktree, 'add', '--', 'src/gate-pass.flag')
+            git(request.worktree, 'commit', '-m', 'fix: repair failed phase gate')
+          }
+        }
+        return { status: 'completed', output: 'done' }
+      },
+    }
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(first.status).toBe('stalled')
+    expect(readFileSync(join(first.stateDir!, 'resume.json'), 'utf8')).toContain('--repair-gate')
+    writeFileSync(join(first.worktree!, 'src', 'value.txt'), 'unauthorized manual edit\n')
+    await expect(runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId, repairGate: true,
+    }, { ...modelDeps, worker })).rejects.toThrow('refuses a dirty worktree')
+    git(first.worktree!, 'checkout', '--', 'src/value.txt')
+
+    const repaired = await runLeppyLoop({
+      tasks: repo.tasks,
+      syncBranch: 'main',
+      fetch: false,
+      recoverExistingWip: true,
+      recoverRunId: first.runId,
+      repairGate: true,
+    }, { ...modelDeps, worker })
+    expect(repaired.status).toBe('completed')
+    expect(calls.map(call => call.task.kind)).toEqual(['task', 'closure', 'closure'])
+    expect(calls.at(-1)?.instructions.join('\n')).toContain('REPAIR_ME')
+    expect(readFileSync(join(repaired.worktree!, 'tasks.task.md'), 'utf8').match(/\[x\]/g)).toHaveLength(3)
+    expect(git(repaired.worktree!, 'status', '--short')).toBe('')
+    const events = readFileSync(join(repaired.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(events.filter(entry => entry.type === 'gate-start')).toHaveLength(2)
+    expect(events.some(entry => entry.type === 'recovery-done' && entry.data.gateRepair === true)).toBe(true)
   }, 90_000)
 
   it('rejects a changed recovered gate command instead of bypassing its recorded fingerprint', async () => {

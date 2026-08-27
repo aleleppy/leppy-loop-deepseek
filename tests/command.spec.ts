@@ -50,6 +50,7 @@ describe('Web command input', () => {
     expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --no-open-pr').openPullRequest).toBe(false)
     expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --open-pr').openPullRequest).toBe(true)
     expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --recover-run abc --retry-gate')).toMatchObject({ recoverRunId: 'abc', recoverExistingWip: true, retryGate: true })
+    expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --recover-run abc --repair-gate')).toMatchObject({ recoverRunId: 'abc', recoverExistingWip: true, repairGate: true })
   })
 
   it('returns actionable usage for malformed input', () => {
@@ -111,6 +112,7 @@ describe('/leppy-loop command', () => {
     expect(tool).toMatchObject({ name: 'leppy_loop_start' })
     expect(JSON.stringify(tool)).not.toContain('openPullRequest')
     expect(JSON.stringify(tool)).not.toContain('retryGate')
+    expect(JSON.stringify(tool)).not.toContain('repairGate')
     cleanup?.()
   })
 
@@ -129,6 +131,8 @@ describe('/leppy-loop command', () => {
     expect(prompt).toContain('zero open rows is already finished')
     expect(prompt).toContain('invalid legacy controller')
     expect(prompt).toContain('instead of guessing or calling leppy_loop_start')
+    expect(prompt).toContain('never edit its source checkout or preserved worktree')
+    expect(prompt).toContain('--repair-gate')
   })
 
   it('treats natural language after the slash command as AI intent, not argv', async () => {

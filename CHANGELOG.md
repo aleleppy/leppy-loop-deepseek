@@ -2,6 +2,21 @@
 
 All notable changes are documented here.
 
+## [0.2.21] - 2026-08-27
+
+### Added
+
+- A direct exact-run `--repair-gate` recovery reopens the completed closure immediately preceding a failed gate, feeds the bounded durable gate receipt to a fresh scoped worker, records a controller reopen commit, and retries the unchanged gate fingerprint after the closure succeeds.
+
+### Changed
+
+- Gate-failure receipts now recommend controlled repair while preserving a separate `--retry-gate` command for transient failures.
+- The autonomous resolver prompt explicitly forbids source/worktree edits, subagent repairs, publication and integration after a stalled, failed or interrupted controller result.
+
+### Security
+
+- Gate repair is absent from the model-facing tool, requires a clean authenticated worktree plus the exact run ID, and refuses manually modified stalled worktrees.
+
 ## [0.2.20] - 2026-08-27
 
 ### Fixed

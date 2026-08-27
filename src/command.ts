@@ -30,6 +30,7 @@ const AUTONOMOUS_PROMPT = `The human invoked /leppy-loop without arguments. Auto
 4. Determine a phase gate only when the checklist requires one and does not carry its own gate metadata.
 5. Call leppy_loop_start exactly once with the resolved arguments. Do not launch another dsh process or emulate the controller with shell commands.
 6. If the intended checklist is invalid, or more than one eligible checklist or base is genuinely plausible, ask the human one concise question instead of guessing or calling leppy_loop_start.
+7. If the controller returns stalled, failed, or interrupted, never edit its source checkout or preserved worktree, never delegate a repair through subagent/workflow, and never publish or integrate around it. Report the exact run/receipt and stop. Availability recovery must launch a new worker only through exact-run Leppy recovery. A failed gate may be repaired only by a later direct human slash/CLI command carrying --repair-gate and the exact run ID.
 
 Wait for leppy_loop_start to settle before reporting completion or recovery information.`
 

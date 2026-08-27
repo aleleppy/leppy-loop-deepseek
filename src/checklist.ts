@@ -240,3 +240,11 @@ export function markTaskDone(parsed: ParsedChecklist, task: ChecklistTask): stri
   parsed.lines[task.line - 1] = line.replace(CHECKBOX, '$1x$3$4')
   return parsed.lines.join('\n')
 }
+
+export function markTaskOpen(parsed: ParsedChecklist, task: ChecklistTask): string {
+  const line = parsed.lines[task.line - 1]
+  if (line === undefined) throw new Error(`Checklist line ${task.line} disappeared`)
+  const mark: ChecklistMark = task.kind === 'closure' ? '?' : task.kind === 'gate' ? '~' : ' '
+  parsed.lines[task.line - 1] = line.replace(CHECKBOX, `$1${mark}$3$4`)
+  return parsed.lines.join('\n')
+}
