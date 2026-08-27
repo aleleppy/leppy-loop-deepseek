@@ -2,6 +2,16 @@
 
 All notable changes are documented here.
 
+## [0.3.4] - 2026-08-27
+
+### Fixed
+
+- Pull-request lookup and creation now derive an explicit `owner/repository` from the authenticated GitHub remote and pass it through `gh --repo`, preventing ambient repository inference from producing blank base/head SHAs after a successful branch push.
+
+### Security
+
+- Publication rejects non-GitHub, local, or ambiguous remote URLs before push instead of allowing `gh` to select an unrelated repository from ambient Git configuration.
+
 ## [0.3.3] - 2026-08-27
 
 ### Fixed

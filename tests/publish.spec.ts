@@ -5,8 +5,11 @@ import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   abortInterruptedPublicationRebase,
+  githubRepositoryFromRemoteUrl,
   isAuthenticatedPublicationRebase,
   preparePublicationRebase,
+  pullRequestCreateArguments,
+  pullRequestListArguments,
 } from '../src/publish.js'
 import type { PullRequestRequest } from '../src/types.js'
 
@@ -65,6 +68,30 @@ function emptyConflictRepository(): { root: string; request: PullRequestRequest 
   git(root, 'fetch', 'origin')
   return { root, request: { runId: 'empty-publish-test', repoRoot: root, worktree: root, branch: 'feature', syncBranch: 'origin/main' } }
 }
+
+describe('GitHub publication target', () => {
+  it.each([
+    ['https://github.com/aleleppy/elysium-ts.git', 'aleleppy/elysium-ts'],
+    ['git@github.com:aleleppy/elysium-ts.git', 'aleleppy/elysium-ts'],
+    ['ssh://git@github.com/aleleppy/elysium-ts.git', 'aleleppy/elysium-ts'],
+  ])('derives an explicit gh --repo target from %s', (remoteUrl, expected) => {
+    expect(githubRepositoryFromRemoteUrl(remoteUrl)).toBe(expected)
+  })
+
+  it('passes the resolved repository explicitly to lookup and creation', () => {
+    expect(pullRequestListArguments('aleleppy/elysium-ts', 'leppy-loop/run')).toEqual([
+      'pr', 'list', '--repo', 'aleleppy/elysium-ts', '--state', 'all', '--head', 'leppy-loop/run', '--json', 'url', '--limit', '1',
+    ])
+    expect(pullRequestCreateArguments('aleleppy/elysium-ts', 'plugins', 'leppy-loop/run')).toEqual([
+      'pr', 'create', '--repo', 'aleleppy/elysium-ts', '--base', 'plugins', '--head', 'leppy-loop/run', '--fill',
+    ])
+  })
+
+  it('rejects non-GitHub and ambiguous remote URLs', () => {
+    expect(() => githubRepositoryFromRemoteUrl('https://gitlab.com/aleleppy/elysium-ts.git')).toThrow('explicit github.com')
+    expect(() => githubRepositoryFromRemoteUrl('../local-repository')).toThrow('explicit github.com')
+  })
+})
 
 describe('publication rebase protocol', () => {
   it.each(['merge', 'apply'] as const)('lets the controller continue a %s rebase while preserving clean staged replay paths', async backend => {

@@ -28,6 +28,21 @@ function branchTarget(syncBranch: string): { remote: string; base: string } {
   return { remote: 'origin', base: normalized.replace(/^refs\/heads\//u, '') }
 }
 
+export function githubRepositoryFromRemoteUrl(remoteUrl: string): string {
+  const value = remoteUrl.trim()
+  const match = /^(?:https?:\/\/github\.com\/|ssh:\/\/(?:git@)?github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/iu.exec(value)
+  if (!match) throw new Error('publication remote must be an explicit github.com owner/repository URL')
+  return `${match[1]}/${match[2]}`
+}
+
+export function pullRequestListArguments(repository: string, branch: string): string[] {
+  return ['pr', 'list', '--repo', repository, '--state', 'all', '--head', branch, '--json', 'url', '--limit', '1']
+}
+
+export function pullRequestCreateArguments(repository: string, base: string, branch: string): string[] {
+  return ['pr', 'create', '--repo', repository, '--base', base, '--head', branch, '--fill']
+}
+
 function parsePullRequestUrl(stdout: string): string | undefined {
   const trimmed = stdout.trim()
   if (trimmed === '') return undefined
@@ -237,12 +252,14 @@ export async function publishPullRequest(request: PullRequestRequest, signal: Ab
   const ahead = await runFile('git', ['rev-list', '--count', `${remote}/${base}..HEAD`], { cwd: request.worktree, signal })
   if (Number.parseInt(ahead.stdout.trim(), 10) < 1) throw new Error('refusing to open a pull request without commits')
 
+  const remoteUrl = (await runFile('git', ['remote', 'get-url', remote], { cwd: request.worktree, signal })).stdout.trim()
+  const githubRepository = githubRepositoryFromRemoteUrl(remoteUrl)
   await runFile('git', ['push', '--set-upstream', remote, `HEAD:refs/heads/${request.branch}`], { cwd: request.worktree, signal, timeoutMs: 5 * 60_000 })
-  const existing = await runFile('gh', ['pr', 'list', '--state', 'all', '--head', request.branch, '--json', 'url', '--limit', '1'], { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  const existing = await runFile('gh', pullRequestListArguments(githubRepository, request.branch), { cwd: request.worktree, signal, timeoutMs: 60_000 })
   const existingUrl = parsePullRequestUrl(existing.stdout)
   if (existingUrl) return { url: existingUrl, validationReceipt }
 
-  const created = await runFile('gh', ['pr', 'create', '--base', base, '--head', request.branch, '--fill'], { cwd: request.worktree, signal, timeoutMs: 120_000 })
+  const created = await runFile('gh', pullRequestCreateArguments(githubRepository, base, request.branch), { cwd: request.worktree, signal, timeoutMs: 120_000 })
   const url = parsePullRequestUrl(created.stdout)
   if (!url) throw new Error('gh pr create did not return a GitHub pull request URL')
   return { url, validationReceipt }
