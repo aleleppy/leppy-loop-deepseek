@@ -33,6 +33,10 @@ class FakeWorker implements WorkerAdapter {
     this.calls.push(request)
     const outcome = this.outcomes.shift()
     if (outcome) return outcome
+    if (request.mode === 'publication-conflict') {
+      for (const path of request.allowedPaths) writeFileSync(join(request.worktree, path), 'authoritative-base\ndone-0\n')
+      return { status: 'completed', output: 'resolved without staging or committing' }
+    }
     if (request.task.kind === 'task') {
       writeFileSync(join(request.worktree, 'src', 'value.txt'), `done-${request.task.index}\n`)
       git(request.worktree, 'add', '--', 'src/value.txt')
@@ -513,6 +517,8 @@ describe('controller state machine', () => {
     )
     expect(result.status).toBe('stalled')
     expect(result.pullRequestUrl).toBeUndefined()
+    expect(result.detail).toContain('publisher did not consume')
+    expect(JSON.parse(readFileSync(join(result.stateDir!, 'run.json'), 'utf8')).lastError).toContain('publisher did not consume')
   }, 90_000)
 
   it('refuses publication without a completed authenticated final gate', async () => {
@@ -575,7 +581,8 @@ describe('controller state machine', () => {
           expect(() => git(request.worktree, 'rebase', 'origin/main')).toThrow()
           const paths = git(request.worktree, 'diff', '--name-only', '--diff-filter=U').split(/\r?\n/u).filter(Boolean)
           await hooks.repairConflict(new PublicationConflictError(paths, 'real rebase conflict'))
-          git(request.worktree, 'rebase', '--continue')
+          git(request.worktree, 'add', '-A', '--', ...paths)
+          git(request.worktree, '-c', 'core.editor=true', 'rebase', '--continue')
           validationCalls += 1
           const receipt = await hooks.validateBeforePush(git(request.worktree, 'rev-parse', 'origin/main'))
           return { url: 'https://github.com/example/repo/pull/8', validationReceipt: receipt }
@@ -587,7 +594,7 @@ describe('controller state machine', () => {
     expect(publicationCalls).toBe(1)
     expect(validationCalls).toBe(1)
     expect(worker.calls).toHaveLength(2)
-    expect(worker.calls[1]).toMatchObject({ allowedPaths: [join('src', 'value.txt')], gateFingerprint: expect.any(String) })
+    expect(worker.calls[1]).toMatchObject({ mode: 'publication-conflict', allowedPaths: [join('src', 'value.txt')], gateFingerprint: expect.any(String) })
     expect(worker.calls[1]!.instructions.join('\n')).toContain('authenticated Git rebase stopped by conflicts')
     expect(readdirSync(join(result.stateDir!, 'receipts'))).toContainEqual(expect.stringMatching(/^publication-gate-/u))
   }, 90_000)
@@ -658,6 +665,27 @@ describe('controller state machine', () => {
     const stateRoot = join(repo.root, '.git', 'leppy-loop', 'runs')
     const stateDir = join(stateRoot, readdirSync(stateRoot)[0]!)
     expect(JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8')).status).toBe('interrupted')
+  }, 90_000)
+
+  it('persists bounded actionable detail for failures handled by the outer controller catch', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    const worker: WorkerAdapter = {
+      async run(request) {
+        writeFileSync(join(request.worktree, 'src', 'value.txt'), 'first\n')
+        git(request.worktree, 'add', '--', 'src/value.txt')
+        git(request.worktree, 'commit', '-m', 'feat: first unauthorized commit')
+        writeFileSync(join(request.worktree, 'src', 'value.txt'), 'second\n')
+        git(request.worktree, 'commit', '-am', 'feat: second unauthorized commit')
+        return { status: 'completed', output: 'two commits' }
+      },
+    }
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, runId: () => 'outerdetail', worker },
+    )).rejects.toThrow('exactly one commit')
+    const stored = JSON.parse(readFileSync(join(repo.root, '.git', 'leppy-loop', 'runs', 'outerdetail', 'run.json'), 'utf8'))
+    expect(stored.status).toBe('failed')
+    expect(stored.lastError).toContain('exactly one commit')
   }, 90_000)
 
   it('honors a pre-aborted command signal before repository mutation', async () => {

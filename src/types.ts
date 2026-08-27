@@ -9,6 +9,7 @@ export type Phase = 'setup' | 'worker' | 'closure' | 'gate' | 'human' | 'recover
 export type TaskKind = 'task' | 'closure' | 'gate' | 'human'
 export type ChecklistMark = ' ' | 'x' | '?' | '~'
 export type WorkerPolicy = 'adaptive' | 'selected' | 'terra-high' | 'sol-low'
+export type WorkerMode = 'task' | 'publication-conflict'
 
 export interface TaskMetadata {
   done?: string
@@ -118,6 +119,7 @@ export interface RunResult {
   currentTask?: number
   diagnostics: LintDiagnostic[]
   pullRequestUrl?: string
+  detail?: string
   preview?: RunPreview
 }
 
@@ -128,6 +130,7 @@ export interface WorkerRequest {
   worktree: string
   checklistPath: string
   allowedPaths: string[]
+  mode?: WorkerMode
   model: string
   effort?: string
   provider: string
@@ -170,7 +173,7 @@ export interface PublicationConflict {
 }
 
 export interface PublicationHooks {
-  repairConflict: (conflict: PublicationConflict) => Promise<string>
+  repairConflict: (conflict: PublicationConflict) => Promise<void>
   validateBeforePush: (targetCommit: string) => Promise<string>
 }
 

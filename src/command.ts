@@ -9,7 +9,7 @@ import type {} from '@deepseek-ai/dsh-credentials'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { inspectAuthenticatedControllers, selectControllerForHumanIntent, selectControllerForPublication } from './controller-auth.js'
+import { inspectAuthenticatedControllers, selectControllerForHumanIntent, selectControllerForPublication, selectControllerForStatus } from './controller-auth.js'
 import type { AuthenticatedController } from './controller-auth.js'
 import { resolveRepoRoot } from './git.js'
 import { harnessRunDependencies } from './harness-runtime.js'
@@ -63,6 +63,8 @@ export interface LeppyLoopControlResult {
   status: string
   runId?: string
   jobId?: string
+  jobStatus?: string
+  detail?: string
   completedTasks?: number
   currentTask?: number
   attempt?: number
@@ -102,6 +104,7 @@ function resultText(result: RunResult): string {
     ...(result.currentTask === undefined ? [] : [`currentTask=${result.currentTask}`]),
     ...(result.branch ? [`branch=${result.branch}`] : []),
     ...(result.pullRequestUrl ? [`pr=${result.pullRequestUrl}`] : []),
+    ...(result.detail ? [`detail=${result.detail}`] : []),
   ]
   if (result.diagnostics.length > 0) facts.push(`diagnostics=${result.diagnostics.map(item => `${item.line ?? '-'}:${item.code}:${item.message}`).join('; ')}`)
   return `Leppy Loop ${result.status}. ${facts.join(' | ')}`
@@ -227,7 +230,7 @@ function jobOutcome(result: RunResult, signal: AbortSignal): JobOutcome {
   const output = resultText(result)
   if (signal.aborted || result.status === 'interrupted') return { status: 'killed', detail: `run ${result.runId} interrupted`, output }
   if (result.status === 'completed' || result.status === 'dry-run') return { status: 'completed', detail: `run ${result.runId} ${result.status}`, output }
-  return { status: 'failed', detail: `run ${result.runId} ${result.status}${result.currentTask === undefined ? '' : ` at task ${result.currentTask}`}`, output }
+  return { status: 'failed', detail: `run ${result.runId} ${result.status}${result.currentTask === undefined ? '' : ` at task ${result.currentTask}`}${result.detail ? `: ${result.detail}` : ''}`, output }
 }
 
 function liveJobRecord(ctx: Context, runtime: LeppyLoopRuntime, agent: Agent, repoRoot: string): JobRecord | undefined {
@@ -293,13 +296,33 @@ export async function executeLeppyLoopControl(
   const cwd = requireWorkspace(agent)
   const repoRoot = resolve(await resolveRepoRoot(cwd))
   if (args.operation === 'status') {
-    const controllers = await (runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers)(cwd)
+    const inspect = runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers
+    const candidateJob = liveJobRecord(ctx, runtime, agent, repoRoot)
+    const active = candidateJob && (args.runId === undefined || args.runId === candidateJob.runId) ? candidateJob : undefined
+    if (active) {
+      const job = ctx.jobs.get(active.id, agent)
+      const selected = await inspect(cwd).then(
+        controllers => controllers.find(candidate => candidate.runId === active.runId),
+        () => undefined,
+      )
+      return {
+        operation: 'status', status: job.status, jobStatus: job.status, runId: active.runId, jobId: String(active.id),
+        ...((job as { detail?: string }).detail ? { detail: (job as { detail: string }).detail } : {}),
+        ...(selected ? {
+          completedTasks: selected.completedTasks, attempt: selected.attempt, branch: selected.branch,
+          ...(selected.currentTask === undefined ? {} : { currentTask: selected.currentTask }),
+          ...(selected.openTask ? { task: selected.openTask.text } : {}),
+        } : {}),
+      }
+    }
+    const controllers = await inspect(cwd)
     const selected = args.runId
       ? controllers.find(candidate => candidate.runId === args.runId)
-      : selectControllerForHumanIntent(controllers) ?? selectControllerForPublication(controllers)
+      : selectControllerForStatus(controllers)
     return selected ? {
       operation: 'status', status: selected.status, runId: selected.runId,
       completedTasks: selected.completedTasks, attempt: selected.attempt, branch: selected.branch,
+      ...(selected.detail ? { detail: selected.detail } : {}),
       ...(selected.currentTask === undefined ? {} : { currentTask: selected.currentTask }),
       ...(selected.openTask ? { task: selected.openTask.text } : {}),
     } : { operation: 'status', status: 'not-found' }
@@ -405,7 +428,7 @@ function toolDefinition(ctx: Context, runtime: LeppyLoopRuntime) {
         type: 'object', additionalProperties: false,
         properties: {
           operation: { type: 'string', required: true }, status: { type: 'string', required: true },
-          runId: { type: 'string' }, jobId: { type: 'string' }, completedTasks: { type: 'number' },
+          runId: { type: 'string' }, jobId: { type: 'string' }, jobStatus: { type: 'string' }, detail: { type: 'string' }, completedTasks: { type: 'number' },
           currentTask: { type: 'number' }, attempt: { type: 'number' }, task: { type: 'string' }, branch: { type: 'string' },
         },
       },
@@ -437,9 +460,17 @@ export async function executeLeppyLoopCommand(
     const intent = parseHumanIntent(invocation.rawInput)
     if (intent.operation === 'status') {
       const value = await executeLeppyLoopControl(ctx, runtime, invocation.agent, { operation: 'status' })
-      return { kind: 'success', text: value.status === 'not-found'
-        ? 'No authenticated Leppy controller with open work was found in this repository.'
-        : `Leppy Loop ${value.status}. run=${value.runId} | completed=${value.completedTasks} | currentTask=${value.currentTask} | attempt=${value.attempt} | task=${value.task}` }
+      if (value.status === 'not-found') return { kind: 'error', text: 'No authenticated Leppy controller was found in this repository.' }
+      const facts = [
+        `run=${value.runId}`,
+        ...(value.jobId ? [`job=${value.jobId}`] : []),
+        ...(value.completedTasks === undefined ? [] : [`completed=${value.completedTasks}`]),
+        ...(value.currentTask === undefined ? [] : [`currentTask=${value.currentTask}`]),
+        ...(value.attempt === undefined ? [] : [`attempt=${value.attempt}`]),
+        ...(value.task ? [`task=${value.task}`] : []),
+        ...(value.detail ? [`detail=${value.detail}`] : []),
+      ]
+      return { kind: 'success', text: `Leppy Loop ${value.status}. ${facts.join(' | ')}` }
     }
 
     if (intent.operation === 'start') {
@@ -485,7 +516,9 @@ export async function executeLeppyLoopCommand(
       content: [{ type: 'text', text: continuePrompt(selected, intent.recovery, intent.publishRemote, intent.publicationOnly) }],
       source: { kind: 'plugin', plugin: name },
     }))
-    return { kind: 'success', text: `Leppy Loop continuation authorized for run ${selected.runId}. The AI will start the controller as a background job.` }
+    return { kind: 'success', text: intent.publicationOnly
+      ? `Leppy Loop publication authorized for run ${selected.runId}. The AI will start the publication controller as a background job.`
+      : `Leppy Loop continuation authorized for run ${selected.runId}. The AI will start the controller as a background job.` }
   } catch (error) {
     if (invocation.signal.aborted) throw abortError(invocation.signal)
     return { kind: 'error', text: `Leppy Loop could not accept the intent: ${error instanceof Error ? error.message : String(error)}` }

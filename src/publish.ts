@@ -118,6 +118,27 @@ export async function abortInterruptedPublicationRebase(request: PullRequestRequ
   return true
 }
 
+async function abortFailedPublicationRebase(request: PullRequestRequest, original: unknown): Promise<never> {
+  const originalMessage = original instanceof Error ? original.message : String(original)
+  const aborted = await runFile('git', ['rebase', '--abort'], { cwd: request.worktree, timeoutMs: 30_000, allowFailure: true })
+  const [metadata, branch, head, branchHead, status] = await Promise.all([
+    rebaseMetadata(request.worktree, new AbortController().signal).catch(() => ({ invalid: true })),
+    runFile('git', ['branch', '--show-current'], { cwd: request.worktree, allowFailure: true }),
+    runFile('git', ['rev-parse', 'HEAD'], { cwd: request.worktree, allowFailure: true }),
+    runFile('git', ['rev-parse', `refs/heads/${request.branch}`], { cwd: request.worktree, allowFailure: true }),
+    runFile('git', ['status', '--porcelain'], { cwd: request.worktree, allowFailure: true }),
+  ])
+  const restored = metadata === undefined
+    && branch.exitCode === 0 && branch.stdout.trim() === request.branch
+    && head.exitCode === 0 && branchHead.exitCode === 0 && head.stdout.trim() === branchHead.stdout.trim()
+    && status.exitCode === 0 && status.stdout.trim() === ''
+  if (!restored) {
+    const abortDetail = `${aborted.stderr}\n${branch.stderr}\n${head.stderr}\n${branchHead.stderr}\n${status.stderr}`.trim().slice(-8 * 1024)
+    throw new Error(`${originalMessage}; publication rollback failed (abort exit ${aborted.exitCode})${abortDetail ? `: ${abortDetail}` : ''}`)
+  }
+  throw original
+}
+
 async function requireConflictOrAbort(request: PullRequestRequest, detail: string, signal: AbortSignal): Promise<PublicationConflictError> {
   const paths = await conflictPaths(request.worktree, signal)
   if (paths.length > 0) return new PublicationConflictError(paths, detail)
@@ -125,14 +146,49 @@ async function requireConflictOrAbort(request: PullRequestRequest, detail: strin
   throw new Error(detail)
 }
 
-async function continueAfterValidatedRepair(request: PullRequestRequest, expectedCommit: string, signal: AbortSignal): Promise<{ done: true } | { conflict: PublicationConflictError }> {
-  const unresolved = await conflictPaths(request.worktree, signal)
-  if (unresolved.length > 0) throw new Error('publication conflict worker left unmerged paths')
+interface ConflictRepairSnapshot {
+  head: string
+  index: string
+  paths: string[]
+}
+
+function samePaths(left: readonly string[], right: readonly string[]): boolean {
+  return JSON.stringify([...new Set(left)].sort()) === JSON.stringify([...new Set(right)].sort())
+}
+
+async function conflictRepairSnapshot(request: PullRequestRequest, signal: AbortSignal): Promise<ConflictRepairSnapshot> {
+  return {
+    head: (await runFile('git', ['rev-parse', 'HEAD'], { cwd: request.worktree, signal })).stdout.trim(),
+    index: (await runFile('git', ['ls-files', '--stage', '-z'], { cwd: request.worktree, signal })).stdout,
+    paths: (await conflictPaths(request.worktree, signal)).sort(),
+  }
+}
+
+async function continueAfterValidatedRepair(
+  request: PullRequestRequest,
+  snapshot: ConflictRepairSnapshot,
+  signal: AbortSignal,
+): Promise<{ done: true } | { conflict: PublicationConflictError }> {
+  if (!await isAuthenticatedPublicationRebase(request, signal)) throw new Error('publication conflict worker changed the authenticated rebase identity')
   const currentHead = (await runFile('git', ['rev-parse', 'HEAD'], { cwd: request.worktree, signal })).stdout.trim()
-  if (currentHead !== expectedCommit) throw new Error('publication conflict worker receipt does not match current HEAD')
-  const status = await runFile('git', ['status', '--porcelain'], { cwd: request.worktree, signal })
-  if (status.stdout.trim() !== '') throw new Error('publication conflict worker did not leave a clean rebase step')
-  const continued = await runFile('git', ['rebase', '--continue'], {
+  if (currentHead !== snapshot.head) throw new Error('publication conflict worker changed HEAD')
+  const currentIndex = (await runFile('git', ['ls-files', '--stage', '-z'], { cwd: request.worktree, signal })).stdout
+  if (currentIndex !== snapshot.index) throw new Error('publication conflict worker changed the Git index')
+  const unresolved = await conflictPaths(request.worktree, signal)
+  if (!samePaths(unresolved, snapshot.paths)) throw new Error('publication conflict worker changed the exact unmerged path set')
+  const unstaged = (await runFile('git', ['diff', '--name-only', '-z'], { cwd: request.worktree, signal })).stdout.split('\0').filter(Boolean)
+  if (!unstaged.every(path => snapshot.paths.includes(path))) throw new Error('publication conflict worker changed a path outside the exact unmerged set')
+  const untracked = (await runFile('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: request.worktree, signal })).stdout.split('\0').filter(Boolean)
+  if (untracked.length > 0) throw new Error('publication conflict worker created untracked paths')
+
+  await runFile('git', ['add', '-A', '--', ...snapshot.paths], { cwd: request.worktree, signal })
+  if ((await conflictPaths(request.worktree, signal)).length > 0) throw new Error('controller staging left unresolved publication conflicts')
+  const residue = (await runFile('git', ['diff', '--name-only', '-z'], { cwd: request.worktree, signal })).stdout.split('\0').filter(Boolean)
+  if (residue.length > 0) throw new Error('publication conflict repair left unstaged paths')
+  const staged = await runFile('git', ['diff', '--cached', '--quiet', '--exit-code'], { cwd: request.worktree, signal, allowFailure: true })
+  if (![0, 1].includes(staged.exitCode)) throw new Error(`cannot inspect the resolved rebase step (${staged.exitCode}): ${staged.stderr.trim()}`)
+  const action = staged.exitCode === 0 ? '--skip' : '--continue'
+  const continued = await runFile('git', ['rebase', action], {
     cwd: request.worktree,
     signal,
     timeoutMs: 120_000,
@@ -140,7 +196,7 @@ async function continueAfterValidatedRepair(request: PullRequestRequest, expecte
     env: { ...process.env, GIT_EDITOR: ':' },
   })
   if (continued.exitCode === 0) return { done: true }
-  return { conflict: await requireConflictOrAbort(request, `git rebase --continue failed (${continued.exitCode}): ${continued.stderr.trim()}`, signal) }
+  return { conflict: await requireConflictOrAbort(request, `git rebase ${action} failed (${continued.exitCode}): ${continued.stderr.trim()}`, signal) }
 }
 
 export async function preparePublicationRebase(request: PullRequestRequest, remote: string, base: string, hooks: PublicationHooks, signal: AbortSignal): Promise<void> {
@@ -152,19 +208,19 @@ export async function preparePublicationRebase(request: PullRequestRequest, remo
   if (rebased.exitCode === 0) return
   let conflict = await requireConflictOrAbort(request, `git rebase ${remote}/${base} failed (${rebased.exitCode}): ${rebased.stderr.trim()}`, signal)
   for (;;) {
-    let commit: string
+    let snapshot: ConflictRepairSnapshot
     try {
-      commit = await hooks.repairConflict(conflict)
+      snapshot = await conflictRepairSnapshot(request, signal)
+      if (!samePaths(snapshot.paths, conflict.paths)) throw new Error('publication conflict receipt does not match the live unmerged set')
+      await hooks.repairConflict(conflict)
     } catch (error) {
-      await runFile('git', ['rebase', '--abort'], { cwd: request.worktree, timeoutMs: 30_000, allowFailure: true })
-      throw error
+      return await abortFailedPublicationRebase(request, error)
     }
     let next: { done: true } | { conflict: PublicationConflictError }
     try {
-      next = await continueAfterValidatedRepair(request, commit, signal)
+      next = await continueAfterValidatedRepair(request, snapshot, signal)
     } catch (error) {
-      await runFile('git', ['rebase', '--abort'], { cwd: request.worktree, timeoutMs: 30_000, allowFailure: true })
-      throw error
+      return await abortFailedPublicationRebase(request, error)
     }
     if ('done' in next) return
     conflict = next.conflict

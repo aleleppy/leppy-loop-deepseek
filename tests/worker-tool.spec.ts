@@ -2,8 +2,9 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
-import { commitTaskChanges, resolveExecCwd, type WorkerPolicy } from '../src/worker-tool.js'
+import { apply as applyWorkerTools, commitTaskChanges, resolveAllowed, resolveExecCwd, type WorkerPolicy } from '../src/worker-tool.js'
 
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
@@ -30,6 +31,26 @@ function runner(root: string) {
   }
 }
 
+function registeredTools(root: string, mode: 'task' | 'publication-conflict'): string[] {
+  const variables = ['LEPPY_WORKTREE', 'LEPPY_CHECKLIST', 'LEPPY_ALLOWED_PATHS', 'LEPPY_WORKER_MODE'] as const
+  const previous = Object.fromEntries(variables.map(name => [name, process.env[name]]))
+  process.env.LEPPY_WORKTREE = root
+  process.env.LEPPY_CHECKLIST = 'tasks.task.md'
+  process.env.LEPPY_ALLOWED_PATHS = JSON.stringify(['prisma/schemas/auth.prisma'])
+  process.env.LEPPY_WORKER_MODE = mode
+  const names: string[] = []
+  try {
+    applyWorkerTools({ tools: { register: (definition: { name: string }) => { names.push(definition.name); return () => {} } } } as unknown as Context)
+  } finally {
+    for (const name of variables) {
+      const value = previous[name]
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
+  return names
+}
+
 describe('worker commit capability', () => {
   it('normalizes an explicit dot cwd to the repository root without widening file scope', () => {
     const root = repository()
@@ -39,6 +60,28 @@ describe('worker commit capability', () => {
     expect(resolveExecCwd(policy, './')).toBe(root)
     expect(resolveExecCwd(policy, 'prisma/schemas')).toBe(join(root, 'prisma', 'schemas'))
     expect(() => resolveExecCwd(policy, 'prisma')).toThrow('outside this task scope')
+  })
+
+  it('gives publication conflict workers exact file scope and no commit capability', async () => {
+    const root = repository()
+    const exact = join(root, 'prisma', 'schemas', 'auth.prisma')
+    const policy: WorkerPolicy = {
+      root,
+      checklist: join(root, 'tasks.task.md'),
+      allowed: [exact],
+      mode: 'publication-conflict',
+    }
+    expect(resolveAllowed(policy, 'prisma/schemas/auth.prisma', false)).toBe(exact)
+    expect(() => resolveAllowed(policy, 'prisma/schemas', false)).toThrow('outside this task scope')
+    expect(() => resolveAllowed(policy, 'prisma/schemas/nested.prisma', true)).toThrow('outside this task scope')
+    expect(() => resolveAllowed(policy, 'tasks.task.md', false)).toThrow('controlling checklist is denied')
+    await expect(commitTaskChanges(policy, 'fix: forbidden conflict commit', runner(root))).rejects.toThrow('cannot commit')
+  })
+
+  it('registers only edit tools in publication conflict mode', () => {
+    const root = repository()
+    expect(registeredTools(root, 'publication-conflict')).toEqual(['leppy_read', 'leppy_write', 'leppy_delete'])
+    expect(registeredTools(root, 'task')).toEqual(['leppy_read', 'leppy_commit', 'leppy_write', 'leppy_exec'])
   })
 
   it('force-adds only changed ignored files inside the declared task scope', async () => {

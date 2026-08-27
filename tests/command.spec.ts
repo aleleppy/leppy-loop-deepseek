@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   apply, createChatProgressReporter, executeLeppyLoopCommand, executeLeppyLoopControl,
 } from '../src/command.js'
-import { selectControllerForPublication } from '../src/controller-auth.js'
+import { selectControllerForPublication, selectControllerForStatus } from '../src/controller-auth.js'
 import type { AuthenticatedController } from '../src/controller-auth.js'
 import { HumanGrantStore } from '../src/human-grant.js'
 import { parseLeppyLoopCommandInput, tokenizeLeppyLoopCommandInput } from '../src/options.js'
@@ -181,6 +181,22 @@ describe('simple human slash surface', () => {
     expect(selectControllerForPublication([unrelated, intended])?.runId).toBe('44c85fb806c6')
   })
 
+  it('status selects the newest controller instead of an older run merely because it has open work', async () => {
+    const oldOpen = controller({ runId: '606090827cf1', updatedAt: '2026-08-27T08:51:47.101Z' })
+    const publicationStall = controller({ status: 'stalled', completedTasks: 18, attempt: 34, updatedAt: '2026-08-27T19:40:58.876Z', detail: 'publication conflict repair failed' })
+    delete publicationStall.currentTask
+    delete publicationStall.openTask
+    expect(selectControllerForStatus([oldOpen, publicationStall])?.runId).toBe('44c85fb806c6')
+    expect(selectControllerForStatus([publicationStall, oldOpen])?.runId).toBe('44c85fb806c6')
+
+    const result = await executeLeppyLoopCommand(
+      context(), invocation(agent('status-agent'), 'status'), runtime({ inspectControllers: async () => [oldOpen, publicationStall] }),
+    )
+    expect(result).toMatchObject({ kind: 'success', text: expect.stringContaining('run=44c85fb806c6') })
+    expect(result.text).toContain('detail=publication conflict repair failed')
+    expect(result.text).not.toContain('undefined')
+  })
+
   it('/leppy-loop publicar can retry an authenticated publication-only stall', async () => {
     const messages: unknown[] = []
     const owner = agent('publish-stalled-agent', message => { messages.push(message) })
@@ -225,6 +241,41 @@ describe('grant-validated background controller tool', () => {
     expect(jobs.starts).toHaveLength(1)
     settle({ ...completed, runId: value.runId! })
     await expect(jobs.starts[0]!.hooks.done).resolves.toMatchObject({ status: 'completed' })
+  })
+
+  it('preserves actionable detail for a resolved publication stall in the Jobs outcome', async () => {
+    const owner = agent('job-detail-agent')
+    const jobs = new FakeJobs()
+    const rt = runtime({ run: async () => ({
+      runId: 'detail-run', status: 'stalled', completedTasks: 18, diagnostics: [], detail: 'publication conflict worker changed the Git index',
+    }) })
+    rt.grants.issue({ agent: owner, repoRoot: cwd, operation: 'start', recovery: 'none', publishRemote: false, maxIterations: 64, maxRepairCycles: 3 })
+    await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false,
+    })
+    await expect(jobs.starts[0]!.hooks.done).resolves.toMatchObject({
+      status: 'failed',
+      detail: expect.stringContaining('publication conflict worker changed the Git index'),
+      output: expect.stringContaining('detail=publication conflict worker changed the Git index'),
+    })
+  })
+
+  it('status reports the exact active background run before durable controller state exists', async () => {
+    const owner = agent('active-status-agent')
+    const jobs = new FakeJobs()
+    const rt = runtime({
+      run: async () => await new Promise<RunResult>(() => {}),
+      inspectControllers: async () => { throw new Error('transient durable inspection failure') },
+    })
+    rt.grants.issue({ agent: owner, repoRoot: cwd, operation: 'start', recovery: 'none', publishRemote: false, maxIterations: 64, maxRepairCycles: 3 })
+    const started = await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false,
+    })
+    const value = await executeLeppyLoopControl(context(jobs), rt, owner, { operation: 'status' })
+    expect(value).toMatchObject({ status: 'running', jobStatus: 'running', jobId: 'leppy-loop-1', runId: started.runId })
+    const explicit = await executeLeppyLoopControl(context(jobs), rt, owner, { operation: 'status', runId: started.runId! })
+    expect(explicit).toMatchObject({ status: 'running', jobStatus: 'running', jobId: 'leppy-loop-1', runId: started.runId })
+    expect(value.runId).not.toBe('606090827cf1')
   })
 
   it('rejects a duplicate live controller before repository-lock races', async () => {

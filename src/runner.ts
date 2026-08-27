@@ -53,6 +53,7 @@ interface RunState {
   completedTasks: number
   gateAttempts: Record<string, number>
   pullRequestUrl?: string
+  lastError?: string
   updatedAt: string
 }
 
@@ -348,6 +349,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     releaseLock = acquireLock(commonDir, state.runId)
     const previousStatus = state.status
     state.status = 'running'
+    delete state.lastError
     writeState(join(stateDir, 'run.json'), state)
     appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-start', 'recovery', { worktree: state.worktree, previousStatus }))
     appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', { taskIndex: state.currentTask ?? null }))
@@ -395,7 +397,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   let publicationOriginalHead: string | undefined
   let publicationValidationReceipt: string | undefined
   let publicationGate: { task: ChecklistTask; command: string } | undefined
-  const repairPublicationConflict = async (conflict: PublicationConflict): Promise<string> => {
+  const repairPublicationConflict = async (conflict: PublicationConflict): Promise<void> => {
     if (publicationRepairsUsed >= options.publicationRepairCycles) throw new Error(`publication conflict repair cycle limit exhausted after ${publicationRepairsUsed} workers`)
     if (!publicationChecklistDigest || !publicationGate) throw new Error('publication conflict repair lacks a frozen checklist and final gate')
     const checklistPath = join(state.worktree, checklistRelative)
@@ -429,7 +431,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       text: `Resolve authenticated publication rebase conflict (${publicationRepairsUsed}/${options.publicationRepairCycles})`,
       raw: `Publication rebase conflict repair | paths=${allowedPaths.join(',')}`,
       metadata: {
-        done: 'All conflict markers are resolved by preserving the completed feature and compatible authoritative-base changes; create exactly one conventional commit and leave no unmerged path.',
+        done: 'Resolve every conflict marker in the exact allowed files while preserving completed feature behavior and compatible authoritative-base changes; do not stage or commit.',
         paths: allowedPaths,
       },
     }
@@ -444,6 +446,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       worktree: state.worktree,
       checklistPath: checklistRelative,
       allowedPaths,
+      mode: 'publication-conflict',
       model: model.model,
       provider: model.provider,
       ...(model.effort ? { effort: model.effort } : {}),
@@ -457,7 +460,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         ...await discoverInstructions(state.worktree, allowedPaths),
         `The controller is in an authenticated Git rebase stopped by conflicts. Resolve only these unmerged paths: ${allowedPaths.join(', ')}.`,
         `Preserve both the completed Leppy work and compatible changes from the authoritative base. Conflict detail: ${redact(conflict.detail)}`,
-        'Do not run git, rebase, merge, push, gh, gates, or edit the checklist. Use leppy_commit exactly once after resolving every marker.',
+        'Do not run git, stage, commit, rebase, merge, push, gh, gates, or edit the checklist. Resolve only file contents and return; the controller owns the index and rebase continuation.',
       ],
     }
     appendEvent(eventsPath, event(state.runId, 'recovery-start', 'publish', { publicationConflict: true, cycle: publicationRepairsUsed, paths: allowedPaths }, task, state.attempt))
@@ -467,14 +470,10 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     if (signal.aborted) throw abortReason(signal)
     if (digest(readFileSync(checklistPath, 'utf8')) !== rebaseStepChecklistDigest) throw new Error('publication repair worker altered the controlling checklist')
     if (outcome.status !== 'completed') throw new Error(`publication conflict worker ${outcome.status}: ${outcome.error ?? 'no error detail'}`)
-    const count = await commitCount(state.worktree, previousHead)
-    if (count !== 1) throw new Error(`publication conflict worker must create exactly one commit; observed ${count}`)
-    if (!isConventional(await commitSubject(state.worktree))) throw new Error('publication conflict worker commit is not conventional')
-    if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('publication conflict worker must resolve every unmerged path and leave a clean tree')
-    const commit = await head(state.worktree)
-    appendEvent(eventsPath, event(state.runId, 'recovery-done', 'publish', { publicationConflict: true, cycle: publicationRepairsUsed, commit }, task, state.attempt))
+    if (await head(state.worktree) !== previousHead) throw new Error('publication conflict worker changed HEAD')
+    if (!await isAuthenticatedPublicationRebase(publicationRequest, signal)) throw new Error('publication conflict worker changed the authenticated rebase identity')
+    appendEvent(eventsPath, event(state.runId, 'recovery-done', 'publish', { publicationConflict: true, cycle: publicationRepairsUsed, resolvedPaths: allowedPaths }, task, state.attempt))
     await dependencies.onProgress?.(taskProgress(state, task, state.completedTasks, 'task-done', clock().getTime() - startedAt))
-    return commit
   }
   const restorePrePublicationHead = async (): Promise<void> => {
     if (!publicationOriginalHead) throw new Error('publication rollback lacks the authenticated original HEAD')
@@ -590,17 +589,18 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             writeState(join(stateDir, 'run.json'), state)
             appendEvent(eventsPath, event(state.runId, 'publish-done', 'publish', { url: state.pullRequestUrl }))
           } catch (error) {
-            const message = redact(error instanceof Error ? error.message : String(error))
+            const message = redact(error instanceof Error ? error.message : String(error)).slice(-16 * 1024)
             state.status = 'stalled'
+            state.lastError = message
             writeState(join(stateDir, 'run.json'), state)
             appendEvent(eventsPath, event(state.runId, 'stall', 'publish', { reason: message }))
             atomicWriteJson(join(stateDir, 'resume.json'), {
               schemaVersion: 1,
               runId: state.runId,
-              reason: 'pull request publication stalled',
+              reason: message,
               command: `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)}`,
             })
-            return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, diagnostics }
+            return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, diagnostics, detail: message }
           }
         }
         state.status = 'completed'
@@ -814,8 +814,9 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
     return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, ...(state.currentTask !== undefined ? { currentTask: state.currentTask } : {}), diagnostics }
   } catch (error) {
-    const message = redact(error instanceof Error ? error.message : String(error))
+    const message = redact(error instanceof Error ? error.message : String(error)).slice(-16 * 1024)
     if (state.status === 'running') state.status = signal.aborted ? 'interrupted' : 'failed'
+    state.lastError = message
     writeState(join(stateDir, 'run.json'), state)
     appendEvent(eventsPath, event(state.runId, 'run-end', 'complete', { status: state.status, error: message }))
     try {

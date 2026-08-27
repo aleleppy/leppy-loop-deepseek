@@ -98,6 +98,7 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
       LEPPY_WORKTREE: request.worktree,
       LEPPY_CHECKLIST: request.checklistPath,
       LEPPY_ALLOWED_PATHS: JSON.stringify(request.allowedPaths),
+      LEPPY_WORKER_MODE: request.mode ?? 'task',
       LEPPY_MODEL_EFFORT: request.effort ?? '',
       LEPPY_SYSTEM_PROMPT: prompt,
       LEPPY_SESSION_ROOT: join(request.stateDir, 'sessions', suffix),
@@ -157,17 +158,22 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
 }
 
 function workerPrompt(request: WorkerRequest): string {
+  const publicationConflict = request.mode === 'publication-conflict'
   const kind = request.task.kind === 'closure' ? 'phase closure' : 'ordinary task'
   return [
-    `You are one ephemeral Leppy Loop worker for a ${kind}.`,
+    `You are one ephemeral Leppy Loop worker for a ${publicationConflict ? 'publication conflict resolution' : kind}.`,
     `Execute only this line: ${request.task.raw}`,
     request.task.metadata.done ? `Done contract: ${request.task.metadata.done}` : 'Closure contract: inspect the completed phase and correct only defects inside scope.',
     `Allowed repo-relative paths: ${request.allowedPaths.map(path => JSON.stringify(path)).join(', ')}`,
-    'Use only the provided leppy_read, leppy_write, leppy_exec, and leppy_commit tools.',
+    publicationConflict
+      ? 'Use only the provided leppy_read, leppy_write, and leppy_delete tools. Every allowed path is exact; no directory descendants are authorized.'
+      : 'Use only the provided leppy_read, leppy_write, leppy_exec, and leppy_commit tools.',
     'Never read or edit the controlling checklist. Never push, publish, deploy, mutate PRs, fetch, merge, rebase, or manage worktrees.',
-    request.task.kind === 'task'
-      ? 'Finish with exactly one conventional commit through leppy_commit and a clean working tree.'
-      : 'If correction is needed, make at most one conventional commit and leave a clean tree. If no correction is needed, make no commit.',
+    publicationConflict
+      ? 'Resolve the exact files and finish without staging or committing. The authenticated controller exclusively owns the Git index and rebase continuation.'
+      : request.task.kind === 'task'
+        ? 'Finish with exactly one conventional commit through leppy_commit and a clean working tree.'
+        : 'If correction is needed, make at most one conventional commit and leave a clean tree. If no correction is needed, make no commit.',
     ...request.instructions,
   ].join('\n')
 }

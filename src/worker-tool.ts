@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -7,6 +7,7 @@ import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import { safePathEnvironment, validateArgv } from './security.js'
 import { isConventional } from './git.js'
+import type { WorkerMode } from './types.js'
 
 export const name = 'leppy-loop-worker-tools'
 export const inject = ['tools', 'subprocess', 'sandbox', 'sandboxPolicy']
@@ -15,6 +16,7 @@ export interface WorkerPolicy {
   root: string
   checklist: string
   allowed: string[]
+  mode?: WorkerMode
   gateFingerprint?: string
 }
 
@@ -23,7 +25,9 @@ function loadPolicy(): WorkerPolicy {
   const checklist = resolve(root, requiredEnv('LEPPY_CHECKLIST'))
   const allowed = JSON.parse(requiredEnv('LEPPY_ALLOWED_PATHS')) as unknown
   if (!Array.isArray(allowed) || !allowed.every(item => typeof item === 'string')) throw new Error('LEPPY_ALLOWED_PATHS must be a string array')
-  return { root, checklist, allowed: allowed.map(item => resolve(root, item)), ...(process.env.LEPPY_GATE_FINGERPRINT ? { gateFingerprint: process.env.LEPPY_GATE_FINGERPRINT } : {}) }
+  const mode = process.env.LEPPY_WORKER_MODE ?? 'task'
+  if (!['task', 'publication-conflict'].includes(mode)) throw new Error('LEPPY_WORKER_MODE is invalid')
+  return { root, checklist, allowed: allowed.map(item => resolve(root, item)), mode: mode as WorkerMode, ...(process.env.LEPPY_GATE_FINGERPRINT ? { gateFingerprint: process.env.LEPPY_GATE_FINGERPRINT } : {}) }
 }
 
 function requiredEnv(name: string): string {
@@ -47,14 +51,14 @@ function inside(parent: string, child: string): boolean {
   return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
 }
 
-function resolveAllowed(policy: WorkerPolicy, candidate: string, writing: boolean): string {
+export function resolveAllowed(policy: WorkerPolicy, candidate: string, writing: boolean): string {
   if (candidate.includes('\0') || isAbsolute(candidate)) throw new Error('path must be repo-relative')
   const absolute = resolve(policy.root, candidate)
   const { real, suffix } = nearestReal(absolute)
   const canonical = resolve(real, suffix)
   if (!inside(policy.root, canonical)) throw new Error('path escapes worktree through traversal or link')
   if (canonical === policy.checklist) throw new Error('controlling checklist is denied')
-  const permitted = policy.allowed.some(scope => canonical === scope || inside(scope, canonical))
+  const permitted = policy.allowed.some(scope => canonical === scope || (policy.mode !== 'publication-conflict' && inside(scope, canonical)))
   if (!permitted) throw new Error(`path is outside this task scope: ${candidate}`)
   if (!writing && !existsSync(canonical)) throw new Error(`path does not exist: ${candidate}`)
   return canonical
@@ -92,6 +96,7 @@ type GitRunner = (args: readonly string[]) => Promise<GitResult>
 
 /** Validate and commit exactly the changed paths inside one worker's declared scope. */
 export async function commitTaskChanges(policy: WorkerPolicy, message: string, runGit: GitRunner): Promise<string> {
+  if (policy.mode === 'publication-conflict') throw new Error('publication conflict workers cannot commit')
   if (!isConventional(message)) throw new Error('commit message must be conventional')
   const relativeScopes = policy.allowed.map(path => relative(policy.root, path))
   const probes = await Promise.all([
@@ -124,7 +129,7 @@ export function apply(ctx: Context): void {
       return { text: readFileSync(resolveAllowed(policy, args.path, false), 'utf8') }
     },
   }))
-  ctx.tools.register(defineTool({
+  if (policy.mode !== 'publication-conflict') ctx.tools.register(defineTool({
     name: 'leppy_commit',
     description: 'Create the task conventional commit through a narrow Git-metadata capability after validating every changed path against this task scope.',
     parameters: { message: { type: 'string', required: true } },
@@ -146,7 +151,19 @@ export function apply(ctx: Context): void {
       return { bytes: Buffer.byteLength(args.content) }
     },
   }))
-  ctx.tools.register(defineTool({
+  if (policy.mode === 'publication-conflict') ctx.tools.register(defineTool({
+    name: 'leppy_delete',
+    description: 'Delete one exact conflicted path. This capability exists only during authenticated publication conflict repair.',
+    parameters: { path: { type: 'string', required: true } },
+    output: { schema: { type: 'object', additionalProperties: false, properties: { deleted: { type: 'boolean', required: true } } }, render: (_args, value) => textOutput(value) },
+    async execute(args) {
+      const path = resolveAllowed(policy, args.path, true)
+      const deleted = existsSync(path)
+      if (deleted) rmSync(path, { force: true })
+      return { deleted }
+    },
+  }))
+  if (policy.mode !== 'publication-conflict') ctx.tools.register(defineTool({
     name: 'leppy_exec',
     description: 'Run an exact local argv without a shell. Remote, publication, integration and dynamic-eval commands are denied.',
     parameters: {

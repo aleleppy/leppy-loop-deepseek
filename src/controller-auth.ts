@@ -22,6 +22,7 @@ interface StoredRunState {
   completedTasks: number
   gateAttempts: Record<string, number>
   pullRequestUrl?: string
+  lastError?: string
   updatedAt: string
 }
 
@@ -43,6 +44,7 @@ export interface AuthenticatedController {
   openTask?: ChecklistTask
   pullRequestUrl?: string
   publicationRebase?: boolean
+  detail?: string
 }
 
 function ownershipPayload(state: StoredRunState): string {
@@ -75,6 +77,7 @@ function parseStoredRun(path: string): StoredRunState | undefined {
       || typeof value.attempt !== 'number'
       || typeof value.completedTasks !== 'number'
       || typeof value.updatedAt !== 'string'
+      || (value.lastError !== undefined && typeof value.lastError !== 'string')
       || typeof value.status !== 'string'
       || typeof value.gateAttempts !== 'object'
       || value.gateAttempts === null) return undefined
@@ -160,10 +163,16 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       updatedAt: state.updatedAt,
       ...(openTask ? { openTask } : {}),
       ...(state.pullRequestUrl ? { pullRequestUrl: state.pullRequestUrl } : {}),
+      ...(state.lastError ? { detail: state.lastError } : {}),
       ...(publicationRebase ? { publicationRebase: true } : {}),
     })
   }
   return controllers.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+}
+
+/** Select the most recently updated authenticated controller regardless of its workflow phase. */
+export function selectControllerForStatus(controllers: readonly AuthenticatedController[]): AuthenticatedController | undefined {
+  return [...controllers].sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0]
 }
 
 /** Select the most recently updated authenticated controller that still has work. */

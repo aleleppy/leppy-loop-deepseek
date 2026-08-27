@@ -2,6 +2,19 @@
 
 All notable changes are documented here.
 
+## [0.3.3] - 2026-08-27
+
+### Fixed
+
+- Publication conflict recovery no longer asks a worker to commit a rebase step. The controller now preserves clean paths already staged by Git, gives the worker edit-only authority over exact unmerged files, validates frozen HEAD/index/rebase identity, stages only resolved conflicts, and continues or safely skips an empty replay step itself across merge/apply backends.
+- Failed conflict recovery verifies that rebase abort restored the authenticated branch, HEAD, and clean tree; rollback failure is surfaced explicitly instead of being hidden behind the original stall.
+- `/leppy-loop status` reports the exact owner-fenced live job first and otherwise the newest authenticated controller, so an old failed run with open work cannot hide a newer publication stall.
+- Background and durable status output preserve bounded actionable stall detail, omit undefined fields, and distinguish publication authorization from ordinary continuation.
+
+### Security
+
+- Publication conflict workers have no commit or exec tools. Any index/HEAD/rebase drift, changed unmerged set, untracked path, or edit outside the exact conflict set aborts and restores the authenticated pre-publication branch before push.
+
 ## [0.3.2] - 2026-08-27
 
 ### Added
