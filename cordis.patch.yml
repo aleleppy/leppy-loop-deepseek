@@ -1,4 +1,4 @@
 - insert:
     - id: leppy-loop-command
       name: leppy-loop-deepseek
-      inject: [commands, tools, credentials, settings, llm, agentDefaultModel]
+      inject: [commands, tools, jobs, credentials, settings, llm, agentDefaultModel]

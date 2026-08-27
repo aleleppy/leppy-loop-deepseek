@@ -2,6 +2,24 @@
 
 All notable changes are documented here.
 
+## [0.3.0] - 2026-08-27
+
+### Added
+
+- `/leppy-loop`, `continue`, `stop`, `status`, and explicit publication language are now the complete human Web surface; paths, refs, run IDs, repair flags, scopes, fingerprints, and cycle counts remain private technical facts.
+- Direct human intent mints an expiring, one-shot capability bound to the exact live Agent/session, canonical repository, authenticated run, operation, iteration/repair bounds, and publication authority. Cross-session/repository/run use and replay fail closed.
+- The agent-scoped `leppy_loop_control` tool validates the grant and transfers controllers into the Harness job registry, returning a job ID immediately. General controller status, elapsed time, terminal state, and direct Stop are visible in a dedicated Web card.
+
+### Changed
+
+- Web slash RPCs no longer await the controller. Worker, gate, and fetch cancellation flow from `ctx.jobs.kill`; cancellation preserves dirty WIP and the open controller row for exact recovery.
+- Task cards render `Running`, attempt, and elapsed duration in separate non-shrinking elements while only the long task label elides; terminal output remains on the same card.
+- Exact continuation selects the most recently updated HMAC-authenticated run with open work and reconstructs checklist/base facts from its preserved controller. Technical argv remains available only through the separate CLI startup composition.
+
+### Security
+
+- Retry, repair, stop, and remote publication cannot be self-authorized by model booleans. Existing clean-worktree, unchanged-gate-fingerprint, exact-run ownership, bounded repair, and publication checks remain defense in depth.
+
 ## [0.2.24] - 2026-08-27
 
 ### Changed

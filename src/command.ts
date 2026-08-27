@@ -1,13 +1,20 @@
-import { isAbsolute, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { isAbsolute, relative, resolve } from 'node:path'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 import { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-credentials'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { inspectAuthenticatedControllers, selectControllerForHumanIntent } from './controller-auth.js'
+import type { AuthenticatedController } from './controller-auth.js'
+import { resolveRepoRoot } from './git.js'
 import { harnessRunDependencies } from './harness-runtime.js'
-import { parseLeppyLoopCommandInput } from './options.js'
+import { HumanGrantStore } from './human-grant.js'
+import type { LeppyOperation, RecoveryAuthority } from './human-grant.js'
 import { runLeppyLoop } from './runner.js'
 import type { LeppyLoopOptions, RunDependencies, RunProgress, RunResult, WorkerPolicy } from './types.js'
 
@@ -17,65 +24,74 @@ declare module '@deepseek-ai/dsh-commands/types' {
   }
 }
 
+declare module '@deepseek-ai/dsh-jobs' {
+  interface JobKindMap {
+    'leppy-loop': 'leppy-loop'
+  }
+}
+
 const WORKER_POLICIES: WorkerPolicy[] = ['adaptive', 'selected', 'terra-high', 'sol-low']
+const GRANT_MAX_ITERATIONS = 64
+const GRANT_MAX_REPAIR_CYCLES = 3
 
 export const name = 'leppy-loop-command'
-export const inject = ['commands', 'tools', 'credentials', 'settings', 'llm', 'agentDefaultModel']
+export const inject = ['commands', 'tools', 'jobs', 'credentials', 'settings', 'llm', 'agentDefaultModel']
 
-const AUTONOMOUS_PROMPT = `The human invoked /leppy-loop without arguments. Autonomously prepare and start Leppy Loop for the task implied by the conversation and repository state.
+const START_PROMPT = `The human invoked the simple /leppy-loop interface and authorized one bounded local controller start.
 
-1. Inspect the session workspace and relevant conversation context.
-2. Identify the intended tracked Markdown checklist. Prefer an explicitly discussed controller; otherwise inspect plausible *.task.md files and their open rows. A checklist is eligible only when it has at least one open executable row, every open ordinary row has a non-empty Done: contract and explicit repo-relative paths, and every open closure/gate satisfies its typed contract. A controller with zero open rows is already finished and must not be started or recovered. Treat status prose such as "pending", "blocked", or "requires review" without those contracts as an invalid legacy controller, not runnable work. Never edit the controller to make it eligible.
-3. Determine the authoritative Git base ref from the current branch upstream, remote HEAD, or repository convention.
-4. Determine a phase gate only when the checklist requires one and does not carry its own gate metadata.
-5. Call leppy_loop_start exactly once with the resolved arguments. Do not launch another dsh process or emulate the controller with shell commands.
-6. If the intended checklist is invalid, or more than one eligible checklist or base is genuinely plausible, ask the human one concise question instead of guessing or calling leppy_loop_start.
-7. If the controller returns stalled, failed, or interrupted, never edit its source checkout or preserved worktree, never delegate a repair through subagent/workflow, and never publish or integrate around it. Report the exact run/receipt and stop. Availability recovery must launch a new worker only through exact-run Leppy recovery. A failed gate may be repaired only by a later direct human slash/CLI command carrying --repair-gate and the exact run ID.
-
-Wait for leppy_loop_start to settle before reporting completion or recovery information.`
+Resolve the intended tracked Markdown checklist and authoritative Git base from the conversation and repository. Call leppy_loop_control exactly once with operation=start and the technical arguments. The tool consumes a session- and repository-bound one-shot human capability and returns a background job immediately. Do not wait for the controller, poll it, start another dsh process, emulate it with shell, use subagents, or edit any controller worktree. Ask one concise question only when the checklist or base is genuinely ambiguous.`
 
 export interface LeppyLoopCommandHooks {
   run?: (options: LeppyLoopOptions, dependencies: RunDependencies) => Promise<RunResult>
   dependencies?: (ctx: Context, signal: AbortSignal) => RunDependencies
+  inspectControllers?: (cwd: string) => Promise<AuthenticatedController[]>
 }
 
-export interface LeppyLoopStartArguments {
-  tasks: string
-  syncBranch: string
-  phaseGateCommand?: string
+export interface LeppyLoopControlArguments {
+  operation: 'start' | 'continue' | 'status' | 'stop'
+  tasks?: string
+  syncBranch?: string
+  runId?: string
   taskMatch?: string
-  recoverExistingWip?: boolean
-  recoverRunId?: string
-  dryRun?: boolean
+  recovery?: 'resume' | 'retry-gate' | 'repair-gate'
   fetch?: boolean
   workerPolicy?: WorkerPolicy
 }
 
-export interface LeppyLoopStartResult {
+export interface LeppyLoopControlResult {
+  operation: string
   status: string
-  runId: string
-  completedTasks: number
-  branch?: string
-  worktree?: string
-  stateDir?: string
+  runId?: string
+  jobId?: string
+  completedTasks?: number
   currentTask?: number
-  pullRequestUrl?: string
-  diagnostics: RunResult['diagnostics']
+  attempt?: number
+  task?: string
+  branch?: string
+}
+
+interface JobRecord {
+  id: JobId
+  agent: Agent
+  repoRoot: string
+  runId: string
+}
+
+export interface LeppyLoopRuntime {
+  grants: HumanGrantStore
+  jobs: JobRecord[]
+  registeredAgents: WeakSet<Agent>
+  lifetime: AbortController
+  hooks: LeppyLoopCommandHooks
 }
 
 function abortError(signal: AbortSignal): Error {
   if (signal.reason instanceof Error) return signal.reason
-  return new Error(typeof signal.reason === 'string' ? signal.reason : 'Leppy Loop command aborted')
+  return new Error(typeof signal.reason === 'string' ? signal.reason : 'Leppy Loop aborted')
 }
 
 function workspaceOptions(options: LeppyLoopOptions, cwd: string): LeppyLoopOptions {
-  return {
-    ...options,
-    tasks: resolve(cwd, options.tasks),
-    ...(options.artifactsDir
-      ? { artifactsDir: isAbsolute(options.artifactsDir) ? options.artifactsDir : resolve(cwd, options.artifactsDir) }
-      : {}),
-  }
+  return { ...options, tasks: resolve(cwd, options.tasks) }
 }
 
 function resultText(result: RunResult): string {
@@ -83,33 +99,12 @@ function resultText(result: RunResult): string {
     `status=${result.status}`,
     `run=${result.runId}`,
     `completed=${result.completedTasks}`,
-    ...(result.branch ? [`branch=${result.branch}`] : []),
-    ...(result.worktree ? [`worktree=${result.worktree}`] : []),
-    ...(result.stateDir ? [`state=${result.stateDir}`] : []),
     ...(result.currentTask === undefined ? [] : [`currentTask=${result.currentTask}`]),
+    ...(result.branch ? [`branch=${result.branch}`] : []),
     ...(result.pullRequestUrl ? [`pr=${result.pullRequestUrl}`] : []),
   ]
-  if (result.preview) {
-    facts.push(`selected=${result.preview.selectedLine ?? '<none>'}`)
-  }
-  if (result.diagnostics.length > 0) {
-    facts.push(`diagnostics=${result.diagnostics.map(item => `${item.line ?? '-'}:${item.code}:${item.message}`).join('; ')}`)
-  }
+  if (result.diagnostics.length > 0) facts.push(`diagnostics=${result.diagnostics.map(item => `${item.line ?? '-'}:${item.code}:${item.message}`).join('; ')}`)
   return `Leppy Loop ${result.status}. ${facts.join(' | ')}`
-}
-
-function resultValue(result: RunResult): LeppyLoopStartResult {
-  return {
-    status: result.status,
-    runId: result.runId,
-    completedTasks: result.completedTasks,
-    diagnostics: result.diagnostics,
-    ...(result.branch ? { branch: result.branch } : {}),
-    ...(result.worktree ? { worktree: result.worktree } : {}),
-    ...(result.stateDir ? { stateDir: result.stateDir } : {}),
-    ...(result.currentTask === undefined ? {} : { currentTask: result.currentTask }),
-    ...(result.pullRequestUrl ? { pullRequestUrl: result.pullRequestUrl } : {}),
-  }
 }
 
 function progressCommandId(progress: RunProgress): ReturnType<typeof CommandId> {
@@ -118,7 +113,7 @@ function progressCommandId(progress: RunProgress): ReturnType<typeof CommandId> 
 
 function progressLabel(progress: RunProgress): string {
   const compact = progress.text.replace(/\s+/gu, ' ').trim()
-  const bounded = compact.length > 180 ? `${compact.slice(0, 177)}...` : compact
+  const bounded = compact.length > 240 ? `${compact.slice(0, 237)}...` : compact
   return `[${progress.completedTasks + 1}/${progress.totalTasks}] ${bounded}`
 }
 
@@ -127,9 +122,7 @@ function formatElapsed(elapsedMs: number): string {
   const hours = Math.floor(totalSeconds / 3600)
   const minutes = Math.floor((totalSeconds % 3600) / 60)
   const seconds = totalSeconds % 60
-  return [hours > 0 ? `${hours}h` : '', minutes > 0 || hours > 0 ? `${minutes}m` : '', `${seconds}s`]
-    .filter(Boolean)
-    .join(' ')
+  return [hours > 0 ? `${hours}h` : '', minutes > 0 || hours > 0 ? `${minutes}m` : '', `${seconds}s`].filter(Boolean).join(' ')
 }
 
 /** Render controller progress as durable, model-invisible command cards in the chat. */
@@ -140,7 +133,7 @@ export function createChatProgressReporter(agent: CommandInvocation['agent']): (
       agent.session.append('command/run', {
         commandId,
         name: 'leppy-loop-task',
-        args: ` ${progressLabel(progress)}\nleppy-elapsed-ms=${Math.floor(progress.elapsedMs)}`,
+        args: ` ${progressLabel(progress)}\nleppy-attempt=${progress.attempt}\nleppy-elapsed-ms=${Math.floor(progress.elapsedMs)}`,
         source: { kind: 'plugin', plugin: 'leppy-loop' },
       })
       return
@@ -153,139 +146,347 @@ export function createChatProgressReporter(agent: CommandInvocation['agent']): (
   }
 }
 
-/** Start the controller from arguments selected by the model-facing orchestration turn. */
-export async function executeLeppyLoopTool(
-  ctx: Context,
-  agent: CommandInvocation['agent'],
-  args: LeppyLoopStartArguments,
-  signal: AbortSignal,
-  hooks: LeppyLoopCommandHooks = {},
-): Promise<LeppyLoopStartResult> {
+function requireWorkspace(agent: Agent): string {
   const cwd = agent.session.header.cwd
   if (!cwd || !isAbsolute(cwd)) throw new Error('Leppy Loop requires an absolute session workspace cwd')
-  const options = workspaceOptions({
-    tasks: args.tasks,
-    syncBranch: args.syncBranch,
-    ...(args.phaseGateCommand ? { phaseGateCommand: args.phaseGateCommand } : {}),
+  return cwd
+}
+
+function requireString(value: string | undefined, name: string): string {
+  if (!value) throw new Error(`leppy_loop_control requires ${name} for this operation`)
+  return value
+}
+
+function recoveryOf(args: LeppyLoopControlArguments): RecoveryAuthority {
+  if (args.operation === 'start') return 'none'
+  if (args.operation === 'continue') return args.recovery ?? 'resume'
+  return 'none'
+}
+
+async function authenticatedController(runtime: LeppyLoopRuntime, cwd: string, runId: string): Promise<AuthenticatedController> {
+  const controllers = await (runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers)(cwd)
+  const controller = controllers.find(candidate => candidate.runId === runId)
+  if (!controller) throw new Error(`run ${runId} is not an authenticated controller in this repository`)
+  return controller
+}
+
+function validateTechnicalArguments(
+  args: LeppyLoopControlArguments,
+  cwd: string,
+  repoRoot: string,
+  controller?: AuthenticatedController,
+): void {
+  if (args.operation === 'stop') return
+  const tasks = requireString(args.tasks, 'tasks')
+  const syncBranch = requireString(args.syncBranch, 'syncBranch')
+  if (controller) {
+    if (resolve(cwd, tasks) !== resolve(repoRoot, controller.checklistRelative)) throw new Error('tool checklist does not match the human-authorized run')
+    if (syncBranch !== controller.syncBranch) throw new Error('tool base does not match the human-authorized run')
+  }
+}
+
+function controllerOptions(
+  args: LeppyLoopControlArguments,
+  cwd: string,
+  repoRoot: string,
+  runId: string,
+  grant: ReturnType<HumanGrantStore['consume']>,
+  controller?: AuthenticatedController,
+): LeppyLoopOptions {
+  const tasks = requireString(args.tasks, 'tasks')
+  const syncBranch = requireString(args.syncBranch, 'syncBranch')
+  if (controller) {
+    if (resolve(cwd, tasks) !== resolve(repoRoot, controller.checklistRelative)) throw new Error('tool checklist does not match the human-authorized run')
+    if (syncBranch !== controller.syncBranch) throw new Error('tool base does not match the human-authorized run')
+  }
+  const recovery = recoveryOf(args)
+  const options: LeppyLoopOptions = {
+    tasks,
+    syncBranch,
     ...(args.taskMatch ? { taskMatch: args.taskMatch } : {}),
-    recoverExistingWip: Boolean(args.recoverExistingWip || args.recoverRunId),
-    ...(args.recoverRunId ? { recoverRunId: args.recoverRunId } : {}),
-    dryRun: Boolean(args.dryRun),
     fetch: args.fetch !== false,
     workerPolicy: args.workerPolicy ?? 'adaptive',
-    // Model-selected autonomous runs are always local. Remote publication is
-    // available only through the direct, human-authored --open-pr command.
-    openPullRequest: false,
-  }, cwd)
-  const dependencies = hooks.dependencies?.(ctx, signal) ?? {
-    ...harnessRunDependencies(ctx, signal),
-    onProgress: createChatProgressReporter(agent),
+    maxIterations: grant.maxIterations,
+    openPullRequest: grant.publishRemote,
+    repoRoot,
   }
-  return resultValue(await (hooks.run ?? runLeppyLoop)(options, dependencies))
+  if (args.operation === 'continue') {
+    options.recoverExistingWip = true
+    options.recoverRunId = runId
+    options.retryGate = recovery === 'retry-gate'
+    options.repairGate = recovery === 'repair-gate'
+    if (recovery === 'repair-gate') {
+      options.repairCycles = grant.maxRepairCycles
+    }
+  }
+  return workspaceOptions(options, cwd)
 }
 
-/** Execute one user-owned Web command, delegating bare or natural-language invocation to the model. */
-export async function executeLeppyLoopCommand(
+function jobOutcome(result: RunResult, signal: AbortSignal): JobOutcome {
+  const output = resultText(result)
+  if (signal.aborted || result.status === 'interrupted') return { status: 'killed', detail: `run ${result.runId} interrupted`, output }
+  if (result.status === 'completed' || result.status === 'dry-run') return { status: 'completed', detail: `run ${result.runId} ${result.status}`, output }
+  return { status: 'failed', detail: `run ${result.runId} ${result.status}${result.currentTask === undefined ? '' : ` at task ${result.currentTask}`}`, output }
+}
+
+function liveJobRecord(ctx: Context, runtime: LeppyLoopRuntime, agent: Agent, repoRoot: string): JobRecord | undefined {
+  return [...runtime.jobs].reverse().find(record => {
+    if (record.agent !== agent || record.repoRoot !== repoRoot) return false
+    try {
+      const status = ctx.jobs.get(record.id, agent).status
+      return status === 'running' || status === 'stopping'
+    } catch {
+      return false
+    }
+  })
+}
+
+function startControllerJob(
   ctx: Context,
-  invocation: CommandInvocation,
-  lifetimeSignal?: AbortSignal,
-  hooks: LeppyLoopCommandHooks = {},
-): Promise<CommandResult> {
-  const signal = lifetimeSignal
-    ? AbortSignal.any([invocation.signal, lifetimeSignal])
-    : invocation.signal
+  runtime: LeppyLoopRuntime,
+  agent: Agent,
+  options: LeppyLoopOptions,
+  repoRoot: string,
+  runId: string,
+): JobId {
+  const existing = liveJobRecord(ctx, runtime, agent, repoRoot)
+  if (existing) throw new Error(`Leppy controller job ${existing.id} is already active in this repository`)
+  const abort = new AbortController()
+  const signal = AbortSignal.any([abort.signal, runtime.lifetime.signal])
+  const id = ctx.jobs.start({
+    kind: 'leppy-loop',
+    label: `Controller ${runId} — ${relative(repoRoot, options.tasks)}`,
+    owner: agent,
+    outputLimitBytes: 64 * 1024,
+    run: () => {
+      const dependencies = runtime.hooks.dependencies?.(ctx, signal) ?? {
+        ...harnessRunDependencies(ctx, signal),
+        runId: () => runId,
+        onProgress: createChatProgressReporter(agent),
+      }
+      if (!dependencies.runId) dependencies.runId = () => runId
+      if (!dependencies.onProgress) dependencies.onProgress = createChatProgressReporter(agent)
+      const done = (runtime.hooks.run ?? runLeppyLoop)(options, dependencies).then(
+        result => jobOutcome(result, signal),
+        (error: unknown): JobOutcome => signal.aborted
+          ? { status: 'killed', detail: `run ${runId} interrupted`, output: `Leppy Loop interrupted. run=${runId}` }
+          : { status: 'failed', detail: error instanceof Error ? error.message : String(error), output: `Leppy Loop failed. run=${runId} | error=${error instanceof Error ? error.message : String(error)}` },
+      )
+      return {
+        cancel: reason => { if (!abort.signal.aborted) abort.abort(new Error(reason ?? 'Leppy Loop stopped by the human')) },
+        done,
+      }
+    },
+  })
+  runtime.jobs.push({ id, agent, repoRoot, runId })
+  return id
+}
+
+/** Execute the scoped grant-consuming controller tool. */
+export async function executeLeppyLoopControl(
+  ctx: Context,
+  runtime: LeppyLoopRuntime,
+  agent: Agent,
+  args: LeppyLoopControlArguments,
+): Promise<LeppyLoopControlResult> {
+  const cwd = requireWorkspace(agent)
+  const repoRoot = resolve(await resolveRepoRoot(cwd))
+  if (args.operation === 'status') {
+    const controllers = await (runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers)(cwd)
+    const selected = args.runId ? controllers.find(candidate => candidate.runId === args.runId) : selectControllerForHumanIntent(controllers)
+    return selected ? {
+      operation: 'status', status: selected.status, runId: selected.runId,
+      completedTasks: selected.completedTasks, attempt: selected.attempt, branch: selected.branch,
+      ...(selected.currentTask === undefined ? {} : { currentTask: selected.currentTask }),
+      ...(selected.openTask ? { task: selected.openTask.text } : {}),
+    } : { operation: 'status', status: 'not-found' }
+  }
+
+  const runId = args.operation === 'start'
+    ? randomUUID().replaceAll('-', '').slice(0, 12)
+    : requireString(args.runId, 'runId')
+  const controller = args.operation === 'continue' ? await authenticatedController(runtime, cwd, runId) : undefined
+  const record = args.operation === 'stop'
+    ? liveJobRecord(ctx, runtime, agent, repoRoot)
+    : undefined
+  if (args.operation === 'stop' && (!record || record.runId !== runId)) throw new Error(`no active background controller job exists for run ${runId}`)
+  validateTechnicalArguments(args, cwd, repoRoot, controller)
+  const recovery = recoveryOf(args)
+  const grant = runtime.grants.consume({
+    agent, repoRoot, operation: args.operation, recovery,
+    ...(args.operation === 'start' ? {} : { runId }),
+    ...(controller ? { controllerDigest: controller.authorityDigest } : {}),
+  })
+
+  if (args.operation === 'stop') {
+    const outcome = ctx.jobs.kill(record!.id, agent, 'Stopped through direct human Leppy intent')
+    return { operation: 'stop', status: outcome === 'requested' ? 'stopping' : 'already-finished', runId, jobId: String(record!.id) }
+  }
+
+  const options = controllerOptions(args, cwd, repoRoot, runId, grant, controller)
   try {
-    if (signal.aborted) throw abortError(signal)
-    const cwd = invocation.agent.session.header.cwd
-    if (!cwd) return { kind: 'error', text: 'Leppy Loop requires a session with a workspace cwd.' }
-    if (!isAbsolute(cwd)) return { kind: 'error', text: 'Leppy Loop refused the non-absolute session workspace cwd.' }
-    const input = invocation.rawInput.trim()
-    if (!input.startsWith('--')) {
-      const prompt = input === ''
-        ? AUTONOMOUS_PROMPT
-        : `${AUTONOMOUS_PROMPT}\n\nThe human added this natural-language instruction to the slash command:\n${JSON.stringify(input)}`
-      invocation.agent.followup(createUserMessage({
-        content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: name },
-      }))
-      return { kind: 'success', text: 'Leppy Loop delegated to the AI. It will inspect the workspace and start the controller, or ask one question if the target is ambiguous.' }
-    }
-    const options = workspaceOptions(parseLeppyLoopCommandInput(invocation.rawInput), cwd)
-    const dependencies = hooks.dependencies?.(ctx, signal) ?? {
-      ...harnessRunDependencies(ctx, signal),
-      onProgress: createChatProgressReporter(invocation.agent),
-    }
-    const result = await (hooks.run ?? runLeppyLoop)(options, dependencies)
-    const text = resultText(result)
-    return result.status === 'completed' || result.status === 'dry-run'
-      ? { kind: 'success', text }
-      : { kind: 'error', text }
+    const jobId = startControllerJob(ctx, runtime, agent, options, repoRoot, runId)
+    return { operation: args.operation, status: 'running', runId, jobId: String(jobId) }
   } catch (error) {
-    if (signal.aborted) throw abortError(signal)
-    const message = error instanceof Error ? error.message : String(error)
-    return { kind: 'error', text: `Leppy Loop could not start: ${message}` }
+    runtime.grants.restore(grant)
+    throw error
   }
 }
 
-/** Register `/leppy-loop` in every interactive command adapter in this profile. */
-export function apply(ctx: Context): void {
-  const lifetime = new AbortController()
-  ctx.tools.register(defineTool({
-    name: 'leppy_loop_start',
-    description: 'Start Leppy Loop after resolving the intended tracked checklist and authoritative Git base. Use this instead of launching dsh or emulating the controller.',
+function normalizeIntent(raw: string): string {
+  return raw.normalize('NFD').replace(/[\u0300-\u036f]/gu, '').trim().toLowerCase().replace(/\s+/gu, ' ')
+}
+
+function parseHumanIntent(raw: string): { operation: LeppyOperation | 'status'; recovery: RecoveryAuthority; publishRemote: boolean } {
+  const input = normalizeIntent(raw)
+  if (input.startsWith('--')) throw new Error('technical flags are private; use only /leppy-loop, continuar, parar, status, or explicit publication intent')
+  if (input === '' || ['start', 'iniciar', 'comecar'].includes(input)) return { operation: 'start', recovery: 'none', publishRemote: false }
+  if (['status', 'estado'].includes(input)) return { operation: 'status', recovery: 'none', publishRemote: false }
+  if (['parar', 'pare', 'stop', 'cancelar', 'cancele'].includes(input)) return { operation: 'stop', recovery: 'none', publishRemote: false }
+  if (['reparar gate', 'repare gate', 'corrigir gate', 'consertar gate', 'repair gate'].includes(input)) return { operation: 'continue', recovery: 'repair-gate', publishRemote: false }
+  if (['retry gate', 'repetir gate', 'tentar gate novamente', 'tentar novamente'].includes(input)) return { operation: 'continue', recovery: 'retry-gate', publishRemote: false }
+  if (['continuar', 'continue', 'retomar', 'retome', 'resume'].includes(input)) return { operation: 'continue', recovery: 'resume', publishRemote: false }
+  if (['continuar e publicar quando tudo passar', 'continue and publish when everything passes'].includes(input)) {
+    return { operation: 'continue', recovery: 'resume', publishRemote: true }
+  }
+  if (['iniciar e publicar quando tudo passar', 'start and publish when everything passes'].includes(input)) {
+    return { operation: 'start', recovery: 'none', publishRemote: true }
+  }
+  throw new Error('unrecognized Leppy intent; use start, continuar, parar, status, reparar gate, or explicit publish-when-passing intent')
+}
+
+function continuePrompt(controller: AuthenticatedController, recovery: RecoveryAuthority, publishRemote: boolean): string {
+  return `The human directly authorized one bounded Leppy controller continuation${publishRemote ? ' and remote publication only after every row and gate passes' : ' with local-only completion'}.
+
+The Host authenticated and selected these exact controller facts:
+- operation: continue
+- recovery: ${recovery}
+- runId: ${controller.runId}
+- checklist: ${controller.checklistRelative}
+- authoritative base: ${controller.syncBranch}
+- status: ${controller.status}
+- completedTasks: ${controller.completedTasks}
+- currentTask: ${controller.openTask?.index ?? controller.currentTask ?? 'unknown'}
+- attempt: ${controller.attempt}
+- open row: ${controller.openTask?.text ?? 'unknown'}
+
+Call leppy_loop_control exactly once with those technical facts. The tool validates and consumes the session/repository/run-bound one-shot human capability, then returns a background job immediately. Do not wait or poll, do not use shell or subagents to bypass a stall, and never edit the source checkout or preserved worktree.`
+}
+
+function toolDefinition(ctx: Context, runtime: LeppyLoopRuntime) {
+  return defineTool({
+    name: 'leppy_loop_control',
+    description: 'Private controller interface enabled by a direct human /leppy-loop intent. Resolve technical controller facts, then start, continue, inspect, or stop only through the matching one-shot capability.',
     parameters: {
-      tasks: { type: 'string', description: 'Checklist path relative to the session workspace.', required: true },
-      syncBranch: { type: 'string', description: 'Authoritative Git base ref, usually the current upstream.', required: true },
-      phaseGateCommand: { type: 'string', description: 'Opaque phase gate command only when the checklist requires one without inline gate metadata.' },
-      taskMatch: { type: 'string', description: 'Optional literal selector for one open checklist row.' },
-      recoverExistingWip: { type: 'boolean', description: 'Resume an authenticated matching run.' },
-      recoverRunId: { type: 'string', description: 'Select an exact authenticated run, including a completed selective run that still has open checklist rows.' },
-      dryRun: { type: 'boolean', description: 'Validate and preview without starting a worker.' },
-      fetch: { type: 'boolean', description: 'Fetch once before resolving the base; defaults to true.' },
-      workerPolicy: { type: 'string', enum: WORKER_POLICIES, description: 'Worker cost policy; defaults to adaptive (Terra high for normal tasks, Sol low for closures and recovered attempts).' },
+      operation: { type: 'string', enum: ['start', 'continue', 'status', 'stop'], required: true },
+      tasks: { type: 'string', description: 'Resolved tracked checklist path for start/continue.' },
+      syncBranch: { type: 'string', description: 'Resolved authoritative Git base for start/continue.' },
+      runId: { type: 'string', description: 'Exact authenticated run for continue/status/stop.' },
+      taskMatch: { type: 'string', description: 'Optional literal row selector for a new run.' },
+      recovery: { type: 'string', enum: ['resume', 'retry-gate', 'repair-gate'], description: 'Exact recovery operation authorized by the human capability.' },
+      fetch: { type: 'boolean', description: 'Fetch once before a new run; defaults true.' },
+      workerPolicy: { type: 'string', enum: WORKER_POLICIES },
     },
     output: {
       schema: {
-        type: 'object',
-        additionalProperties: false,
+        type: 'object', additionalProperties: false,
         properties: {
-          status: { type: 'string', required: true },
-          runId: { type: 'string', required: true },
-          completedTasks: { type: 'number', required: true },
-          branch: { type: 'string' },
-          worktree: { type: 'string' },
-          stateDir: { type: 'string' },
-          currentTask: { type: 'number' },
-          pullRequestUrl: { type: 'string' },
-          diagnostics: {
-            type: 'array', required: true,
-            items: {
-              type: 'object', additionalProperties: false,
-              properties: {
-                severity: { type: 'string', required: true },
-                code: { type: 'string', required: true },
-                message: { type: 'string', required: true },
-                line: { type: 'number' },
-              },
-            },
-          },
+          operation: { type: 'string', required: true }, status: { type: 'string', required: true },
+          runId: { type: 'string' }, jobId: { type: 'string' }, completedTasks: { type: 'number' },
+          currentTask: { type: 'number' }, attempt: { type: 'number' }, task: { type: 'string' }, branch: { type: 'string' },
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(args, exec) {
-      if (!exec.agent) throw new Error('leppy_loop_start requires an agent-backed session')
-      const signal = AbortSignal.any([exec.signal, lifetime.signal])
-      return await executeLeppyLoopTool(ctx, exec.agent, args, signal)
+      if (!exec.agent) throw new Error('leppy_loop_control requires an agent-backed session')
+      return await executeLeppyLoopControl(ctx, runtime, exec.agent, args)
     },
-  }))
+  })
+}
+
+function ensureScopedTool(ctx: Context, runtime: LeppyLoopRuntime, agent: Agent): void {
+  if (runtime.registeredAgents.has(agent)) return
+  agent.ctx.tools.register(toolDefinition(ctx, runtime))
+  runtime.registeredAgents.add(agent)
+}
+
+/** Execute the simple human command; long-running work always transfers to ctx.jobs. */
+export async function executeLeppyLoopCommand(
+  ctx: Context,
+  invocation: CommandInvocation,
+  runtime: LeppyLoopRuntime,
+): Promise<CommandResult> {
+  try {
+    if (invocation.signal.aborted) throw abortError(invocation.signal)
+    const cwd = requireWorkspace(invocation.agent)
+    const repoRoot = resolve(await resolveRepoRoot(cwd, invocation.signal))
+    const intent = parseHumanIntent(invocation.rawInput)
+    if (intent.operation === 'status') {
+      const value = await executeLeppyLoopControl(ctx, runtime, invocation.agent, { operation: 'status' })
+      return { kind: 'success', text: value.status === 'not-found'
+        ? 'No authenticated Leppy controller with open work was found in this repository.'
+        : `Leppy Loop ${value.status}. run=${value.runId} | completed=${value.completedTasks} | currentTask=${value.currentTask} | attempt=${value.attempt} | task=${value.task}` }
+    }
+
+    if (intent.operation === 'start') {
+      runtime.grants.issue({
+        agent: invocation.agent, repoRoot, operation: 'start', recovery: 'none', publishRemote: intent.publishRemote,
+        maxIterations: GRANT_MAX_ITERATIONS, maxRepairCycles: GRANT_MAX_REPAIR_CYCLES,
+      })
+      ensureScopedTool(ctx, runtime, invocation.agent)
+      invocation.agent.followup(createUserMessage({
+        content: [{ type: 'text', text: START_PROMPT }],
+        source: { kind: 'plugin', plugin: name },
+      }))
+      return { kind: 'success', text: 'Leppy Loop intent accepted. The AI will resolve the controller and hand it to a background job.' }
+    }
+
+    if (intent.operation === 'stop') {
+      const record = liveJobRecord(ctx, runtime, invocation.agent, repoRoot)
+      if (!record) return { kind: 'error', text: 'No active Leppy background controller was found in this session and repository.' }
+      runtime.grants.issue({
+        agent: invocation.agent, repoRoot, runId: record.runId, operation: 'stop', recovery: 'none',
+        publishRemote: false, maxIterations: 1, maxRepairCycles: 1,
+      })
+      ensureScopedTool(ctx, runtime, invocation.agent)
+      const value = await executeLeppyLoopControl(ctx, runtime, invocation.agent, { operation: 'stop', runId: record.runId })
+      return { kind: 'success', text: `Leppy Loop stop requested. run=${record.runId} | job=${value.jobId} | status=${value.status}` }
+    }
+
+    const controllers = await (runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers)(cwd)
+    const selected = selectControllerForHumanIntent(controllers)
+    if (!selected) return { kind: 'error', text: 'No authenticated Leppy controller with open work was found in this repository.' }
+    runtime.grants.issue({
+      agent: invocation.agent, repoRoot, runId: selected.runId, controllerDigest: selected.authorityDigest,
+      operation: 'continue', recovery: intent.recovery,
+      publishRemote: intent.publishRemote, maxIterations: GRANT_MAX_ITERATIONS, maxRepairCycles: GRANT_MAX_REPAIR_CYCLES,
+    })
+    ensureScopedTool(ctx, runtime, invocation.agent)
+
+    invocation.agent.followup(createUserMessage({
+      content: [{ type: 'text', text: continuePrompt(selected, intent.recovery, intent.publishRemote) }],
+      source: { kind: 'plugin', plugin: name },
+    }))
+    return { kind: 'success', text: `Leppy Loop continuation authorized for run ${selected.runId}. The AI will start the controller as a background job.` }
+  } catch (error) {
+    if (invocation.signal.aborted) throw abortError(invocation.signal)
+    return { kind: 'error', text: `Leppy Loop could not accept the intent: ${error instanceof Error ? error.message : String(error)}` }
+  }
+}
+
+/** Register the simple slash surface; the scoped private tool appears only after direct human intent. */
+export function apply(ctx: Context): void {
+  const runtime: LeppyLoopRuntime = {
+    grants: new HumanGrantStore(), jobs: [], registeredAgents: new WeakSet(), lifetime: new AbortController(), hooks: {},
+  }
   ctx.commands.register({
     name: 'leppy-loop',
-    description: 'let the AI resolve and run a tracked checklist',
-    input: { hint: '[--tasks <path> --sync-branch <ref> [options]]' },
-    handler: invocation => executeLeppyLoopCommand(ctx, invocation, lifetime.signal),
+    description: 'start, continue, stop, or inspect a Leppy controller',
+    input: { hint: '[continuar|parar|status|continuar e publicar quando tudo passar]' },
+    handler: invocation => executeLeppyLoopCommand(ctx, invocation, runtime),
   })
   ctx.effect(() => () => {
-    lifetime.abort(new Error('Leppy Loop plugin disposed'))
+    runtime.lifetime.abort(new Error('Leppy Loop plugin disposed'))
   }, 'leppy-loop-command lifetime')
 }

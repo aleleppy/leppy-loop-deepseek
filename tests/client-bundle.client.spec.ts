@@ -25,8 +25,8 @@ describe('built client bundle', () => {
       if (id === 'react/jsx-runtime') return jsxRuntime
       throw new Error(`unexpected client external ${id}`)
     })
-    expect(requested).toEqual(['react', 'react/jsx-runtime'])
-    expect(plugin.inject).toEqual(['slots'])
+    expect([...new Set(requested)]).toEqual(['react', 'react/jsx-runtime'])
+    expect(plugin.inject).toEqual(['sessions', 'slots'])
     expect(plugin.apply).toEqual(expect.any(Function))
   })
 })

@@ -4,50 +4,42 @@
 
 Leppy Loop is a native external Cordis bundle that executes a tracked Markdown checklist with a fresh DeepSeek Harness process and session for each worker line. The controller owns Git synchronization, the worktree, checklist transitions, closure, gates, durable recovery state, and process leases. Workers receive only the current line, its `Done:` contract, allowed paths, applicable repository instructions, and explicit prohibitions.
 
-Version `0.2.24` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). It registers a Host-side `/leppy-loop` command and a model-facing controller tool that the existing Web composer and agent discover without a client patch.
+Version `0.3.0` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). It registers a simple Host-side `/leppy-loop` command, a grant-validated agent-scoped controller tool, and browser cards without patching Harness.
 
 ## Install
 
-Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.2.24`. Configure the credential for the model provider selected in the Harness Models page, then build and install the tarball into the profile used by the Web host. Workers reuse that provider, model profile, and credential automatically; `DEEPSEEK_API_KEY` is not required when another provider is selected:
+Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.3.0`. Configure the credential for the model provider selected in the Harness Models page, then build and install the tarball into the profile used by the Web host. Workers reuse that provider, model profile, and credential automatically; `DEEPSEEK_API_KEY` is not required when another provider is selected:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm build
 pnpm pack
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.2.24.tgz
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.3.0.tgz
 ```
 
 Restart the existing `dsh web` process after changing its profile. A browser refresh cannot compose a newly installed Host plugin. A published GitHub Release tarball may replace the local `.tgz` path; there is no claim of publication in a plugin registry.
 
 ## Quickstart
 
-Create a tracked checklist such as [`examples/feature.task.md`](examples/feature.task.md), commit it, start a Web session whose workspace is that clean checkout, and invoke the command without arguments:
+Create and commit a tracked checklist such as [`examples/feature.task.md`](examples/feature.task.md), then use only human intent — never paths, refs, run IDs, fingerprints, scopes, cycles, or repair flags:
 
 ```text
 /leppy-loop
+/leppy-loop continue
+/leppy-loop stop
+/leppy-loop status
+/leppy-loop continue and publish when everything passes
 ```
 
-The command queues an AI turn that inspects the conversation and repository, resolves the intended tracked checklist and authoritative Git base, and calls the private `leppy_loop_start` tool. If the target is genuinely ambiguous, the AI asks one concise question instead of guessing. Natural language after the command is forwarded as intent instead of parsed as CLI arguments, for example `/leppy-loop continue the checklist from this conversation`.
+The slash command returns after accepting the intent. Start/continue queues one short AI resolver turn; the Host then validates and consumes a one-shot capability and transfers the controller into `ctx.jobs`, so the controller does not hold the slash RPC or composer. The agent-scoped `leppy_loop_control` tool receives the technical checklist/base/run facts, but it cannot invent human authority: capabilities are bound to the exact live session, canonical repository, authenticated run, operation, expiry, iteration bound, repair-cycle bound, and explicit publication intent. Replay and cross-session/repository/run use are denied.
 
-The deterministic explicit form remains available only when the input starts with an option such as `--tasks`:
+`continue` selects the most recently updated HMAC-authenticated controller with open work, verifies its preserved branch/worktree, and resumes its exact run. `retry gate` and `repair gate` are separate simple intents and consume matching direct-human authority; unchanged gate fingerprint, clean-worktree, closure, scope, receipt, and bounded-cycle checks remain enforced by the controller. Completion remains local unless the human explicitly says to publish. Workers still cannot push or invoke `gh`.
 
-```text
-/leppy-loop --tasks ./tasks/feature.task.md --sync-branch origin/main --phase-gate-command "pnpm test"
-```
+The default `adaptive` worker policy uses `gpt-5.6-terra` at `high` for ordinary OpenAI Codex tasks, then `gpt-5.6-sol` at `low` for closures and recovery of a stalled task. Terminal SDK notifications for overload, temporary unavailability, rate limits and HTTP 502/503 remain availability failures even when the SDK resolves with an empty final response: they receive the availability fallback once and otherwise stall with a recovery receipt. They never enter zero-commit verification. A genuinely clean ordinary-task completion with zero commits is retried once automatically under the recovery policy. If that independent retry proves the `Done:` contract is already satisfied through the exact terminal evidence marker and leaves a clean unchanged branch, the controller closes only the checklist; dirty WIP, missing evidence, and an unverified repeated zero-commit result still fail closed. Inline `model=`/`effort=` metadata and CLI-only `--model`/`--effort` options take priority. Use `--worker-policy selected`, `terra-high`, or `sol-low` to choose another global behavior. The default transcript cap is 8192 KiB and remains configurable with `--worker-transcript-limit-kb`. Resume receipts include `--recover-run <id>` so recovery remains deterministic even when older failed runs still exist. Exact authenticated recovery resolves and lints the controller from the preserved run worktree, so a receiving source checkout may have switched branches, removed that checklist, or contain unrelated dirty changes; fresh runs still require a clean source checkout with a tracked checklist. A failed gate requires a new direct human `retry gate` or `repair gate` intent; the scoped tool reconstructs the exact authenticated run and the controller retries only the unchanged fingerprint. Repair refuses a dirty worktree, creates a controller reopen commit, and is accepted by the scoped tool only when its matching direct-human capability exists. When a failed gate proves the original closure omitted required generated artifacts or dependencies, a direct human may add existing worktree scopes with `--repair-path <path...>`; these additions are validated, persisted, receipted, and granted only to that reopened repair worker. Worker root commands may omit `cwd` or use `cwd="."`, while changed-file commit validation remains limited to the effective scope. A direct repair invocation chains up to three fresh closure/gate cycles by default, passing each newly failed receipt to the next worker; `--repair-cycles <1..8>` changes this hard bound. It stops immediately on success, worker failure, dirty state, changed fingerprint, cancellation, or exhaustion rather than looping indefinitely. The autonomous resolver must report a stalled/failed result and stop; it may never edit the preserved worktree, delegate a repair, publish, or integrate around the controller. Supplying an exact run ID may also continue a completed selective run on the next open checklist row in its preserved branch/worktree; completed runs are never chosen implicitly.
 
-Relative checklist and artifact paths resolve from the receiving session's workspace. Explicit arguments use a non-evaluating quoted argv grammar; the gate remains one explicitly quoted opaque argument.
+While a Web run is active, every selected row creates one durable progress card. `Running`, attempt, and elapsed time use separate non-shrinking elements while only the long task label elides; terminal output settles the same card. A recovered interrupted row starts a new attempt card. The controller itself appears as a background card with status, elapsed time, and a Stop button. Browser timers write no per-second events or model tokens.
 
-The default `adaptive` worker policy uses `gpt-5.6-terra` at `high` for ordinary OpenAI Codex tasks, then `gpt-5.6-sol` at `low` for closures and recovery of a stalled task. Terminal SDK notifications for overload, temporary unavailability, rate limits and HTTP 502/503 remain availability failures even when the SDK resolves with an empty final response: they receive the availability fallback once and otherwise stall with a recovery receipt. They never enter zero-commit verification. A genuinely clean ordinary-task completion with zero commits is retried once automatically under the recovery policy. If that independent retry proves the `Done:` contract is already satisfied through the exact terminal evidence marker and leaves a clean unchanged branch, the controller closes only the checklist; dirty WIP, missing evidence, and an unverified repeated zero-commit result still fail closed. Inline `model=`/`effort=` metadata and explicit `--model`/`--effort` options take priority. Use `--worker-policy selected`, `terra-high`, or `sol-low` to choose another global behavior. The default transcript cap is 8192 KiB and remains configurable with `--worker-transcript-limit-kb`. Resume receipts include `--recover-run <id>` so recovery remains deterministic even when older failed runs still exist. Exact authenticated recovery resolves and lints the controller from the preserved run worktree, so a receiving source checkout may have switched branches, removed that checklist, or contain unrelated dirty changes; fresh runs still require a clean source checkout with a tracked checklist. A failed gate additionally requires a new direct human slash/CLI invocation with the exact authenticated run ID. Use `--retry-gate` for a transient failure, or `--repair-gate` to reopen the preceding completed closure, pass the bounded gate receipt to a fresh scoped worker, and retry the unchanged fingerprint after its correction. Repair refuses a dirty worktree, creates a controller reopen commit, and remains absent from the model-facing tool. When a failed gate proves the original closure omitted required generated artifacts or dependencies, a direct human may add existing worktree scopes with `--repair-path <path...>`; these additions are validated, persisted, receipted, and granted only to that reopened repair worker. Worker root commands may omit `cwd` or use `cwd="."`, while changed-file commit validation remains limited to the effective scope. A direct repair invocation chains up to three fresh closure/gate cycles by default, passing each newly failed receipt to the next worker; `--repair-cycles <1..8>` changes this hard bound. It stops immediately on success, worker failure, dirty state, changed fingerprint, cancellation, or exhaustion rather than looping indefinitely. The autonomous resolver must report a stalled/failed result and stop; it may never edit the preserved worktree, delegate a repair, publish, or integrate around the controller. Supplying an exact run ID may also continue a completed selective run on the next open checklist row in its preserved branch/worktree; completed runs are never chosen implicitly.
-
-While a Web run is active, every selected row creates a durable progress card in chat at start. Its plugin-owned browser renderer updates that task attempt's elapsed wall-clock time locally once per second, then the same card settles with the completed/total count and final task duration on success, stall, or failure (for example, `Task completed — 14/57 — 3m 12s elapsed.`). A recovered interrupted row starts a new attempt card and timer; an internal no-commit verification remains inside the original card and duration. Only the start and terminal command-lifecycle records are durable and both remain excluded from model context, so the live timer writes no per-second events, consumes no tokens, and does not split tool-call/result pairing.
-
-Web runs complete locally by default after every checklist row and gate succeeds. Only a direct, human-authored `--open-pr` slash command can make the controller fetch and rebase onto the remote base, push its exact Leppy branch, create or find the GitHub pull request with `gh`, store the URL, and return it to the chat. The autonomous model tool cannot enable publication, and workers cannot push or use `gh`. Install and authenticate GitHub CLI first (`gh auth status`) before opting in.
-
-Preview exactly one selected line without starting a worker or reading a credential:
-
-```text
-/leppy-loop --tasks ./tasks/feature.task.md --sync-branch origin/main --dry-run
-```
+Web runs complete locally by default. Only explicit human publication language such as `/leppy-loop continue and publish when everything passes` adds remote publication to that one-shot capability. The model cannot add or replay publication authority, and workers cannot push or use `gh`. Install and authenticate GitHub CLI first (`gh auth status`) before opting in.
 
 ## Checklist contract
 
@@ -75,7 +67,9 @@ A tracked root `.leppy-loop.json` may contain a string `customInstructions`; it 
 
 Paths are resolved through filesystem identity. Traversal, absolute paths, and symlinks/junctions escaping the worktree are rejected. The controlling checklist is always denied to workers.
 
-## Options
+## CLI startup options
+
+These technical arguments are for the separately exported CLI startup composition, not the human Web slash interface.
 
 | Option | Default |
 |---|---:|

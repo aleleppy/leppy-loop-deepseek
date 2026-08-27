@@ -4,16 +4,14 @@ import { apply, inject } from '../src/client/index.js'
 import { LeppyLoopTaskCard } from '../src/client/LeppyLoopTaskCard.js'
 
 describe('Leppy browser plugin', () => {
-  it('registers the keyed command row owned by ui-conversation', () => {
-    let registration: { name: string; key: string; component: unknown } | undefined
+  it('registers the keyed task row and dedicated background controller action', () => {
+    const registrations: Array<{ name: string; key?: string; id?: string; order?: number; component: unknown }> = []
     const ctx = {
+      sessions: {},
       slots: {
-        inject: (name: string, setup: () => unknown) => {
-          expect(name).toBe('conversation.chat.commandview')
-          setup()
-        },
-        register: (entry: { name: string; key: string }, component: unknown) => {
-          registration = { ...entry, component }
+        inject: (_name: string, setup: () => unknown) => { setup() },
+        register: (entry: { name: string; key?: string; id?: string; order?: number }, component: unknown) => {
+          registrations.push({ ...entry, component })
           return () => {}
         },
       },
@@ -21,11 +19,13 @@ describe('Leppy browser plugin', () => {
 
     apply(ctx)
 
-    expect(inject).toEqual(['slots'])
-    expect(registration).toEqual({
-      name: 'conversation.chat.commandview',
-      key: 'leppy-loop-task',
-      component: LeppyLoopTaskCard,
+    expect(inject).toEqual(['sessions', 'slots'])
+    expect(registrations[0]).toEqual({
+      name: 'conversation.chat.commandview', key: 'leppy-loop-task', component: LeppyLoopTaskCard,
     })
+    expect(registrations[1]).toMatchObject({
+      name: 'conversation.session.header.actions', id: 'leppy-loop-controller', order: 19,
+    })
+    expect(registrations[1]?.component).toEqual(expect.any(Function))
   })
 })

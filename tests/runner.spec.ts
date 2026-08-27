@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -92,13 +92,13 @@ describe('controller state machine', () => {
     const repo = repository(`## Phase
 - [ ] Change \`src/value.txt\` | Done: value says done
 - [?] Closure: inspect src | paths=src
-- [~] Gate: node version
+- [~] Gate: node version | gate=\`node --version\`
 `)
     const worker = new FakeWorker()
     const progress: RunProgress[] = []
     let now = Date.parse('2026-08-26T12:00:00.000Z')
     const result = await runLeppyLoop(
-      { tasks: repo.tasks, syncBranch: 'main', fetch: false, phaseGateCommand: 'node --version' },
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
       {
         ...modelDeps,
         worker,
@@ -112,6 +112,7 @@ describe('controller state machine', () => {
     expect(result.status).toBe('completed')
     expect(worker.calls).toHaveLength(2)
     expect(worker.calls.every(call => call.provider === 'fake')).toBe(true)
+    expect(worker.calls.every(call => call.gateFingerprint?.length === 64)).toBe(true)
     expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8').match(/\[x\]/g)).toHaveLength(3)
     expect(git(result.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('3')
     const eventTypes = readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line).type)
@@ -531,6 +532,38 @@ describe('controller state machine', () => {
     expect(result.currentTask).toBe(1)
     expect(result.preview).toMatchObject({ selectedLine: expect.stringContaining('Beta') })
     expect(worker.calls).toHaveLength(0)
+  }, 90_000)
+
+  it('stops an active worker, preserves its dirty WIP, and leaves the controller row open', async () => {
+    const repo = repository('- [ ] Alpha `src/value.txt` | Done: alpha\n')
+    const control = new AbortController()
+    let started!: () => void
+    const workerStarted = new Promise<void>(resolveStarted => { started = resolveStarted })
+    const worker: WorkerAdapter = {
+      run: async (request, signal) => {
+        writeFileSync(join(request.worktree, 'src', 'value.txt'), 'preserved worker WIP\n')
+        started()
+        return await new Promise<WorkerOutcome>(resolveOutcome => {
+          signal.addEventListener('abort', () => resolveOutcome({ status: 'interrupted', output: '', error: 'human stop' }), { once: true })
+        })
+      },
+    }
+    const running = runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, worker, signal: control.signal },
+    )
+    await workerStarted
+    control.abort(new Error('human stop'))
+    await expect(running).rejects.toThrow('human stop')
+
+    const worktrees = git(repo.root, 'worktree', 'list', '--porcelain').split('\n').filter(line => line.startsWith('worktree '))
+    const worktree = worktrees.at(-1)!.slice('worktree '.length)
+    expect(readFileSync(join(worktree, 'src', 'value.txt'), 'utf8')).toBe('preserved worker WIP\n')
+    expect(readFileSync(join(worktree, 'tasks.task.md'), 'utf8')).toContain('- [ ] Alpha')
+    expect(git(worktree, 'status', '--short')).toContain('src/value.txt')
+    const stateRoot = join(repo.root, '.git', 'leppy-loop', 'runs')
+    const stateDir = join(stateRoot, readdirSync(stateRoot)[0]!)
+    expect(JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8')).status).toBe('interrupted')
   }, 90_000)
 
   it('honors a pre-aborted command signal before repository mutation', async () => {

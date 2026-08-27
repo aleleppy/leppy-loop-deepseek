@@ -55,6 +55,12 @@ interface RunState {
 }
 
 function digest(text: string): string { return createHash('sha256').update(text).digest('hex') }
+function workerGateFingerprint(parsed: ReturnType<typeof parseChecklist>, task: ChecklistTask, fallback?: string): string | undefined {
+  const gate = parsed.tasks.find(candidate => candidate.kind === 'gate' && candidate.mark !== 'x' && candidate.phase === task.phase)
+  const command = gate?.metadata.gate ?? fallback
+  if (!command) return undefined
+  return fingerprint([process.platform === 'win32' ? 'cmd.exe' : '/bin/sh', command].join('\0'))
+}
 function safeSlug(value: string): string { return value.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'default' }
 function commandArgument(value: string): string { return `"${value.replaceAll('"', '\\"')}"` }
 function inside(root: string, path: string): boolean { const rel = relative(root, path); return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel)) }
@@ -540,13 +546,14 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           'For repository-root commands, omit cwd in leppy_exec (cwd "." is also normalized to the root). Use the repository generation command when a gate reports stale generated artifacts.',
         ] : []),
       ]
+      const effectiveGateFingerprint = workerGateFingerprint(parsed, task, options.phaseGateCommand)
       const request: WorkerRequest = {
         runId: state.runId, task, attempt: state.attempt, worktree: state.worktree,
         checklistPath: checklistRelative, allowedPaths,
         model: model.model, provider: model.provider, ...(model.effort ? { effort: model.effort } : {}),
         timeoutMs: options.workerTimeoutMs, outputLimitBytes: options.workerOutputLimitBytes,
         transcriptLimitBytes: options.workerTranscriptLimitBytes, stateDir,
-        ...(options.phaseGateCommand ? { gateFingerprint: fingerprint([process.platform === 'win32' ? 'cmd.exe' : '/bin/sh', options.phaseGateCommand].join('\0')) } : {}),
+        ...(effectiveGateFingerprint ? { gateFingerprint: effectiveGateFingerprint } : {}),
         instructions,
       }
       appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: model.model, effort: model.effort ?? null, paths: allowedPaths }, task, state.attempt))
