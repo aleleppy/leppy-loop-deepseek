@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { commitTaskChanges, type WorkerPolicy } from '../src/worker-tool.js'
+import { commitTaskChanges, resolveExecCwd, type WorkerPolicy } from '../src/worker-tool.js'
 
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
@@ -31,6 +31,16 @@ function runner(root: string) {
 }
 
 describe('worker commit capability', () => {
+  it('normalizes an explicit dot cwd to the repository root without widening file scope', () => {
+    const root = repository()
+    const policy: WorkerPolicy = { root, checklist: join(root, 'tasks.task.md'), allowed: [join(root, 'prisma', 'schemas')] }
+    expect(resolveExecCwd(policy)).toBe(root)
+    expect(resolveExecCwd(policy, '.')).toBe(root)
+    expect(resolveExecCwd(policy, './')).toBe(root)
+    expect(resolveExecCwd(policy, 'prisma/schemas')).toBe(join(root, 'prisma', 'schemas'))
+    expect(() => resolveExecCwd(policy, 'prisma')).toThrow('outside this task scope')
+  })
+
   it('force-adds only changed ignored files inside the declared task scope', async () => {
     const root = repository()
     mkdirSync(join(root, 'prisma', 'migrations', '20260826_auth'), { recursive: true })

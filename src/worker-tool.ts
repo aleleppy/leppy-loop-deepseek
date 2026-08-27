@@ -60,6 +60,11 @@ function resolveAllowed(policy: WorkerPolicy, candidate: string, writing: boolea
   return canonical
 }
 
+export function resolveExecCwd(policy: WorkerPolicy, candidate?: string): string {
+  if (candidate === undefined || candidate === '.' || candidate === './' || candidate === '.\\') return policy.root
+  return resolveAllowed(policy, candidate, false)
+}
+
 function textOutput(value: unknown): [{ type: 'text'; text: string }] {
   return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }]
 }
@@ -147,14 +152,14 @@ export function apply(ctx: Context): void {
     parameters: {
       command: { type: 'string', required: true },
       args: { type: 'array', items: { type: 'string' }, required: true },
-      cwd: { type: 'string', description: 'Repo-relative working directory; defaults to repository root.' },
+      cwd: { type: 'string', description: 'Repo-relative working directory; omit it or use "." for repository root.' },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { exitCode: { type: 'number', required: true }, stdout: { type: 'string', required: true }, stderr: { type: 'string', required: true } } },
       render: (_args, value) => textOutput(value),
     },
     async execute(args, exec) {
-      const cwd = args.cwd ? resolveAllowed(policy, args.cwd, false) : policy.root
+      const cwd = resolveExecCwd(policy, args.cwd)
       validateArgv(args.command, args.args, cwd, policy.root, policy.gateFingerprint)
       const execution = ctx.sandboxPolicy.resolve(exec.agent?.session ? { session: exec.agent.session } : {})
       if (execution.mode !== 'workspace-write') throw new Error(`worker requires workspace-write, got ${execution.mode}`)

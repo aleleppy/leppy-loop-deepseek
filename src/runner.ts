@@ -32,6 +32,7 @@ interface GateRepairContext {
   gateIndex: number
   closureIndex: number
   instruction: string
+  additionalPaths?: string[]
 }
 
 interface RunState {
@@ -276,6 +277,7 @@ export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDep
 async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: RunDependencies, signal: AbortSignal): Promise<RunResult> {
   const options = { ...DEFAULTS, ...input }
   if ((options.retryGate || options.repairGate) && (!options.recoverExistingWip || !options.recoverRunId)) throw new Error('--retry-gate/--repair-gate require --recover-existing-wip and an exact --recover-run')
+  if ((options.repairPaths?.length ?? 0) > 0 && !options.repairGate) throw new Error('--repair-path requires --repair-gate')
   const clock = dependencies.now ?? (() => new Date())
   const runId = dependencies.runId?.() ?? randomUUID().replaceAll('-', '').slice(0, 12)
   const requestedTasks = resolve(options.tasks)
@@ -375,14 +377,21 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       const closure = parsed.tasks.filter(task => task.phase === gate.phase && task.index < gate.index && task.kind === 'closure').at(-1)
       if (!closure || closure.mark !== 'x') throw new Error('--repair-gate requires the preceding phase closure to be completed')
       if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('--repair-gate refuses a dirty worktree; discard unauthorized edits or recover the existing worker WIP first')
-      gateRepairContext = { schemaVersion: 1, gateIndex: gate.index, closureIndex: closure.index, instruction: latestGateFailureInstruction(stateDir, gate.index) }
+      const additionalPaths = [...new Set((options.repairPaths ?? []).map(candidate => {
+        if (candidate.includes('\0') || isAbsolute(candidate)) throw new Error('--repair-path must be repo-relative')
+        const absolute = resolve(state.worktree, candidate)
+        const scoped = existsSync(absolute) ? physicalRelative(state.worktree, absolute) : undefined
+        if (!scoped || scoped === checklistRelative) throw new Error(`--repair-path must name an existing path inside the preserved worktree: ${candidate}`)
+        return scoped
+      }))]
+      gateRepairContext = { schemaVersion: 1, gateIndex: gate.index, closureIndex: closure.index, instruction: latestGateFailureInstruction(stateDir, gate.index), additionalPaths }
       writeFileSync(join(state.worktree, checklistRelative), markTaskOpen(parsed, closure), 'utf8')
       await commitControllerChange(state.worktree, [checklistRelative], `chore(leppy-loop): reopen ${safeSlug(gate.phase)} repair closure`)
       state.completedTasks = Math.max(0, state.completedTasks - 1)
       state.currentTask = closure.index
       writeState(join(stateDir, 'run.json'), state)
       atomicWriteJson(gateRepairPath, gateRepairContext)
-      appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', { taskIndex: closure.index, gateRepair: true, gateIndex: gate.index }))
+      appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', { taskIndex: closure.index, gateRepair: true, gateIndex: gate.index, additionalPaths }))
     }
     for (let iteration = 0; iteration < options.maxIterations; iteration += 1) {
       if (signal.aborted) throw abortReason(signal)
@@ -451,7 +460,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         if (priorTaskGateKey && priorTaskGateKey !== key) throw new Error('recovered gate command fingerprint differs from its recorded attempt')
         const priorGateAttempts = state.gateAttempts[key] ?? 0
         const retryCommand = `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)} --retry-gate`
-        const repairCommand = `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)} --repair-gate`
+        const repairPathArguments = (gateRepairContext?.additionalPaths ?? []).map(path => ` ${commandArgument(path)}`).join('')
+        const repairCommand = `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)} --repair-gate${repairPathArguments ? ` --repair-path${repairPathArguments}` : ''}`
         if (retryGateAuthorized && priorGateAttempts === 0) throw new Error('--retry-gate requires a recorded failed attempt for the current gate fingerprint')
         if (priorGateAttempts > 0 && !retryGateAuthorized) {
           const reason = 'gate retry requires a direct human invocation with --retry-gate and the exact authenticated run ID'
@@ -490,25 +500,32 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         continue
       }
 
+      const allowedPaths = task.index === gateRepairContext?.closureIndex
+        ? [...new Set([...task.metadata.paths, ...(gateRepairContext.additionalPaths ?? [])])]
+        : task.metadata.paths
       const model = selectedModel(task, options, fallbackSelection, catalog, retryingRecoveredTask)
       validateModelSelection(catalog, model.model, model.effort)
       const controllerHash = digest(readFileSync(checklistPath, 'utf8'))
       const previousHead = await head(state.worktree)
       const instructions = [
         ...legacyCustomInstructions(state.worktree),
-        ...await discoverInstructions(state.worktree, task.metadata.paths),
-        ...(task.index === gateRepairContext?.closureIndex ? [gateRepairContext.instruction] : []),
+        ...await discoverInstructions(state.worktree, allowedPaths),
+        ...(task.index === gateRepairContext?.closureIndex ? [
+          gateRepairContext.instruction,
+          ...(gateRepairContext.additionalPaths?.length ? [`Direct human authorized these additional repair scopes: ${gateRepairContext.additionalPaths.join(', ')}`] : []),
+          'For repository-root commands, omit cwd in leppy_exec (cwd "." is also normalized to the root). Use the repository generation command when a gate reports stale generated artifacts.',
+        ] : []),
       ]
       const request: WorkerRequest = {
         runId: state.runId, task, attempt: state.attempt, worktree: state.worktree,
-        checklistPath: checklistRelative, allowedPaths: task.metadata.paths,
+        checklistPath: checklistRelative, allowedPaths,
         model: model.model, provider: model.provider, ...(model.effort ? { effort: model.effort } : {}),
         timeoutMs: options.workerTimeoutMs, outputLimitBytes: options.workerOutputLimitBytes,
         transcriptLimitBytes: options.workerTranscriptLimitBytes, stateDir,
         ...(options.phaseGateCommand ? { gateFingerprint: fingerprint([process.platform === 'win32' ? 'cmd.exe' : '/bin/sh', options.phaseGateCommand].join('\0')) } : {}),
         instructions,
       }
-      appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: model.model, effort: model.effort ?? null, paths: task.metadata.paths }, task, state.attempt))
+      appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: model.model, effort: model.effort ?? null, paths: allowedPaths }, task, state.attempt))
       if (signal.aborted) throw abortReason(signal)
       let outcome = await dependencies.worker.run(request, signal)
       let outcomeAttempt = state.attempt

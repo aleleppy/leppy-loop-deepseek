@@ -2,6 +2,17 @@
 
 All notable changes are documented here.
 
+## [0.2.23] - 2026-08-27
+
+### Added
+
+- Direct exact-run gate repair accepts one or more `--repair-path` values to authorize narrowly scoped generated artifacts or dependencies missing from the original closure contract. The additional paths must already exist inside the preserved worktree, are recorded in repair state/events and worker instructions, and remain absent from the model-facing tool.
+
+### Fixed
+
+- Worker `leppy_exec` now treats an explicit `cwd` of `.` like its documented omitted-root default, allowing required repository-root validation and generation commands without widening file commit scope.
+- Subsequent failed-gate resume receipts preserve the controller-authorized additional repair paths.
+
 ## [0.2.22] - 2026-08-27
 
 ### Fixed
