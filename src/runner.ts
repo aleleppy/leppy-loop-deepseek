@@ -242,6 +242,7 @@ export async function runLeppyLoop(input: LeppyLoopOptions, dependencies: RunDep
 
 async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: RunDependencies, signal: AbortSignal): Promise<RunResult> {
   const options = { ...DEFAULTS, ...input }
+  if (options.retryGate && (!options.recoverExistingWip || !options.recoverRunId)) throw new Error('--retry-gate requires --recover-existing-wip and an exact --recover-run')
   const clock = dependencies.now ?? (() => new Date())
   const runId = dependencies.runId?.() ?? randomUUID().replaceAll('-', '').slice(0, 12)
   const tasksAbsolute = realpathSync(resolve(options.tasks))
@@ -310,6 +311,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
 
   const eventsPath = join(stateDir, 'events.jsonl')
   let activeProgress: { task: ChecklistTask; totalTasks: number; attempt: number; startedAtMs: number } | undefined
+  let retryGateAuthorized = options.retryGate
   const settleProgress = async (type: 'task-done' | 'task-failed', error?: string): Promise<void> => {
     const active = activeProgress
     if (!active) return
@@ -357,6 +359,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         appendEvent(eventsPath, event(state.runId, 'run-end', 'complete', { status: 'completed', completedTasks: state.completedTasks, pullRequestUrl: state.pullRequestUrl ?? null }))
         return { runId: state.runId, status: 'completed', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, diagnostics, ...(state.pullRequestUrl ? { pullRequestUrl: state.pullRequestUrl } : {}) }
       }
+      if (retryGateAuthorized && task.kind !== 'gate') throw new Error('--retry-gate can only authorize the currently recovered failed gate')
       const retryingRecoveredTask = Boolean(recovered && state.currentTask === task.index)
       const literalMatch = options.taskMatch
       const remainingTasks = parsed.tasks.filter(candidate =>
@@ -380,16 +383,23 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       if (task.kind === 'gate') {
         const command = task.metadata.gate ?? options.phaseGateCommand!
         const key = `${task.index}:${fingerprint(command)}`
-        if ((state.gateAttempts[key] ?? 0) > 0) {
-          const reason = 'gate requires an explicit new invocation after any prior attempt'
+        const priorTaskGateKey = Object.keys(state.gateAttempts).find(candidate => candidate.startsWith(`${task.index}:`) && (state.gateAttempts[candidate] ?? 0) > 0)
+        if (priorTaskGateKey && priorTaskGateKey !== key) throw new Error('recovered gate command fingerprint differs from its recorded attempt')
+        const priorGateAttempts = state.gateAttempts[key] ?? 0
+        const retryCommand = `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)} --retry-gate`
+        if (retryGateAuthorized && priorGateAttempts === 0) throw new Error('--retry-gate requires a recorded failed attempt for the current gate fingerprint')
+        if (priorGateAttempts > 0 && !retryGateAuthorized) {
+          const reason = 'gate retry requires a direct human invocation with --retry-gate and the exact authenticated run ID'
           appendEvent(eventsPath, event(state.runId, 'stall', 'gate', { reason }, task, state.attempt))
           state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
+          atomicWriteJson(join(stateDir, 'resume.json'), { runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: 'gate-retry-authorization-required', worktree: state.worktree, command: retryCommand })
           await settleProgress('task-failed', reason)
           return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
         }
-        state.gateAttempts[key] = 1
+        state.gateAttempts[key] = priorGateAttempts + 1
+        retryGateAuthorized = false
         writeState(join(stateDir, 'run.json'), state)
-        appendEvent(eventsPath, event(state.runId, 'gate-start', 'gate', { commandFingerprint: fingerprint(command) }, task, state.attempt))
+        appendEvent(eventsPath, event(state.runId, 'gate-start', 'gate', { commandFingerprint: fingerprint(command), ...(priorGateAttempts > 0 ? { retry: true } : {}) }, task, state.attempt))
         const gate = await runOpaqueShell(command, state.worktree, signal, scrubEnvironment(process.env))
         if (signal.aborted) throw abortReason(signal)
         const receipt = { schemaVersion: 1, runId: state.runId, taskIndex: task.index, attempt: state.attempt, commandFingerprint: fingerprint(command), exitCode: gate.exitCode, stdout: redact(gate.stdout), stderr: redact(gate.stderr), timestamp: new Date().toISOString() }
@@ -398,6 +408,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         if (gate.exitCode !== 0) {
           appendEvent(eventsPath, event(state.runId, 'gate-failed', 'gate', { exitCode: gate.exitCode }, task, state.attempt))
           state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
+          atomicWriteJson(join(stateDir, 'resume.json'), { runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: 'gate-failed', worktree: state.worktree, command: retryCommand })
           await settleProgress('task-failed', `gate exited with code ${gate.exitCode}`)
           return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
         }

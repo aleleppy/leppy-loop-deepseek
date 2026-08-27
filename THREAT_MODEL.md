@@ -18,7 +18,7 @@
 - The selected provider credential is resolved by Harness or its isolated credential store and remains inside the model runtime; model-facing tools never expose it, and their subprocess environments are scrubbed.
 - Recursive redaction of sensitive names, known values, headers, and URL userinfo.
 - Atomic state, per-common-dir lock, HMAC ownership proofs and leases, PID plus process-start identity checks, and tree-scoped termination.
-- Gate command fingerprint is denied in workers. Gates run once per explicit invocation and never auto-retry after failure/crash.
+- Gate command fingerprint is denied in workers. Gates never auto-retry after failure/crash. A repeated fingerprint requires a direct slash/CLI invocation with `--retry-gate` plus the exact authenticated run ID; the model-facing tool has no retry field, and every attempt receives a durable receipt.
 - Option-led Web arguments remain a direct human command with a non-evaluating quoted argv grammar. Bare or natural-language `/leppy-loop` delegates checklist/base selection and the trailing human intent to the session model; the private `leppy_loop_start` tool preserves the same controller validation, workspace resolution, cancellation controls, and visible lint diagnostics.
 - A clean checkout may supply tracked `.leppy-loop.json` `customInstructions`. Parsing, shape and byte caps fail closed before a worker starts; the text is treated as repository-authored instruction under the same trusted-repository boundary as `AGENTS.md`, `CLAUDE.md`, scripts and hooks.
 - Remote publication is disabled by default and absent from the model-facing tool schema. Only a direct, human-authored `--open-pr` command enables it after no open checklist row remains. It requires a clean authenticated worktree, rebases onto the configured remote base, pushes the exact controller-owned branch, finds/creates one PR idempotently through authenticated `gh`, and persists the returned URL.
@@ -26,7 +26,7 @@
 
 ## Explicit non-goals
 
-The Harness filesystem sandbox does not confine network. Existing repository scripts may access network, invoke native code, exploit the OS account, or hide behavior behind an otherwise permitted test command. The v0.2.18 boundary assumes the repository and its existing scripts are trusted.
+The Harness filesystem sandbox does not confine network. Existing repository scripts may access network, invoke native code, exploit the OS account, or hide behavior behind an otherwise permitted test command. The v0.2.19 boundary assumes the repository and its existing scripts are trusted.
 
 The narrow Git commit bridge writes shared Git metadata. Validation prevents it from staging out-of-scope worktree paths, but a hostile repository with crafted Git configuration/hooks could affect commit execution. Leppy sets no blanket claim against malicious Git hooks; use clean trusted repositories and review local Git configuration.
 

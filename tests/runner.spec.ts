@@ -129,6 +129,57 @@ describe('controller state machine', () => {
     ])
   }, 90_000)
 
+  it('retries a failed gate only after direct exact-run authorization', async () => {
+    const suffix = Math.random().toString(16).slice(2)
+    const flag = join(tmpdir(), `leppy-gate-${suffix}.flag`).replaceAll('\\', '/')
+    const gateScript = join(tmpdir(), `leppy-gate-${suffix}.cjs`).replaceAll('\\', '/')
+    writeFileSync(gateScript, `process.exit(require('fs').existsSync('${flag}') ? 0 : 1)\n`)
+    const repo = repository(`- [~] Gate: controlled retry | gate=\`node ${gateScript}\`\n`)
+    const worker = new FakeWorker()
+    try {
+      const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+      expect(first.status).toBe('stalled')
+      expect(readFileSync(join(first.stateDir!, 'resume.json'), 'utf8')).toContain('--retry-gate')
+
+      const unauthorized = await runLeppyLoop({
+        tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      }, { ...modelDeps, worker })
+      expect(unauthorized.status).toBe('stalled')
+      expect(readFileSync(join(first.stateDir!, 'resume.json'), 'utf8')).toContain('gate-retry-authorization-required')
+
+      await expect(runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, retryGate: true }, { ...modelDeps, worker }))
+        .rejects.toThrow('--retry-gate requires')
+      writeFileSync(flag, 'pass')
+      const retried = await runLeppyLoop({
+        tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId, retryGate: true,
+      }, { ...modelDeps, worker })
+      expect(retried.status, readFileSync(join(first.stateDir!, 'receipts', 'gate-0-3.json'), 'utf8')).toBe('completed')
+      const events = readFileSync(join(first.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      expect(events.filter(entry => entry.type === 'gate-start')).toHaveLength(2)
+      expect(events.filter(entry => entry.type === 'gate-start').at(-1)?.data.retry).toBe(true)
+    } finally {
+      // The unique temp flag is intentionally harmless and cannot affect another test.
+    }
+  }, 90_000)
+
+  it('rejects a changed recovered gate command instead of bypassing its recorded fingerprint', async () => {
+    const repo = repository('- [~] Gate: configured externally\n')
+    const worker = new FakeWorker()
+    const first = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, phaseGateCommand: 'node definitely-missing-leppy-gate.cjs',
+    }, { ...modelDeps, worker })
+    expect(first.status).toBe('stalled')
+    await expect(runLeppyLoop({
+      tasks: repo.tasks,
+      syncBranch: 'main',
+      fetch: false,
+      phaseGateCommand: 'node --version',
+      recoverExistingWip: true,
+      recoverRunId: first.runId,
+      retryGate: true,
+    }, { ...modelDeps, worker })).rejects.toThrow('fingerprint differs')
+  }, 90_000)
+
   it('forwards bounded tracked legacy custom instructions to the worker', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
     writeFileSync(join(repo.root, '.leppy-loop.json'), JSON.stringify({ customInstructions: 'Run the focal command literally.' }))

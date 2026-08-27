@@ -67,6 +67,7 @@ export interface LeppyLoopOptions {
   taskMatch?: string
   recoverExistingWip?: boolean
   recoverRunId?: string
+  retryGate?: boolean
   syncMaxSeconds?: number
   workerTimeoutMs?: number
   workerOutputLimitBytes?: number

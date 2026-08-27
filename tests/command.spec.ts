@@ -49,6 +49,7 @@ describe('Web command input', () => {
     })
     expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --no-open-pr').openPullRequest).toBe(false)
     expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --open-pr').openPullRequest).toBe(true)
+    expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --recover-run abc --retry-gate')).toMatchObject({ recoverRunId: 'abc', recoverExistingWip: true, retryGate: true })
   })
 
   it('returns actionable usage for malformed input', () => {
@@ -109,6 +110,7 @@ describe('/leppy-loop command', () => {
     })
     expect(tool).toMatchObject({ name: 'leppy_loop_start' })
     expect(JSON.stringify(tool)).not.toContain('openPullRequest')
+    expect(JSON.stringify(tool)).not.toContain('retryGate')
     cleanup?.()
   })
 

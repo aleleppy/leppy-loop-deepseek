@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [0.2.19] - 2026-08-27
+
+### Fixed
+
+- A failed controller gate can now be retried on the preserved authenticated run through a direct slash/CLI invocation containing both the exact `--recover-run` ID and `--retry-gate`. The model-facing tool cannot grant this authority.
+- Gate failures and unauthorized recovery attempts persist an exact actionable retry receipt instead of claiming that a new invocation is sufficient while permanently rejecting it.
+
 ## [0.2.18] - 2026-08-26
 
 ### Added
