@@ -50,7 +50,7 @@ describe('Web command input', () => {
     expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --no-open-pr').openPullRequest).toBe(false)
     expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --open-pr').openPullRequest).toBe(true)
     expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --recover-run abc --retry-gate')).toMatchObject({ recoverRunId: 'abc', recoverExistingWip: true, retryGate: true })
-    expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --recover-run abc --repair-gate --repair-path plugins/a/.hui plugins/b/.hui')).toMatchObject({ recoverRunId: 'abc', recoverExistingWip: true, repairGate: true, repairPaths: ['plugins/a/.hui', 'plugins/b/.hui'] })
+    expect(parseLeppyLoopCommandInput('--tasks tasks/a.md --sync-branch main --recover-run abc --repair-gate --repair-cycles 4 --repair-path plugins/a/.hui plugins/b/.hui')).toMatchObject({ recoverRunId: 'abc', recoverExistingWip: true, repairGate: true, repairCycles: 4, repairPaths: ['plugins/a/.hui', 'plugins/b/.hui'] })
   })
 
   it('returns actionable usage for malformed input', () => {
@@ -114,6 +114,7 @@ describe('/leppy-loop command', () => {
     expect(JSON.stringify(tool)).not.toContain('retryGate')
     expect(JSON.stringify(tool)).not.toContain('repairGate')
     expect(JSON.stringify(tool)).not.toContain('repairPaths')
+    expect(JSON.stringify(tool)).not.toContain('repairCycles')
     cleanup?.()
   })
 

@@ -24,6 +24,7 @@ export function leppyCommand(): Command {
     .option('--retry-gate', 'direct-human authorization to retry the failed gate of an exact recovered run')
     .option('--repair-gate', 'reopen the preceding closure in a fresh worker before retrying an exact failed gate')
     .option('--repair-path <paths...>', 'direct-human additional repo-relative scopes for the reopened repair closure')
+    .option('--repair-cycles <count>', 'bounded repair closure and gate cycles in one direct invocation', positive('repair-cycles'))
     .option('--sync-max-seconds <seconds>', 'fetch timeout', positive('sync-max-seconds'), 120)
     .option('--worker-timeout <minutes>', 'worker timeout in minutes', positive('worker-timeout'), 30)
     .option('--worker-output-limit-kb <kb>', 'agent final-output byte limit in KiB', positive('worker-output-limit-kb'), 192)
@@ -54,6 +55,7 @@ export function optionsFromCommand(command: Command): LeppyLoopOptions {
     retryGate: Boolean(raw.retryGate),
     repairGate: Boolean(raw.repairGate),
     ...(Array.isArray(raw.repairPath) ? { repairPaths: raw.repairPath.map(String) } : {}),
+    ...(raw.repairCycles ? { repairCycles: Number(raw.repairCycles) } : {}),
     syncMaxSeconds: Number(raw.syncMaxSeconds),
     workerTimeoutMs: Number(raw.workerTimeout) * 60_000,
     workerOutputLimitBytes: Number(raw.workerOutputLimitKb) * 1024,

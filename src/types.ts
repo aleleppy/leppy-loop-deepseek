@@ -70,6 +70,7 @@ export interface LeppyLoopOptions {
   retryGate?: boolean
   repairGate?: boolean
   repairPaths?: string[]
+  repairCycles?: number
   syncMaxSeconds?: number
   workerTimeoutMs?: number
   workerOutputLimitBytes?: number

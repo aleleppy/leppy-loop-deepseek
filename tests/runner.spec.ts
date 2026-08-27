@@ -151,6 +151,8 @@ describe('controller state machine', () => {
         .rejects.toThrow('--retry-gate/--repair-gate require')
       await expect(runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, repairPaths: ['src'] }, { ...modelDeps, worker }))
         .rejects.toThrow('--repair-path requires --repair-gate')
+      await expect(runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, repairCycles: 2 }, { ...modelDeps, worker }))
+        .rejects.toThrow('--repair-cycles requires --repair-gate')
       writeFileSync(flag, 'pass')
       const retried = await runLeppyLoop({
         tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId, retryGate: true,
@@ -224,6 +226,52 @@ describe('controller state machine', () => {
     const events = readFileSync(join(repaired.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(events.filter(entry => entry.type === 'gate-start')).toHaveLength(2)
     expect(events.some(entry => entry.type === 'recovery-done' && entry.data.gateRepair === true)).toBe(true)
+  }, 90_000)
+
+  it('chains a bounded number of fresh repair closures while the same gate reveals later failures', async () => {
+    const suffix = Math.random().toString(16).slice(2)
+    const gateScript = join(tmpdir(), `leppy-multistage-gate-${suffix}.cjs`).replaceAll('\\', '/')
+    writeFileSync(gateScript, "const fs=require('fs'); const path=require('path'); const file=path.join(process.cwd(),'generated','stage.txt'); const stage=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8').trim()):0; if(stage<3){console.error('NEED_STAGE_'+(stage+1));process.exit(1)}\n")
+    const repo = repository(`## Phase\n- [ ] Change \`src/value.txt\` | Done: value says done\n- [?] Closure: repair sequential gate failures | paths=src\n- [~] Gate: sequential repair | gate=\`node ${gateScript}\`\n`)
+    mkdirSync(join(repo.root, 'generated'), { recursive: true })
+    writeFileSync(join(repo.root, 'generated', '.keep'), 'generated scope\n')
+    git(repo.root, 'add', '--', 'generated/.keep')
+    git(repo.root, 'commit', '-m', 'chore: seed sequential repair scope')
+    let closureCalls = 0
+    const calls: WorkerRequest[] = []
+    const worker: WorkerAdapter = {
+      run: async request => {
+        calls.push(request)
+        if (request.task.kind === 'task') {
+          writeFileSync(join(request.worktree, 'src', 'value.txt'), 'done\n')
+          git(request.worktree, 'add', '--', 'src/value.txt')
+          git(request.worktree, 'commit', '-m', 'feat: finish sequential task')
+        } else {
+          closureCalls += 1
+          if (closureCalls > 1) {
+            const stage = closureCalls - 1
+            writeFileSync(join(request.worktree, 'generated', 'stage.txt'), `${stage}\n`)
+            git(request.worktree, 'add', '--', 'generated/stage.txt')
+            git(request.worktree, 'commit', '-m', `fix: repair gate stage ${stage}`)
+          }
+        }
+        return { status: 'completed', output: 'done' }
+      },
+    }
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(first.status).toBe('stalled')
+    const repaired = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      repairGate: true, repairCycles: 3, repairPaths: ['generated'],
+    }, { ...modelDeps, worker })
+    expect(repaired.status).toBe('completed')
+    expect(calls.map(call => call.task.kind)).toEqual(['task', 'closure', 'closure', 'closure', 'closure'])
+    expect(calls.at(-2)?.instructions.join('\n')).toContain('NEED_STAGE_2')
+    expect(calls.at(-1)?.instructions.join('\n')).toContain('NEED_STAGE_3')
+    const events = readFileSync(join(repaired.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(events.filter(entry => entry.type === 'gate-start')).toHaveLength(4)
+    expect(events.filter(entry => entry.type === 'recovery-done' && entry.data.gateRepair === true).map(entry => entry.data.repairCycle)).toEqual([1, 2, 3])
+    expect(git(repaired.worktree!, 'status', '--short')).toBe('')
   }, 90_000)
 
   it('rejects a changed recovered gate command instead of bypassing its recorded fingerprint', async () => {

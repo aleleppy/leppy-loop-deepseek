@@ -2,6 +2,17 @@
 
 All notable changes are documented here.
 
+## [0.2.24] - 2026-08-27
+
+### Changed
+
+- One direct `--repair-gate` invocation now chains up to three bounded `fresh closure worker → exact gate retry` cycles by default, feeding each new gate receipt into the next worker instead of stalling after the first newly revealed downstream failure.
+- `--repair-cycles <1..8>` allows a direct human to choose the bound. Cycle usage and limits are persisted in events and final resume receipts; the option remains absent from the model-facing tool.
+
+### Security
+
+- Chained repair still fails closed on dirty worktrees, changed gate fingerprints, worker failure, invalid scopes, cancellation, or cycle exhaustion. It never becomes an unbounded automatic loop.
+
 ## [0.2.23] - 2026-08-27
 
 ### Added
