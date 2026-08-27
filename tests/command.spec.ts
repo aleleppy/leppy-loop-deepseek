@@ -118,7 +118,7 @@ describe('simple human slash surface', () => {
       effect: (setup: () => (() => void)) => setup(),
     } as unknown as Context
     apply(ctx)
-    expect(definition?.input).toEqual({ hint: '[continuar|parar|status|continuar e publicar quando tudo passar]' })
+    expect(definition?.input).toEqual({ hint: '[continuar|parar|status|publicar|continuar e publicar quando tudo passar]' })
     expect(globalTool).toBeUndefined()
 
     const messages: unknown[] = []
@@ -146,6 +146,28 @@ describe('simple human slash surface', () => {
     expect(prompt).toContain('currentTask: 11')
     expect(prompt).toContain('attempt: 15')
     expect(prompt).toContain('examples/feature.task.md')
+  })
+
+  it('/leppy-loop publicar authorizes the newest completed controller without reopening work', async () => {
+    const messages: unknown[] = []
+    const owner = agent('publish-completed-agent', message => { messages.push(message) })
+    const finished = controller({ status: 'completed', completedTasks: 18, attempt: 33 })
+    delete finished.currentTask
+    delete finished.openTask
+    let observed: LeppyLoopOptions | undefined
+    const jobs = new FakeJobs()
+    const rt = runtime({
+      inspectControllers: async () => [finished],
+      run: async options => { observed = options; return { ...completed, runId: finished.runId, completedTasks: 18 } },
+    })
+    const accepted = await executeLeppyLoopCommand(context(jobs), invocation(owner, 'publicar'), rt)
+    expect(accepted).toMatchObject({ kind: 'success', text: expect.stringContaining(finished.runId) })
+    expect(JSON.stringify(messages[0])).toContain('remote publication of one completed Leppy controller')
+    await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', recovery: 'resume', runId: finished.runId,
+      tasks: finished.checklistRelative, syncBranch: finished.syncBranch, fetch: false,
+    })
+    expect(observed).toMatchObject({ recoverRunId: finished.runId, openPullRequest: true })
   })
 
   it('rejects the old technical flag UX instead of awaiting a foreground loop', async () => {

@@ -9,7 +9,7 @@ import type {} from '@deepseek-ai/dsh-credentials'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { inspectAuthenticatedControllers, selectControllerForHumanIntent } from './controller-auth.js'
+import { inspectAuthenticatedControllers, selectControllerForHumanIntent, selectControllerForPublication } from './controller-auth.js'
 import type { AuthenticatedController } from './controller-auth.js'
 import { resolveRepoRoot } from './git.js'
 import { harnessRunDependencies } from './harness-runtime.js'
@@ -293,7 +293,9 @@ export async function executeLeppyLoopControl(
   const repoRoot = resolve(await resolveRepoRoot(cwd))
   if (args.operation === 'status') {
     const controllers = await (runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers)(cwd)
-    const selected = args.runId ? controllers.find(candidate => candidate.runId === args.runId) : selectControllerForHumanIntent(controllers)
+    const selected = args.runId
+      ? controllers.find(candidate => candidate.runId === args.runId)
+      : selectControllerForHumanIntent(controllers) ?? selectControllerForPublication(controllers)
     return selected ? {
       operation: 'status', status: selected.status, runId: selected.runId,
       completedTasks: selected.completedTasks, attempt: selected.attempt, branch: selected.branch,
@@ -337,26 +339,36 @@ function normalizeIntent(raw: string): string {
   return raw.normalize('NFD').replace(/[\u0300-\u036f]/gu, '').trim().toLowerCase().replace(/\s+/gu, ' ')
 }
 
-function parseHumanIntent(raw: string): { operation: LeppyOperation | 'status'; recovery: RecoveryAuthority; publishRemote: boolean } {
-  const input = normalizeIntent(raw)
-  if (input.startsWith('--')) throw new Error('technical flags are private; use only /leppy-loop, continuar, parar, status, or explicit publication intent')
-  if (input === '' || ['start', 'iniciar', 'comecar'].includes(input)) return { operation: 'start', recovery: 'none', publishRemote: false }
-  if (['status', 'estado'].includes(input)) return { operation: 'status', recovery: 'none', publishRemote: false }
-  if (['parar', 'pare', 'stop', 'cancelar', 'cancele'].includes(input)) return { operation: 'stop', recovery: 'none', publishRemote: false }
-  if (['reparar gate', 'repare gate', 'corrigir gate', 'consertar gate', 'repair gate'].includes(input)) return { operation: 'continue', recovery: 'repair-gate', publishRemote: false }
-  if (['retry gate', 'repetir gate', 'tentar gate novamente', 'tentar novamente'].includes(input)) return { operation: 'continue', recovery: 'retry-gate', publishRemote: false }
-  if (['continuar', 'continue', 'retomar', 'retome', 'resume'].includes(input)) return { operation: 'continue', recovery: 'resume', publishRemote: false }
-  if (['continuar e publicar quando tudo passar', 'continue and publish when everything passes'].includes(input)) {
-    return { operation: 'continue', recovery: 'resume', publishRemote: true }
-  }
-  if (['iniciar e publicar quando tudo passar', 'start and publish when everything passes'].includes(input)) {
-    return { operation: 'start', recovery: 'none', publishRemote: true }
-  }
-  throw new Error('unrecognized Leppy intent; use start, continuar, parar, status, reparar gate, or explicit publish-when-passing intent')
+interface HumanIntent {
+  operation: LeppyOperation | 'status'
+  recovery: RecoveryAuthority
+  publishRemote: boolean
+  publicationOnly: boolean
 }
 
-function continuePrompt(controller: AuthenticatedController, recovery: RecoveryAuthority, publishRemote: boolean): string {
-  return `The human directly authorized one bounded Leppy controller continuation${publishRemote ? ' and remote publication only after every row and gate passes' : ' with local-only completion'}.
+function parseHumanIntent(raw: string): HumanIntent {
+  const input = normalizeIntent(raw)
+  if (input.startsWith('--')) throw new Error('technical flags are private; use only /leppy-loop, continuar, parar, status, or explicit publication intent')
+  if (input === '' || ['start', 'iniciar', 'comecar'].includes(input)) return { operation: 'start', recovery: 'none', publishRemote: false, publicationOnly: false }
+  if (['status', 'estado'].includes(input)) return { operation: 'status', recovery: 'none', publishRemote: false, publicationOnly: false }
+  if (['parar', 'pare', 'stop', 'cancelar', 'cancele'].includes(input)) return { operation: 'stop', recovery: 'none', publishRemote: false, publicationOnly: false }
+  if (['reparar gate', 'repare gate', 'corrigir gate', 'consertar gate', 'repair gate'].includes(input)) return { operation: 'continue', recovery: 'repair-gate', publishRemote: false, publicationOnly: false }
+  if (['retry gate', 'repetir gate', 'tentar gate novamente', 'tentar novamente'].includes(input)) return { operation: 'continue', recovery: 'retry-gate', publishRemote: false, publicationOnly: false }
+  if (['continuar', 'continue', 'retomar', 'retome', 'resume'].includes(input)) return { operation: 'continue', recovery: 'resume', publishRemote: false, publicationOnly: false }
+  if (['publicar', 'abrir pr', 'abre um pr', 'publish', 'open pr'].includes(input)) {
+    return { operation: 'continue', recovery: 'resume', publishRemote: true, publicationOnly: true }
+  }
+  if (['continuar e publicar quando tudo passar', 'continue and publish when everything passes'].includes(input)) {
+    return { operation: 'continue', recovery: 'resume', publishRemote: true, publicationOnly: false }
+  }
+  if (['iniciar e publicar quando tudo passar', 'start and publish when everything passes'].includes(input)) {
+    return { operation: 'start', recovery: 'none', publishRemote: true, publicationOnly: false }
+  }
+  throw new Error('unrecognized Leppy intent; use start, continuar, parar, status, reparar gate, publicar, or explicit publish-when-passing intent')
+}
+
+function continuePrompt(controller: AuthenticatedController, recovery: RecoveryAuthority, publishRemote: boolean, publicationOnly = false): string {
+  return `The human directly authorized ${publicationOnly ? 'remote publication of one completed Leppy controller' : `one bounded Leppy controller continuation${publishRemote ? ' and remote publication only after every row and gate passes' : ' with local-only completion'}`}.
 
 The Host authenticated and selected these exact controller facts:
 - operation: continue
@@ -455,8 +467,12 @@ export async function executeLeppyLoopCommand(
     }
 
     const controllers = await (runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers)(cwd)
-    const selected = selectControllerForHumanIntent(controllers)
-    if (!selected) return { kind: 'error', text: 'No authenticated Leppy controller with open work was found in this repository.' }
+    const selected = intent.publicationOnly
+      ? selectControllerForPublication(controllers)
+      : selectControllerForHumanIntent(controllers)
+    if (!selected) return { kind: 'error', text: intent.publicationOnly
+      ? 'No authenticated completed Leppy controller was found for publication in this repository.'
+      : 'No authenticated Leppy controller with open work was found in this repository.' }
     runtime.grants.issue({
       agent: invocation.agent, repoRoot, runId: selected.runId, controllerDigest: selected.authorityDigest,
       operation: 'continue', recovery: intent.recovery,
@@ -465,7 +481,7 @@ export async function executeLeppyLoopCommand(
     ensureScopedTool(ctx, runtime, invocation.agent)
 
     invocation.agent.followup(createUserMessage({
-      content: [{ type: 'text', text: continuePrompt(selected, intent.recovery, intent.publishRemote) }],
+      content: [{ type: 'text', text: continuePrompt(selected, intent.recovery, intent.publishRemote, intent.publicationOnly) }],
       source: { kind: 'plugin', plugin: name },
     }))
     return { kind: 'success', text: `Leppy Loop continuation authorized for run ${selected.runId}. The AI will start the controller as a background job.` }
@@ -483,7 +499,7 @@ export function apply(ctx: Context): void {
   ctx.commands.register({
     name: 'leppy-loop',
     description: 'start, continue, stop, or inspect a Leppy controller',
-    input: { hint: '[continuar|parar|status|continuar e publicar quando tudo passar]' },
+    input: { hint: '[continuar|parar|status|publicar|continuar e publicar quando tudo passar]' },
     handler: invocation => executeLeppyLoopCommand(ctx, invocation, runtime),
   })
   ctx.effect(() => () => {

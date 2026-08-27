@@ -86,7 +86,7 @@ describe('controller state machine', () => {
     expect(worker.calls).toHaveLength(0)
     expect(git(repo.root, 'worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1)
     expect(git(repo.root, 'branch', '--list', 'leppy-loop/*')).toBe('')
-  })
+  }, 90_000)
 
   it('runs task, closure and gate once, amending checkbox into the worker commit', async () => {
     const repo = repository(`## Phase

@@ -150,3 +150,8 @@ export function selectControllerForHumanIntent(controllers: readonly Authenticat
   return controllers.find(controller => controller.openTask !== undefined
     && ['running', 'stalled', 'interrupted', 'failed', 'completed'].includes(controller.status))
 }
+
+/** Select the newest authenticated completed controller for explicit post-run publication. */
+export function selectControllerForPublication(controllers: readonly AuthenticatedController[]): AuthenticatedController | undefined {
+  return controllers.find(controller => controller.status === 'completed' && controller.openTask === undefined)
+}

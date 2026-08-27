@@ -2,6 +2,16 @@
 
 All notable changes are documented here.
 
+## [0.3.1] - 2026-08-27
+
+### Added
+
+- `/leppy-loop publish` and `/leppy-loop publicar` now authorize idempotent PR publication after a local-only run has already completed.
+
+### Security
+
+- Post-completion publication selects only the newest authenticated controller with `status=completed` and no open checklist row, binds its immutable authority digest into a one-shot remote-publication grant, and keeps publication absent from model arguments.
+
 ## [0.3.0] - 2026-08-27
 
 ### Added
