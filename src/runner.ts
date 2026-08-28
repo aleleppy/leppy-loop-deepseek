@@ -50,6 +50,7 @@ interface RunState {
   syncBranch: string
   currentTask?: number
   attempt: number
+  taskAttempts: Record<string, number>
   completedTasks: number
   gateAttempts: Record<string, number>
   pullRequestUrl?: string
@@ -60,6 +61,18 @@ interface RunState {
 }
 
 function digest(text: string): string { return createHash('sha256').update(text).digest('hex') }
+function taskAttemptKey(task: ChecklistTask): string {
+  return digest(JSON.stringify({ index: task.index, phase: task.phase, kind: task.kind, raw: task.raw }))
+}
+function nextTaskAttempt(state: RunState, task: ChecklistTask): number {
+  const key = taskAttemptKey(task)
+  const next = (state.taskAttempts[key] ?? 0) + 1
+  state.taskAttempts[key] = next
+  return next
+}
+function currentTaskAttempt(state: RunState, task: ChecklistTask): number {
+  return state.taskAttempts[taskAttemptKey(task)] ?? 1
+}
 function workerGateFingerprint(parsed: ReturnType<typeof parseChecklist>, task: ChecklistTask, fallback?: string): string | undefined {
   const gate = parsed.tasks.find(candidate => candidate.kind === 'gate' && candidate.mark !== 'x' && candidate.phase === task.phase)
   const command = gate?.metadata.gate ?? fallback
@@ -118,12 +131,22 @@ function alreadySatisfiedEvidence(output: string): boolean {
   return evidence.length === 1 && lines.at(-1) === evidence[0]
 }
 
-function taskProgress(state: RunState, task: ChecklistTask, totalTasks: number, type: RunProgress['type'], elapsedMs: number, error?: string, attempt = state.attempt): RunProgress {
+function taskProgress(
+  state: RunState,
+  task: ChecklistTask,
+  totalTasks: number,
+  type: RunProgress['type'],
+  elapsedMs: number,
+  error?: string,
+  attempt = state.attempt,
+  taskAttempt = currentTaskAttempt(state, task),
+): RunProgress {
   return {
     type,
     runId: state.runId,
     taskIndex: task.index,
     attempt,
+    taskAttempt,
     kind: task.kind,
     phase: task.phase,
     text: task.text,
@@ -358,6 +381,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   if (!recovered && !initialTask) throw new Error('checklist contains no open executable rows')
   if (recovered) {
     state = recovered.state
+    state.taskAttempts ??= {}
     stateDir = recovered.dir
     releaseLock = await acquireLock(commonDir, state.runId)
     try {
@@ -383,7 +407,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       }
       stateDir = statePath(stateBase, runId)
       mkdirSync(stateDir, { recursive: true })
-      state = { schemaVersion: 1, runId, status: 'running', repoRoot, checklistRelative, sourceHead: setup.sourceHead, branch: setup.branch, worktree: setup.worktree, syncBranch: options.syncBranch, attempt: 0, completedTasks: 0, gateAttempts: {}, updatedAt: clock().toISOString() }
+      state = { schemaVersion: 1, runId, status: 'running', repoRoot, checklistRelative, sourceHead: setup.sourceHead, branch: setup.branch, worktree: setup.worktree, syncBranch: options.syncBranch, attempt: 0, taskAttempts: {}, completedTasks: 0, gateAttempts: {}, updatedAt: clock().toISOString() }
       const key = createLeaseKey(stateDir)
       writeState(join(stateDir, 'run.json'), state)
       writeFileSync(join(stateDir, 'ownership.hmac'), `${ownership(state, key)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
@@ -406,7 +430,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     releaseLock()
     throw error
   }
-  let activeProgress: { task: ChecklistTask; totalTasks: number; attempt: number; startedAtMs: number } | undefined
+  let activeProgress: { task: ChecklistTask; totalTasks: number; attempt: number; taskAttempt: number; startedAtMs: number } | undefined
   let retryGateAuthorized = Boolean(options.retryGate || options.repairGate)
   let repairCyclesRemaining = options.repairGate ? options.repairCycles : 0
   let repairCyclesUsed = 0
@@ -415,7 +439,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     if (!active) return
     activeProgress = undefined
     const elapsedMs = clock().getTime() - active.startedAtMs
-    await dependencies.onProgress?.(taskProgress(state, active.task, active.totalTasks, type, elapsedMs, error, active.attempt))
+    await dependencies.onProgress?.(taskProgress(state, active.task, active.totalTasks, type, elapsedMs, error, active.attempt, active.taskAttempt))
   }
   let publicationRepairsUsed = 0
   let publicationChecklistDigest: string | undefined
@@ -453,7 +477,6 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     const allowedPaths = liveSet
     publicationRepairsUsed += 1
     state.attempt += 1
-    writeState(join(stateDir, 'run.json'), state)
     const task: ChecklistTask = {
       index: 10_000 + publicationRepairsUsed,
       line: 0,
@@ -467,6 +490,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         paths: allowedPaths,
       },
     }
+    const taskAttempt = nextTaskAttempt(state, task)
+    writeState(join(stateDir, 'run.json'), state)
     const model = selectedModel(task, options, fallbackSelection, catalog, true)
     validateModelSelection(catalog, model.model, model.effort)
     const previousHead = await head(state.worktree)
@@ -496,7 +521,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       ],
     }
     appendEvent(eventsPath, event(state.runId, 'recovery-start', 'publish', { publicationConflict: true, cycle: publicationRepairsUsed, paths: allowedPaths }, task, state.attempt))
-    await dependencies.onProgress?.(taskProgress(state, task, state.completedTasks, 'task-start', 0))
+    await dependencies.onProgress?.(taskProgress(state, task, state.completedTasks, 'task-start', 0, undefined, state.attempt, taskAttempt))
     const startedAt = clock().getTime()
     const outcome = await dependencies.worker!.run(request, signal)
     if (signal.aborted) throw abortReason(signal)
@@ -505,7 +530,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     if (await head(state.worktree) !== previousHead) throw new Error('publication conflict worker changed HEAD')
     if (!await isAuthenticatedPublicationRebase(publicationRequest, signal)) throw new Error('publication conflict worker changed the authenticated rebase identity')
     appendEvent(eventsPath, event(state.runId, 'recovery-done', 'publish', { publicationConflict: true, cycle: publicationRepairsUsed, resolvedPaths: allowedPaths }, task, state.attempt))
-    await dependencies.onProgress?.(taskProgress(state, task, state.completedTasks, 'task-done', clock().getTime() - startedAt))
+    await dependencies.onProgress?.(taskProgress(state, task, state.completedTasks, 'task-done', clock().getTime() - startedAt, undefined, state.attempt, taskAttempt))
   }
   const restorePrePublicationHead = async (): Promise<void> => {
     if (!publicationOriginalHead) throw new Error('publication rollback lacks the authenticated original HEAD')
@@ -658,10 +683,11 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       const totalTasks = state.completedTasks + remainingTasks.length
       state.currentTask = task.index
       state.attempt += 1
+      const taskAttempt = nextTaskAttempt(state, task)
       writeState(join(stateDir, 'run.json'), state)
       const progressStartedAtMs = clock().getTime()
-      await dependencies.onProgress?.(taskProgress(state, task, totalTasks, 'task-start', 0))
-      activeProgress = { task, totalTasks, attempt: state.attempt, startedAtMs: progressStartedAtMs }
+      await dependencies.onProgress?.(taskProgress(state, task, totalTasks, 'task-start', 0, undefined, state.attempt, taskAttempt))
+      activeProgress = { task, totalTasks, attempt: state.attempt, taskAttempt, startedAtMs: progressStartedAtMs }
       if (task.kind === 'human') {
         const reason = 'human checkpoint requires direct approval; mark this row complete in the preserved worktree, then recover the same run'
         appendEvent(eventsPath, event(state.runId, 'stall', 'human', { reason, worktree: state.worktree }, task, state.attempt))

@@ -103,16 +103,19 @@ describe('CLI-only technical parser', () => {
 })
 
 describe('chat task progress', () => {
-  it('publishes attempt metadata in one durable start/terminal card pair', () => {
+  it('keeps the global attempt in card identity while displaying the per-task attempt', () => {
     const events: Array<{ type: string; data: unknown }> = []
     const report = createChatProgressReporter(agent('session', () => {}, (type, data) => { events.push({ type, data }) }))
     const base: RunProgress = {
-      type: 'task-start', runId: 'run-1', taskIndex: 2, attempt: 15, kind: 'task', phase: 'Phase 6',
+      type: 'task-start', runId: 'run-1', taskIndex: 2, attempt: 15, taskAttempt: 2, kind: 'task', phase: 'Phase 6',
       text: 'A very long task label', completedTasks: 5, totalTasks: 14, elapsedMs: 0,
     }
     report(base)
     report({ ...base, type: 'task-done', completedTasks: 6, elapsedMs: 65_000 })
-    expect(events[0]).toMatchObject({ type: 'command/run', data: { args: expect.stringContaining('leppy-attempt=15') } })
+    expect(events[0]).toMatchObject({
+      type: 'command/run',
+      data: { commandId: 'leppy-progress-run-1-2-15', args: expect.stringContaining('leppy-attempt=2') },
+    })
     expect(events[1]).toMatchObject({ type: 'command/done', data: { text: 'Task completed — 6/14 — 1m 5s elapsed.' } })
   })
 })

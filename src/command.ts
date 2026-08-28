@@ -140,7 +140,7 @@ export function createChatProgressReporter(agent: CommandInvocation['agent']): (
       agent.session.append('command/run', {
         commandId,
         name: 'leppy-loop-task',
-        args: ` ${progressLabel(progress)}\nleppy-attempt=${progress.attempt}\nleppy-elapsed-ms=${Math.floor(progress.elapsedMs)}`,
+        args: ` ${progressLabel(progress)}\nleppy-attempt=${progress.taskAttempt}\nleppy-elapsed-ms=${Math.floor(progress.elapsedMs)}`,
         source: { kind: 'plugin', plugin: 'leppy-loop' },
       })
       return

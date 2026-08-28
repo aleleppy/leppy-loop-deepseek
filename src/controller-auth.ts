@@ -19,6 +19,7 @@ interface StoredRunState {
   syncBranch: string
   currentTask?: number
   attempt: number
+  taskAttempts: Record<string, number>
   completedTasks: number
   gateAttempts: Record<string, number>
   pullRequestUrl?: string
@@ -65,6 +66,13 @@ function equalProof(actual: string, expected: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right)
 }
 
+function validTaskAttempts(value: unknown): value is Record<string, number> {
+  if (value === undefined) return true
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  return Object.entries(value).every(([key, count]) => /^[0-9a-f]{64}$/u.test(key)
+    && typeof count === 'number' && Number.isSafeInteger(count) && count > 0)
+}
+
 function parseStoredRun(path: string): StoredRunState | undefined {
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<StoredRunState>
@@ -78,6 +86,7 @@ function parseStoredRun(path: string): StoredRunState | undefined {
       || typeof value.syncBranch !== 'string'
       || typeof value.attempt !== 'number'
       || typeof value.completedTasks !== 'number'
+      || !validTaskAttempts(value.taskAttempts)
       || typeof value.updatedAt !== 'string'
       || (value.lastError !== undefined && typeof value.lastError !== 'string')
       || (value.publicationTargetCommit !== undefined && (typeof value.publicationTargetCommit !== 'string' || !/^[0-9a-f]{40}$/u.test(value.publicationTargetCommit)))
@@ -85,7 +94,7 @@ function parseStoredRun(path: string): StoredRunState | undefined {
       || typeof value.status !== 'string'
       || typeof value.gateAttempts !== 'object'
       || value.gateAttempts === null) return undefined
-    return value as StoredRunState
+    return { ...value, taskAttempts: value.taskAttempts ?? {} } as StoredRunState
   } catch {
     return undefined
   }
@@ -148,6 +157,7 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       status: state.status,
       currentTask: state.currentTask,
       attempt: state.attempt,
+      taskAttempts: state.taskAttempts,
       completedTasks: state.completedTasks,
       gateAttempts: state.gateAttempts,
       publicationTargetCommit: state.publicationTargetCommit,

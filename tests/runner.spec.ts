@@ -131,6 +131,9 @@ describe('controller state machine', () => {
       ['task-start', 2, 2, 3],
       ['task-done', 2, 3, 3],
     ])
+    expect(progress.filter(update => update.type === 'task-start').map(update => [update.attempt, update.taskAttempt])).toEqual([
+      [1, 1], [2, 1], [3, 1],
+    ])
     expect(progress.filter(update => update.type === 'task-done').map(update => update.elapsedMs)).toEqual([
       65_000, 65_000, 65_000,
     ])
@@ -377,9 +380,9 @@ describe('controller state machine', () => {
     expect(worker.calls[1]?.instructions.at(-1)).toContain('produced no commit')
     const events = readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(events.filter(entry => entry.type === 'start').map(entry => entry.data.retry ?? null)).toEqual([null, 'no-commit'])
-    expect(progress.map(update => [update.type, update.attempt])).toEqual([
-      ['task-start', 1],
-      ['task-done', 1],
+    expect(progress.map(update => [update.type, update.attempt, update.taskAttempt])).toEqual([
+      ['task-start', 1, 1],
+      ['task-done', 1, 1],
     ])
     expect(git(result.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('1')
   }, 90_000)
@@ -450,6 +453,47 @@ describe('controller state machine', () => {
       'task-start', 'task-failed', 'task-start', 'task-done',
     ])
     expect(progress[0]?.attempt).not.toBe(progress[2]?.attempt)
+    expect(progress.filter(update => update.type === 'task-start').map(update => update.taskAttempt)).toEqual([1, 2])
+    const state = JSON.parse(readFileSync(join(resumed.stateDir!, 'run.json'), 'utf8')) as {
+      attempt: number; taskAttempts: Record<string, number>
+    }
+    expect(state.attempt).toBe(2)
+    expect(Object.values(state.taskAttempts)).toEqual([2])
+  }, 90_000)
+
+  it('starts split replacement tasks at attempt one without resetting the global identity', async () => {
+    const repo = repository('- [ ] Large change `src/value.txt` | Done: value says done\n')
+    const worker = new FakeWorker([{ status: 'timeout', output: '', error: 'timeout' }])
+    const progress: RunProgress[] = []
+    const dependencies = { ...modelDeps, worker, onProgress: (update: RunProgress) => { progress.push(update) } }
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, dependencies)
+    expect(first.status).toBe('stalled')
+    writeFileSync(join(first.worktree!, 'tasks.task.md'), [
+      '- [ ] Split part A `src/value.txt` | Done: part A',
+      '- [ ] Split part B `src/value.txt` | Done: part B',
+      '',
+    ].join('\n'))
+    git(first.worktree!, 'add', '--', 'tasks.task.md')
+    git(first.worktree!, 'commit', '-m', 'chore: split stalled controller task')
+
+    const resumed = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: first.runId,
+    }, dependencies)
+
+    expect(resumed.status).toBe('completed')
+    expect(progress.filter(update => update.type === 'task-start').map(update => [
+      update.attempt, update.taskAttempt, update.text,
+    ])).toEqual([
+      [1, 1, 'Large change `src/value.txt`'],
+      [2, 1, 'Split part A `src/value.txt`'],
+      [3, 1, 'Split part B `src/value.txt`'],
+    ])
+    const state = JSON.parse(readFileSync(join(resumed.stateDir!, 'run.json'), 'utf8')) as {
+      attempt: number; taskAttempts: Record<string, number>
+    }
+    expect(state.attempt).toBe(3)
+    expect(Object.values(state.taskAttempts).sort()).toEqual([1, 1, 1])
   }, 90_000)
 
   it('recovers from the authenticated worktree when the source branch removed the checklist and is dirty', async () => {

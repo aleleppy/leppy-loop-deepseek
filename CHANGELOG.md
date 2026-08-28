@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [0.3.6] - 2026-08-28
+
+### Changed
+
+- Progress cards now display an attempt ordinal scoped to the exact checklist row. Sequential tasks and durably split replacement rows begin at `Attempt 1`, while recovery of the same unchanged row advances its own ordinal.
+- The pre-existing global attempt remains cumulative and continues to identify worker leases, artifacts, receipts, events, command pairs and authenticated recovery; lifecycle and repair budgets are unchanged.
+
 ## [0.3.5] - 2026-08-27
 
 ### Changed

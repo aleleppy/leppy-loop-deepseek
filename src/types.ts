@@ -158,7 +158,10 @@ export interface RunProgress {
   type: 'task-start' | 'task-done' | 'task-failed'
   runId: string
   taskIndex: number
+  /** Global durable attempt identity used by controller records and recovery. */
   attempt: number
+  /** Human-facing ordinal for this exact checklist row identity. */
+  taskAttempt: number
   kind: TaskKind
   phase: string
   text: string
