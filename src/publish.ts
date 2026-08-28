@@ -21,11 +21,19 @@ interface RebaseMetadata {
   originalHead: string
 }
 
-function branchTarget(syncBranch: string): { remote: string; base: string } {
-  const normalized = syncBranch.replace(/^refs\/remotes\//u, '')
+export function branchTarget(syncBranch: string): { remote: string; base: string } {
+  const value = syncBranch.trim()
+  const localHead = value.startsWith('refs/heads/')
+  const normalized = localHead ? value.slice('refs/heads/'.length) : value.replace(/^refs\/remotes\//u, '')
   const slash = normalized.indexOf('/')
-  if (slash > 0) return { remote: normalized.slice(0, slash), base: normalized.slice(slash + 1) }
-  return { remote: 'origin', base: normalized.replace(/^refs\/heads\//u, '') }
+  const target = !localHead && slash > 0
+    ? { remote: normalized.slice(0, slash), base: normalized.slice(slash + 1) }
+    : { remote: 'origin', base: normalized }
+  const forbidden = ['~', '^', ':', '?', '*', '[', '\\']
+  if (!/^[A-Za-z0-9._-]+$/u.test(target.remote) || target.base === '' || target.base.startsWith('/') || target.base.endsWith('/') || target.base.endsWith('.') || target.base.includes('..') || target.base.includes('@{') || /(?:^|\/)\.\.?\/?$/u.test(target.base) || /\s/u.test(target.base) || forbidden.some(character => target.base.includes(character))) {
+    throw new Error(`cannot derive a safe remote/base from ${JSON.stringify(syncBranch)}`)
+  }
+  return target
 }
 
 export function githubRepositoryFromRemoteUrl(remoteUrl: string): string {
@@ -36,26 +44,57 @@ export function githubRepositoryFromRemoteUrl(remoteUrl: string): string {
 }
 
 export function pullRequestListArguments(repository: string, branch: string): string[] {
-  return ['pr', 'list', '--repo', repository, '--state', 'all', '--head', branch, '--json', 'url', '--limit', '1']
+  return ['pr', 'list', '--repo', repository, '--state', 'all', '--head', branch, '--json', 'url,state,headRefName,headRepositoryOwner,baseRefName,headRefOid,mergeCommit', '--limit', '100']
 }
 
 export function pullRequestCreateArguments(repository: string, base: string, branch: string): string[] {
   return ['pr', 'create', '--repo', repository, '--base', base, '--head', branch, '--fill']
 }
 
-function parsePullRequestUrl(stdout: string): string | undefined {
+interface ExistingPullRequest {
+  url: string
+  state: 'OPEN' | 'MERGED'
+  base: string
+  head: string
+  mergeCommit?: string
+}
+
+export function parseExistingPullRequest(stdout: string, repository: string, branch: string, expectedHead: string): ExistingPullRequest | undefined {
+  let value: unknown
+  try { value = JSON.parse(stdout) } catch { return undefined }
+  if (!Array.isArray(value)) return undefined
+  const owner = repository.split('/')[0]?.toLowerCase()
+  const prefix = `https://github.com/${repository.toLowerCase()}/pull/`
+  const candidates = value.flatMap(entry => {
+    if (!entry || typeof entry !== 'object') return []
+    const row = entry as Record<string, unknown>
+    const state = row.state
+    const headOwner = row.headRepositoryOwner
+    const login = headOwner && typeof headOwner === 'object' ? (headOwner as Record<string, unknown>).login : undefined
+    const mergeCommit = row.mergeCommit
+    const mergeOid = mergeCommit && typeof mergeCommit === 'object' ? (mergeCommit as Record<string, unknown>).oid : undefined
+    if ((state !== 'OPEN' && state !== 'MERGED')
+      || row.headRefName !== branch
+      || typeof login !== 'string' || login.toLowerCase() !== owner
+      || typeof row.url !== 'string' || !row.url.toLowerCase().startsWith(prefix)
+      || typeof row.baseRefName !== 'string'
+      || row.headRefOid !== expectedHead
+      || (state === 'MERGED' && (typeof mergeOid !== 'string' || !/^[0-9a-f]{40}$/u.test(mergeOid)))) return []
+    return [{ url: row.url, state, base: row.baseRefName, head: expectedHead, ...(typeof mergeOid === 'string' ? { mergeCommit: mergeOid } : {}) } satisfies ExistingPullRequest]
+  })
+  const open = candidates.filter(candidate => candidate.state === 'OPEN')
+  if (open.length > 1) throw new Error('multiple exact open pull requests exist for the authenticated Leppy branch')
+  if (open[0]) return open[0]
+  const merged = candidates.filter(candidate => candidate.state === 'MERGED')
+  if (merged.length > 1) throw new Error('multiple exact merged pull requests exist for the authenticated Leppy branch')
+  return merged[0]
+}
+
+function parseCreatedPullRequestUrl(stdout: string, repository: string): string | undefined {
   const trimmed = stdout.trim()
-  if (trimmed === '') return undefined
-  try {
-    const value = JSON.parse(trimmed) as unknown
-    if (Array.isArray(value)) {
-      const first = value[0] as { url?: unknown } | undefined
-      return typeof first?.url === 'string' ? first.url : undefined
-    }
-  } catch {
-    // `gh pr create` returns the URL as plain text.
-  }
-  return /^https:\/\/github\.com\//u.test(trimmed) ? trimmed.split(/\r?\n/u).at(-1) : undefined
+  const last = trimmed.split(/\r?\n/u).at(-1)
+  if (!last) return undefined
+  return last.toLowerCase().startsWith(`https://github.com/${repository.toLowerCase()}/pull/`) ? last : undefined
 }
 
 async function gitPath(worktree: string, relative: string, signal: AbortSignal): Promise<string> {
@@ -214,14 +253,60 @@ async function continueAfterValidatedRepair(
   return { conflict: await requireConflictOrAbort(request, `git rebase ${action} failed (${continued.exitCode}): ${continued.stderr.trim()}`, signal) }
 }
 
-export async function preparePublicationRebase(request: PullRequestRequest, remote: string, base: string, hooks: PublicationHooks, signal: AbortSignal): Promise<void> {
+interface PublicationTarget {
+  remote: string
+  base: string
+  requestedBase: string
+  baseCommit: string
+  repository: string
+  fetchUrl: string
+  pushUrl: string
+  remoteBranchHead?: string
+}
+
+function remoteHead(stdout: string, branch: string): string | undefined {
+  const suffix = `\trefs/heads/${branch}`
+  const line = stdout.split(/\r?\n/u).find(candidate => candidate.endsWith(suffix))
+  const hash = line?.slice(0, -suffix.length)
+  return hash && /^[0-9a-f]{40}$/u.test(hash) ? hash : undefined
+}
+
+async function resolvePublicationTarget(request: PullRequestRequest, remote: string, requestedBase: string, repository: string, fetchUrl: string, pushUrl: string, signal: AbortSignal, execute: typeof runFile): Promise<PublicationTarget> {
+  await execute('git', ['fetch', '--prune', fetchUrl, `+refs/heads/*:refs/remotes/${remote}/*`], { cwd: request.worktree, signal, timeoutMs: 120_000 })
+  const baseHeads = await execute('git', ['ls-remote', '--heads', fetchUrl, `refs/heads/${requestedBase}`], { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  const branchHeads = await execute('git', ['ls-remote', '--heads', pushUrl, `refs/heads/${request.branch}`], { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  const requestedHead = remoteHead(baseHeads.stdout, requestedBase)
+  const remoteBranchHead = remoteHead(branchHeads.stdout, request.branch)
+  if (!requestedHead) throw new Error(`publication base ${remote}/${requestedBase} does not exist on the remote`)
+
+  const originalTarget = request.originalSyncBranch ? branchTarget(request.originalSyncBranch) : undefined
+  if (originalTarget && originalTarget.remote !== remote) throw new Error('publication target cannot change the authenticated Git remote')
+  if (originalTarget && originalTarget.base !== requestedBase) {
+    const priorTarget = request.priorTargetCommit
+    if (!priorTarget || !/^[0-9a-f]{40}$/u.test(priorTarget)) throw new Error('publication base retarget requires an authenticated prior target commit')
+    await execute('git', ['fetch', fetchUrl, requestedHead], { cwd: request.worktree, signal, timeoutMs: 120_000 })
+    const incorporated = await execute('git', ['merge-base', '--is-ancestor', priorTarget, requestedHead], { cwd: request.worktree, signal, allowFailure: true })
+    if (incorporated.exitCode !== 0) throw new Error(`publication retarget refuses ${remote}/${requestedBase}: prior target ${priorTarget} is not incorporated`)
+  }
+
+  const localHead = (await execute('git', ['rev-parse', 'HEAD'], { cwd: request.worktree, signal })).stdout.trim()
+  if (remoteBranchHead && remoteBranchHead !== request.priorRemoteHead) {
+    const owned = await execute('git', ['merge-base', '--is-ancestor', remoteBranchHead, localHead], { cwd: request.worktree, signal, allowFailure: true })
+    if (owned.exitCode !== 0) throw new Error(`remote Leppy branch ${request.branch} contains commits outside the authenticated local lineage`)
+  }
+  await execute('git', ['fetch', fetchUrl, requestedHead], { cwd: request.worktree, signal, timeoutMs: 120_000 })
+  return { remote, base: requestedBase, requestedBase, baseCommit: requestedHead, repository, fetchUrl, pushUrl, ...(remoteBranchHead ? { remoteBranchHead } : {}) }
+}
+
+export async function preparePublicationRebase(request: PullRequestRequest, remote: string, base: string, hooks: PublicationHooks, signal: AbortSignal, fetchRemote = true): Promise<void> {
   if (await rebaseMetadata(request.worktree, signal)) throw new Error('interrupted publication rebase must be aborted before starting a new attempt')
   const status = await runFile('git', ['status', '--porcelain'], { cwd: request.worktree, signal })
   if (status.stdout.trim() !== '') throw new Error('refusing to publish a dirty Leppy worktree')
-  await runFile('git', ['fetch', remote], { cwd: request.worktree, signal, timeoutMs: 120_000 })
-  const rebased = await runFile('git', ['rebase', `${remote}/${base}`], { cwd: request.worktree, signal, timeoutMs: 120_000, allowFailure: true })
+  if (fetchRemote) await runFile('git', ['fetch', '--prune', remote], { cwd: request.worktree, signal, timeoutMs: 120_000 })
+  const upstream = /^[0-9a-f]{40}$/u.test(base) ? base : `${remote}/${base}`
+  const rebased = await runFile('git', ['rebase', upstream], { cwd: request.worktree, signal, timeoutMs: 120_000, allowFailure: true })
   if (rebased.exitCode === 0) return
-  let conflict = await requireConflictOrAbort(request, `git rebase ${remote}/${base} failed (${rebased.exitCode}): ${rebased.stderr.trim()}`, signal)
+  let conflict = await requireConflictOrAbort(request, `git rebase ${upstream} failed (${rebased.exitCode}): ${rebased.stderr.trim()}`, signal)
   for (;;) {
     let snapshot: ConflictRepairSnapshot
     try {
@@ -242,25 +327,80 @@ export async function preparePublicationRebase(request: PullRequestRequest, remo
   }
 }
 
-export async function publishPullRequest(request: PullRequestRequest, signal: AbortSignal, hooks: PublicationHooks): Promise<{ url: string; validationReceipt: string }> {
-  const { remote, base } = branchTarget(request.syncBranch)
-  if (base === '') throw new Error(`cannot derive a pull request base from ${JSON.stringify(request.syncBranch)}`)
+async function canReconcileExistingPullRequest(request: PullRequestRequest, existing: ExistingPullRequest, remote: string, requestedBase: string, fetchUrl: string, signal: AbortSignal, execute: typeof runFile): Promise<boolean> {
+  if (existing.base !== requestedBase) return false
+  const original = request.originalSyncBranch ? branchTarget(request.originalSyncBranch) : { remote, base: requestedBase }
+  const retargeted = original.remote !== remote || original.base !== requestedBase
+  if (existing.state === 'OPEN' && !retargeted) return true
+  const priorTarget = request.priorTargetCommit
+  if (retargeted && (!priorTarget || !/^[0-9a-f]{40}$/u.test(priorTarget))) return false
+  const heads = await execute('git', ['ls-remote', '--heads', fetchUrl, `refs/heads/${requestedBase}`], { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  const baseCommit = remoteHead(heads.stdout, requestedBase)
+  if (!baseCommit) return false
+  await execute('git', ['fetch', fetchUrl, baseCommit], { cwd: request.worktree, signal, timeoutMs: 120_000 })
+  if (retargeted) {
+    const incorporated = await execute('git', ['merge-base', '--is-ancestor', priorTarget!, baseCommit], { cwd: request.worktree, signal, allowFailure: true })
+    if (incorporated.exitCode !== 0) return false
+  }
+  if (existing.state === 'MERGED') {
+    if (!existing.mergeCommit) return false
+    const delivered = await execute('git', ['merge-base', '--is-ancestor', existing.mergeCommit, baseCommit], { cwd: request.worktree, signal, allowFailure: true })
+    if (delivered.exitCode !== 0) return false
+  }
+  return true
+}
 
-  await preparePublicationRebase(request, remote, base, hooks, signal)
-  const targetCommit = await expectedBaseCommit(request, `${remote}/${base}`, signal)
-  const validationReceipt = await hooks.validateBeforePush(targetCommit)
-  const ahead = await runFile('git', ['rev-list', '--count', `${remote}/${base}..HEAD`], { cwd: request.worktree, signal })
+export async function publishPullRequest(request: PullRequestRequest, signal: AbortSignal, hooks: PublicationHooks, execute: typeof runFile = runFile): Promise<{ url: string; validationReceipt: string; reconciledExisting?: boolean }> {
+  const requested = branchTarget(request.syncBranch)
+  if (requested.base === '') throw new Error(`cannot derive a pull request base from ${JSON.stringify(request.syncBranch)}`)
+  const original = request.originalSyncBranch ? branchTarget(request.originalSyncBranch) : requested
+  if (original.remote !== requested.remote) throw new Error('publication target cannot change the authenticated Git remote')
+  const fetchUrl = (await execute('git', ['remote', 'get-url', requested.remote], { cwd: request.worktree, signal })).stdout.trim()
+  const pushUrls = (await execute('git', ['remote', 'get-url', '--push', '--all', requested.remote], { cwd: request.worktree, signal })).stdout.split(/\r?\n/u).map(value => value.trim()).filter(Boolean)
+  const uniquePushUrls = [...new Set(pushUrls)]
+  if (uniquePushUrls.length !== 1) throw new Error(`publication requires exactly one explicit push URL for remote ${requested.remote}`)
+  const fetchRepository = githubRepositoryFromRemoteUrl(fetchUrl)
+  const githubRepository = githubRepositoryFromRemoteUrl(uniquePushUrls[0]!)
+  if (fetchRepository.toLowerCase() !== githubRepository.toLowerCase()) throw new Error('publication fetch and push URLs target different GitHub repositories')
+
+  const initialHead = (await execute('git', ['rev-parse', 'HEAD'], { cwd: request.worktree, signal })).stdout.trim()
+  const listed = await execute('gh', pullRequestListArguments(githubRepository, request.branch), { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  const existing = parseExistingPullRequest(listed.stdout, githubRepository, request.branch, initialHead)
+  if (existing && await canReconcileExistingPullRequest(request, existing, requested.remote, requested.base, fetchUrl, signal, execute)) {
+    return { url: existing.url, validationReceipt: 'reconciled-existing-pr', reconciledExisting: true }
+  }
+
+  const target = await resolvePublicationTarget(request, requested.remote, requested.base, githubRepository, fetchUrl, uniquePushUrls[0]!, signal, execute)
+  await hooks.recordRemoteHead?.(target.remoteBranchHead)
+  await preparePublicationRebase(request, target.remote, target.baseCommit, hooks, signal, false)
+  const targetCommit = await expectedBaseCommit(request, target.baseCommit, signal)
+  const validation = await hooks.validateBeforePush(targetCommit)
+  const ahead = await execute('git', ['rev-list', '--count', `${targetCommit}..HEAD`], { cwd: request.worktree, signal })
   if (Number.parseInt(ahead.stdout.trim(), 10) < 1) throw new Error('refusing to open a pull request without commits')
+  if ((await execute('git', ['rev-parse', 'HEAD'], { cwd: request.worktree, signal })).stdout.trim() !== validation.validatedHead) throw new Error('validated publication HEAD changed before push')
+  if ((await execute('git', ['status', '--porcelain'], { cwd: request.worktree, signal })).stdout.trim() !== '') throw new Error('validated publication worktree became dirty before push')
 
-  const remoteUrl = (await runFile('git', ['remote', 'get-url', remote], { cwd: request.worktree, signal })).stdout.trim()
-  const githubRepository = githubRepositoryFromRemoteUrl(remoteUrl)
-  await runFile('git', ['push', '--set-upstream', remote, `HEAD:refs/heads/${request.branch}`], { cwd: request.worktree, signal, timeoutMs: 5 * 60_000 })
-  const existing = await runFile('gh', pullRequestListArguments(githubRepository, request.branch), { cwd: request.worktree, signal, timeoutMs: 60_000 })
-  const existingUrl = parsePullRequestUrl(existing.stdout)
-  if (existingUrl) return { url: existingUrl, validationReceipt }
+  const liveBase = await execute('git', ['ls-remote', '--heads', target.fetchUrl, `refs/heads/${target.base}`], { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  const liveBranch = await execute('git', ['ls-remote', '--heads', target.pushUrl, `refs/heads/${request.branch}`], { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  if (remoteHead(liveBase.stdout, target.base) !== targetCommit) throw new Error('publication base changed after the final gate')
+  if (remoteHead(liveBranch.stdout, request.branch) !== target.remoteBranchHead) throw new Error('remote Leppy branch changed after publication preflight')
 
-  const created = await runFile('gh', pullRequestCreateArguments(githubRepository, base, request.branch), { cwd: request.worktree, signal, timeoutMs: 120_000 })
-  const url = parsePullRequestUrl(created.stdout)
-  if (!url) throw new Error('gh pr create did not return a GitHub pull request URL')
-  return { url, validationReceipt }
+  if (target.remoteBranchHead !== validation.validatedHead) {
+    const push = ['push', `--force-with-lease=refs/heads/${request.branch}:${target.remoteBranchHead ?? ''}`, target.pushUrl, `HEAD:refs/heads/${request.branch}`]
+    await execute('git', push, { cwd: request.worktree, signal, timeoutMs: 5 * 60_000 })
+  }
+  const pushed = await execute('git', ['ls-remote', '--heads', target.pushUrl, `refs/heads/${request.branch}`], { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  if (remoteHead(pushed.stdout, request.branch) !== validation.validatedHead) throw new Error('remote Leppy branch does not match the validated HEAD after push')
+  await hooks.recordRemoteHead?.(validation.validatedHead)
+
+  const relisted = await execute('gh', pullRequestListArguments(target.repository, request.branch), { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  const raced = parseExistingPullRequest(relisted.stdout, target.repository, request.branch, validation.validatedHead)
+  if (raced && await canReconcileExistingPullRequest(request, raced, target.remote, target.base, target.fetchUrl, signal, execute)) return { url: raced.url, validationReceipt: validation.receipt }
+  const created = await execute('gh', pullRequestCreateArguments(target.repository, target.base, request.branch), { cwd: request.worktree, signal, timeoutMs: 120_000, allowFailure: true })
+  const url = created.exitCode === 0 ? parseCreatedPullRequestUrl(created.stdout, target.repository) : undefined
+  if (url) return { url, validationReceipt: validation.receipt }
+  const afterCreate = await execute('gh', pullRequestListArguments(target.repository, request.branch), { cwd: request.worktree, signal, timeoutMs: 60_000 })
+  const concurrent = parseExistingPullRequest(afterCreate.stdout, target.repository, request.branch, validation.validatedHead)
+  if (concurrent && await canReconcileExistingPullRequest(request, concurrent, target.remote, target.base, target.fetchUrl, signal, execute)) return { url: concurrent.url, validationReceipt: validation.receipt }
+  throw new Error(`gh pr create did not return the expected GitHub pull request URL (${created.exitCode}): ${created.stderr.trim()}`)
 }

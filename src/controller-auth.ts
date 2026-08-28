@@ -22,6 +22,8 @@ interface StoredRunState {
   completedTasks: number
   gateAttempts: Record<string, number>
   pullRequestUrl?: string
+  publicationTargetCommit?: string
+  publicationRemoteHead?: string
   lastError?: string
   updatedAt: string
 }
@@ -78,6 +80,8 @@ function parseStoredRun(path: string): StoredRunState | undefined {
       || typeof value.completedTasks !== 'number'
       || typeof value.updatedAt !== 'string'
       || (value.lastError !== undefined && typeof value.lastError !== 'string')
+      || (value.publicationTargetCommit !== undefined && (typeof value.publicationTargetCommit !== 'string' || !/^[0-9a-f]{40}$/u.test(value.publicationTargetCommit)))
+      || (value.publicationRemoteHead !== undefined && (typeof value.publicationRemoteHead !== 'string' || !/^[0-9a-f]{40}$/u.test(value.publicationRemoteHead)))
       || typeof value.status !== 'string'
       || typeof value.gateAttempts !== 'object'
       || value.gateAttempts === null) return undefined
@@ -146,6 +150,10 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       attempt: state.attempt,
       completedTasks: state.completedTasks,
       gateAttempts: state.gateAttempts,
+      publicationTargetCommit: state.publicationTargetCommit,
+      publicationRemoteHead: state.publicationRemoteHead,
+      pullRequestUrl: state.pullRequestUrl,
+      lastError: state.lastError,
     })).digest('hex')
     controllers.push({
       runId: state.runId,

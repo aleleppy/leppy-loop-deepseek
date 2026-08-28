@@ -85,6 +85,7 @@ export interface LeppyLoopOptions {
   fallbackModel?: string
   fetch?: boolean
   openPullRequest?: boolean
+  publicationTarget?: string
   repoRoot?: string
 }
 
@@ -172,14 +173,21 @@ export interface PublicationConflict {
   detail: string
 }
 
+export interface PublicationValidation {
+  receipt: string
+  validatedHead: string
+}
+
 export interface PublicationHooks {
   repairConflict: (conflict: PublicationConflict) => Promise<void>
-  validateBeforePush: (targetCommit: string) => Promise<string>
+  validateBeforePush: (targetCommit: string) => Promise<PublicationValidation>
+  recordRemoteHead?: (head: string | undefined) => Promise<void>
 }
 
 export interface PublishedPullRequest {
   url: string
   validationReceipt: string
+  reconciledExisting?: boolean
 }
 
 export interface PullRequestRequest {
@@ -188,6 +196,9 @@ export interface PullRequestRequest {
   worktree: string
   branch: string
   syncBranch: string
+  originalSyncBranch?: string
+  priorTargetCommit?: string
+  priorRemoteHead?: string
 }
 
 export interface RunDependencies {

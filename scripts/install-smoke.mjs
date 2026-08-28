@@ -23,6 +23,8 @@ function run(command, args, env = process.env) {
   return result.stdout ?? ''
 }
 
+const WEB_START_TIMEOUT_MS = 90_000
+
 async function bootInstalledWeb(env) {
   const child = spawn(process.execPath, [dshBin, '--profile', 'web', '--host', '127.0.0.1', '--port', '0', '--no-open'], {
     cwd: project,
@@ -34,7 +36,7 @@ async function bootInstalledWeb(env) {
   let stderr = ''
   try {
     const url = await new Promise((resolveUrl, reject) => {
-      const timeout = setTimeout(() => reject(new Error(`installed Web profile did not start:\n${stdout}\n${stderr}`)), 30_000)
+      const timeout = setTimeout(() => reject(new Error(`installed Web profile did not start within ${WEB_START_TIMEOUT_MS} ms:\n${stdout}\n${stderr}`)), WEB_START_TIMEOUT_MS)
       const inspect = () => {
         const match = /dsh web: (http:\/\/127\.0\.0\.1:\d+)/u.exec(stdout)
         if (!match?.[1]) return

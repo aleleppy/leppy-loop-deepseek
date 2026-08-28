@@ -75,8 +75,16 @@ function context(jobs = new FakeJobs()): Context {
 
 function runtime(hooks: LeppyLoopRuntime['hooks'] = {}): LeppyLoopRuntime {
   return {
-    grants: new HumanGrantStore(), jobs: [], registeredAgents: new WeakSet(), lifetime: new AbortController(), hooks,
+    grants: new HumanGrantStore(), jobs: [], activeRepositories: new Set(), registeredAgents: new WeakSet(), lifetime: new AbortController(), hooks,
   }
+}
+
+function issueGrant(rt: LeppyLoopRuntime, owner: Agent, overrides: { runId?: string; allowPublication?: boolean; maxTransitions?: number } = {}) {
+  return rt.grants.issue({
+    agent: owner, repoRoot: cwd, ...(overrides.runId ? { runId: overrides.runId } : {}),
+    allowPublication: overrides.allowPublication ?? false,
+    maxIterations: 64, maxRepairCycles: 3, maxTransitions: overrides.maxTransitions ?? 16,
+  })
 }
 
 function invocation(owner: Agent, rawInput: string): CommandInvocation {
@@ -119,21 +127,25 @@ describe('simple human slash surface', () => {
       effect: (setup: () => (() => void)) => setup(),
     } as unknown as Context
     apply(ctx)
-    expect(definition?.input).toEqual({ hint: '[continuar|parar|status|publicar|continuar e publicar quando tudo passar]' })
+    expect(definition?.input).toEqual({ hint: '[natural-language intent|status|parar]' })
     expect(globalTool).toBeUndefined()
 
     const messages: unknown[] = []
     const owner = agent('scope-agent', message => { messages.push(message) })
     const result = await definition!.handler(invocation(owner, ''))
-    expect(result).toMatchObject({ kind: 'success', text: expect.stringContaining('background job') })
+    expect(result).toMatchObject({ kind: 'success', text: expect.stringContaining('lifecycle authorized') })
     expect(messages).toHaveLength(1)
     const register = owner.ctx.tools.register as ReturnType<typeof vi.fn>
     expect(register).toHaveBeenCalledOnce()
     const scopedTool = register.mock.calls[0]![0] as ToolDefinition
     expect(scopedTool.name).toBe('leppy_loop_control')
-    expect(scopedTool.parameters).not.toHaveProperty('phaseGateCommand')
-    expect(scopedTool.parameters).not.toHaveProperty('repairPaths')
-    expect(scopedTool.parameters).not.toHaveProperty('repairCycles')
+    const toolProperties = (scopedTool.parameters as { properties: Record<string, { enum?: string[] }> }).properties
+    expect(toolProperties).not.toHaveProperty('phaseGateCommand')
+    expect(toolProperties).not.toHaveProperty('repairPaths')
+    expect(toolProperties).not.toHaveProperty('repairCycles')
+    expect(toolProperties).toHaveProperty('publish')
+    expect(toolProperties).toHaveProperty('publicationTarget')
+    expect(toolProperties.operation?.enum).not.toContain('stop')
   })
 
   it('/leppy-loop continuar returns before the controller and gives the AI exact authenticated facts', async () => {
@@ -163,9 +175,9 @@ describe('simple human slash surface', () => {
     })
     const accepted = await executeLeppyLoopCommand(context(jobs), invocation(owner, 'publicar'), rt)
     expect(accepted).toMatchObject({ kind: 'success', text: expect.stringContaining(finished.runId) })
-    expect(JSON.stringify(messages[0])).toContain('remote publication of one completed Leppy controller')
+    expect(JSON.stringify(messages[0])).toContain('may push its owned branch and create or reconcile a pull request')
     await executeLeppyLoopControl(context(jobs), rt, owner, {
-      operation: 'continue', recovery: 'resume', runId: finished.runId,
+      operation: 'continue', recovery: 'resume', publish: true, runId: finished.runId,
       tasks: finished.checklistRelative, syncBranch: finished.syncBranch, fetch: false,
     })
     expect(observed).toMatchObject({ recoverRunId: finished.runId, openPullRequest: true, publicationRepairCycles: 3 })
@@ -215,14 +227,17 @@ describe('simple human slash surface', () => {
     expect(result).toMatchObject({ kind: 'error', text: expect.stringContaining('technical flags are private') })
   })
 
-  it('never treats negated or ambiguous publication language as authority', async () => {
-    const followup = vi.fn()
-    for (const text of ['nao publicar', 'do not publish', 'continuar sem publicar']) {
-      const result = await executeLeppyLoopCommand(context(), invocation(agent(`negated-${text}`, followup), text), runtime())
-      expect(result).toMatchObject({ kind: 'error', text: expect.stringContaining('unrecognized Leppy intent') })
+  it('accepts natural language while keeping explicit publication negation immutable', async () => {
+    for (const text of ['nao publicar', 'não publique', 'não quero publicar', 'nunca publique', 'do not publish', "don't publish", 'never publish', 'please avoid publishing', 'continuar sem publicar']) {
+      const followup = vi.fn()
+      const owner = agent(`negated-${text}`, followup)
+      const rt = runtime()
+      const result = await executeLeppyLoopCommand(context(), invocation(owner, text), rt)
+      expect(result).toMatchObject({ kind: 'success', text: expect.stringContaining('lifecycle authorized') })
+      expect(rt.grants.permits(owner, cwd)[0]?.allowPublication, text).toBe(false)
+      expect(followup).toHaveBeenCalledOnce()
     }
-    expect(followup).not.toHaveBeenCalled()
-  })
+  }, 30_000)
 })
 
 describe('grant-validated background controller tool', () => {
@@ -232,7 +247,7 @@ describe('grant-validated background controller tool', () => {
     let settle!: (result: RunResult) => void
     const run = new Promise<RunResult>(resolveRun => { settle = resolveRun })
     const rt = runtime({ run: async () => await run })
-    rt.grants.issue({ agent: owner, repoRoot: cwd, operation: 'start', recovery: 'none', publishRemote: false, maxIterations: 64, maxRepairCycles: 3 })
+    issueGrant(rt, owner)
 
     const value = await executeLeppyLoopControl(context(jobs), rt, owner, {
       operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false,
@@ -243,13 +258,60 @@ describe('grant-validated background controller tool', () => {
     await expect(jobs.starts[0]!.hooks.done).resolves.toMatchObject({ status: 'completed' })
   })
 
+  it('reuses one lifecycle permit across settled controller transitions without another slash command', async () => {
+    const followup = vi.fn()
+    const owner = agent('lifecycle-agent', followup)
+    const jobs = new FakeJobs()
+    let calls = 0
+    const rt = runtime({
+      inspectControllers: async () => [controller()],
+      run: async () => ++calls === 1
+        ? { runId: '44c85fb806c6', status: 'stalled', completedTasks: 5, currentTask: 11, diagnostics: [], detail: 'recoverable worker stall' }
+        : { runId: '44c85fb806c6', status: 'completed', completedTasks: 18, diagnostics: [] },
+    })
+    issueGrant(rt, owner, { runId: '44c85fb806c6', allowPublication: true })
+    await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: '44c85fb806c6', tasks: 'examples/feature.task.md', syncBranch: 'origin/plugins', fetch: false,
+    })
+    await jobs.starts[0]!.hooks.done
+    await vi.waitFor(() => { expect(rt.grants.permits(owner, cwd)[0]?.inFlight).toBe(false) })
+    await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', publish: true, runId: '44c85fb806c6', tasks: 'examples/feature.task.md', syncBranch: 'origin/plugins', fetch: false,
+    })
+    expect(jobs.starts).toHaveLength(2)
+    expect(rt.grants.permits(owner, cwd)[0]?.transitions).toBe(2)
+    expect(followup).toHaveBeenCalled()
+  })
+
+  it('retries transient automatic follow-up handoff failures within the lifecycle', async () => {
+    const followup = vi.fn()
+    const owner = agent('followup-retry-agent', followup)
+    const jobs = new FakeJobs()
+    let inspections = 0
+    const rt = runtime({
+      inspectControllers: async () => {
+        inspections += 1
+        if (inspections === 2 || inspections === 3) throw new Error('transient inspection failure')
+        return [controller()]
+      },
+      run: async () => ({ runId: '44c85fb806c6', status: 'stalled', completedTasks: 5, diagnostics: [], detail: 'retry me' }),
+    })
+    issueGrant(rt, owner, { runId: '44c85fb806c6' })
+    await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: '44c85fb806c6', tasks: 'examples/feature.task.md', syncBranch: 'origin/plugins', fetch: false,
+    })
+    await jobs.starts[0]!.hooks.done
+    await vi.waitFor(() => { expect(followup).toHaveBeenCalledOnce() }, { timeout: 2_000 })
+    expect(inspections).toBe(4)
+  })
+
   it('preserves actionable detail for a resolved publication stall in the Jobs outcome', async () => {
     const owner = agent('job-detail-agent')
     const jobs = new FakeJobs()
     const rt = runtime({ run: async () => ({
       runId: 'detail-run', status: 'stalled', completedTasks: 18, diagnostics: [], detail: 'publication conflict worker changed the Git index',
     }) })
-    rt.grants.issue({ agent: owner, repoRoot: cwd, operation: 'start', recovery: 'none', publishRemote: false, maxIterations: 64, maxRepairCycles: 3 })
+    issueGrant(rt, owner)
     await executeLeppyLoopControl(context(jobs), rt, owner, {
       operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false,
     })
@@ -267,7 +329,7 @@ describe('grant-validated background controller tool', () => {
       run: async () => await new Promise<RunResult>(() => {}),
       inspectControllers: async () => { throw new Error('transient durable inspection failure') },
     })
-    rt.grants.issue({ agent: owner, repoRoot: cwd, operation: 'start', recovery: 'none', publishRemote: false, maxIterations: 64, maxRepairCycles: 3 })
+    issueGrant(rt, owner)
     const started = await executeLeppyLoopControl(context(jobs), rt, owner, {
       operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false,
     })
@@ -282,11 +344,25 @@ describe('grant-validated background controller tool', () => {
     const owner = agent('duplicate-agent')
     const jobs = new FakeJobs()
     const rt = runtime({ run: async () => await new Promise<RunResult>(() => {}) })
-    const grant = () => rt.grants.issue({ agent: owner, repoRoot: cwd, operation: 'start', recovery: 'none', publishRemote: false, maxIterations: 64, maxRepairCycles: 3 })
+    const grant = () => issueGrant(rt, owner)
     grant()
     await executeLeppyLoopControl(context(jobs), rt, owner, { operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false })
     grant()
     await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false,
+    })).rejects.toThrow('already active')
+    expect(jobs.starts).toHaveLength(1)
+  })
+
+  it('rejects a second Agent before it can reach recovery lease termination', async () => {
+    const first = agent('first-session')
+    const second = agent('second-session')
+    const jobs = new FakeJobs()
+    const rt = runtime({ run: async () => await new Promise<RunResult>(() => {}) })
+    issueGrant(rt, first)
+    await executeLeppyLoopControl(context(jobs), rt, first, { operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false })
+    issueGrant(rt, second)
+    await expect(executeLeppyLoopControl(context(jobs), rt, second, {
       operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false,
     })).rejects.toThrow('already active')
     expect(jobs.starts).toHaveLength(1)
@@ -298,21 +374,17 @@ describe('grant-validated background controller tool', () => {
     await expect(executeLeppyLoopControl(context(), rt, owner, {
       operation: 'continue', recovery: 'repair-gate', runId: '44c85fb806c6',
       tasks: 'examples/feature.task.md', syncBranch: 'origin/plugins',
-    })).rejects.toThrow('no direct human capability')
+    })).rejects.toThrow('no direct human lifecycle permit')
   })
 
-  it('denies a controller snapshot changed after the human authorized it', async () => {
+  it('denies technical controller facts that differ from the live authenticated run', async () => {
     const owner = agent('changed-controller')
-    const changed = controller({ authorityDigest: 'changed-digest', syncBranch: 'attacker/base' })
-    const rt = runtime({ inspectControllers: async () => [changed] })
-    rt.grants.issue({
-      agent: owner, repoRoot: cwd, runId: '44c85fb806c6', controllerDigest: 'controller-digest',
-      operation: 'continue', recovery: 'resume', publishRemote: false, maxIterations: 64, maxRepairCycles: 3,
-    })
+    const rt = runtime({ inspectControllers: async () => [controller()] })
+    issueGrant(rt, owner, { runId: '44c85fb806c6' })
     await expect(executeLeppyLoopControl(context(), rt, owner, {
       operation: 'continue', recovery: 'resume', runId: '44c85fb806c6',
       tasks: 'examples/feature.task.md', syncBranch: 'attacker/base',
-    })).rejects.toThrow('authenticated controller changed after human authorization')
+    })).rejects.toThrow('tool base does not match')
   })
 
   it('reaches current run task 11 through exact recovery options without editing the worktree', async () => {
@@ -322,10 +394,7 @@ describe('grant-validated background controller tool', () => {
       inspectControllers: async () => [controller()],
       run: async options => { observed = options; return { ...completed, runId: '44c85fb806c6', status: 'stalled', currentTask: 11 } },
     })
-    rt.grants.issue({
-      agent: owner, repoRoot: cwd, runId: '44c85fb806c6', controllerDigest: 'controller-digest', operation: 'continue', recovery: 'resume',
-      publishRemote: false, maxIterations: 64, maxRepairCycles: 3,
-    })
+    issueGrant(rt, owner, { runId: '44c85fb806c6' })
     const value = await executeLeppyLoopControl(context(), rt, owner, {
       operation: 'continue', recovery: 'resume', runId: '44c85fb806c6',
       tasks: 'examples/feature.task.md', syncBranch: 'origin/plugins', fetch: false,
@@ -338,10 +407,10 @@ describe('grant-validated background controller tool', () => {
     const owner = agent('publish-agent')
     const seen: boolean[] = []
     const rt = runtime({ run: async options => { seen.push(Boolean(options.openPullRequest)); return completed } })
-    rt.grants.issue({ agent: owner, repoRoot: cwd, operation: 'start', recovery: 'none', publishRemote: false, maxIterations: 64, maxRepairCycles: 3 })
+    issueGrant(rt, owner)
     await executeLeppyLoopControl(context(), rt, owner, { operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false })
-    rt.grants.issue({ agent: owner, repoRoot: cwd, operation: 'start', recovery: 'none', publishRemote: true, maxIterations: 64, maxRepairCycles: 3 })
-    await executeLeppyLoopControl(context(), rt, owner, { operation: 'start', tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false })
+    issueGrant(rt, owner, { allowPublication: true })
+    await executeLeppyLoopControl(context(), rt, owner, { operation: 'start', publish: true, tasks: 'examples/feature.task.md', syncBranch: 'origin/main', fetch: false })
     expect(seen).toEqual([false, true])
   })
 
@@ -356,11 +425,10 @@ describe('grant-validated background controller tool', () => {
         }), { once: true })
       }),
     })
-    rt.grants.issue({ agent: owner, repoRoot: cwd, runId: '44c85fb806c6', controllerDigest: 'controller-digest', operation: 'continue', recovery: 'resume', publishRemote: false, maxIterations: 64, maxRepairCycles: 3 })
+    issueGrant(rt, owner, { runId: '44c85fb806c6' })
     await executeLeppyLoopControl(context(jobs), rt, owner, {
       operation: 'continue', recovery: 'resume', runId: '44c85fb806c6', tasks: 'examples/feature.task.md', syncBranch: 'origin/plugins', fetch: false,
     })
-    rt.grants.issue({ agent: owner, repoRoot: cwd, runId: '44c85fb806c6', operation: 'stop', recovery: 'none', publishRemote: false, maxIterations: 1, maxRepairCycles: 1 })
     const stopped = await executeLeppyLoopControl(context(jobs), rt, owner, { operation: 'stop', runId: '44c85fb806c6' })
     expect(stopped.status).toBe('stopping')
     await expect(jobs.starts[0]!.hooks.done).resolves.toMatchObject({ status: 'killed' })

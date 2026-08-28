@@ -2,6 +2,26 @@
 
 All notable changes are documented here.
 
+## [0.3.5] - 2026-08-27
+
+### Changed
+
+- One `/leppy-loop` invocation now creates a reusable, bounded lifecycle permit for one session/repository/run. The AI can advance recovery, bounded gate repair and PR delivery from natural-language context and background outcomes without asking the human for separate continue/repair/publish slash commands.
+- Arbitrary natural-language suffixes are accepted while technical paths, refs, run IDs, recovery modes and publication targets stay in the private tool. Explicit local-only/`do not publish` language irreversibly removes push/PR authority for that lifecycle.
+
+### Fixed
+
+- Publication reconciles an exact same-owner OPEN or MERGED PR before any fetch, rebase, gate or push, allowing manual publication to settle durable Leppy state without another remote mutation.
+- Deleted remote bases are detected with `fetch --prune` plus `ls-remote` instead of stale tracking refs. A private replacement base cannot change the authenticated remote and requires a durable prior target commit and ancestry proof, including exact-base existing OPEN/MERGED PR reconciliation; MERGED delivery also proves its merge commit remains in the live base.
+- Already-pushed rebased branches use an exact observed-OID `force-with-lease`. The publisher freezes the target OID, revalidates gate-validated HEAD, clean tree, live base and remote lease before push, verifies the resulting remote head, and re-lists PRs to absorb create races.
+- `refs/heads/main`, slash-containing `refs/heads/release/1.0`, and `refs/remotes/origin/main` publication inputs resolve correctly; fetch/push GitHub repository mismatches and ambiguous push URLs fail closed.
+- The clean-profile install smoke retains its HTTP/client-bundle assertions but allows 90 seconds for a cold Web boot after Windows-heavy test suites.
+
+### Security
+
+- Lifecycle permits are Host-memory-only, expire after 24 hours, bind to the first run once, reject concurrent transitions, enforce a cumulative sixteen-transition budget, and disappear on Host restart. Direct stop is absent from the model tool schema; repair scope, merge and deployment remain unauthorized.
+- Repository admission is fenced across Agents before lease termination. Crash-stale locks carry PID/process-start/token ownership and are reclaimed through an exclusive recovery marker; live owners and stale disposer deletion fail closed.
+
 ## [0.3.4] - 2026-08-27
 
 ### Fixed

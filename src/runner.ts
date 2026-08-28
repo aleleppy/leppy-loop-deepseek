@@ -53,6 +53,8 @@ interface RunState {
   completedTasks: number
   gateAttempts: Record<string, number>
   pullRequestUrl?: string
+  publicationTargetCommit?: string
+  publicationRemoteHead?: string
   lastError?: string
   updatedAt: string
 }
@@ -92,6 +94,18 @@ function latestGateFailureInstruction(stateDir: string, gateIndex: number): stri
     'Repair the concrete failures below only inside the closure scope, then commit at most one correction.',
     `Gate stdout/stderr (bounded tail):\n${`${stdout}\n${stderr}`.slice(-24 * 1024)}`,
   ].join('\n')
+}
+
+function latestPublicationTargetCommit(stateDir: string): string | undefined {
+  const receiptsDir = join(stateDir, 'receipts')
+  if (!existsSync(receiptsDir)) return undefined
+  for (const name of readdirSync(receiptsDir).filter(file => /^publication-gate-\d+\.json$/u.test(file)).sort((left, right) => right.localeCompare(left, undefined, { numeric: true }))) {
+    try {
+      const receipt = JSON.parse(readFileSync(join(receiptsDir, name), 'utf8')) as { targetCommit?: unknown; exitCode?: unknown }
+      if (receipt.exitCode === 0 && typeof receipt.targetCommit === 'string' && /^[0-9a-f]{40}$/u.test(receipt.targetCommit)) return receipt.targetCommit
+    } catch { /* ignore malformed legacy receipts */ }
+  }
+  return undefined
 }
 
 function event(runId: string, type: RunEventType, phase: RunEvent['phase'], data: Record<string, unknown>, task?: ChecklistTask, attempt?: number): RunEvent {
@@ -217,7 +231,7 @@ async function terminateAuthenticatedLease(stateDir: string, runId: string): Pro
   }
 }
 
-async function recoverState(base: string, repoRoot: string, checklistRelative: string, requestedRunId?: string, adopt = true): Promise<{ state: RunState; dir: string } | undefined> {
+async function recoverState(base: string, repoRoot: string, checklistRelative: string, requestedRunId?: string): Promise<{ state: RunState; dir: string } | undefined> {
   if (!existsSync(base)) return undefined
   const matches: { state: RunState; dir: string }[] = []
   for (const name of readdirSync(base)) {
@@ -250,7 +264,6 @@ async function recoverState(base: string, repoRoot: string, checklistRelative: s
     branch: match.state.branch,
     syncBranch: match.state.syncBranch,
   }, new AbortController().signal)) throw new Error('authenticated run worktree or publication rebase no longer matches')
-  if (adopt) await terminateAuthenticatedLease(match.dir, match.state.runId)
   return match
 }
 
@@ -313,7 +326,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   const commonRaw = (await runFile('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot, signal })).stdout.trim()
   const commonDir = realpathSync(resolve(repoRoot, commonRaw))
   const stateBase = resolve(options.artifactsDir ?? join(commonDir, 'leppy-loop', 'runs'))
-  const recoveryPreview = options.recoverExistingWip ? await recoverState(stateBase, repoRoot, checklistRelative, options.recoverRunId, false) : undefined
+  const recoveryPreview = options.recoverExistingWip ? await recoverState(stateBase, repoRoot, checklistRelative, options.recoverRunId) : undefined
   if (options.recoverExistingWip && !recoveryPreview) throw new Error('no authenticated matching run exists')
   if (!recoveryPreview) await assertSourceReady(repoRoot, checklistRelative, signal)
   const controllerPath = recoveryPreview ? join(recoveryPreview.state.worktree, checklistRelative) : tasksAbsolute
@@ -346,15 +359,21 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   if (recovered) {
     state = recovered.state
     stateDir = recovered.dir
-    releaseLock = acquireLock(commonDir, state.runId)
-    const previousStatus = state.status
-    state.status = 'running'
-    delete state.lastError
-    writeState(join(stateDir, 'run.json'), state)
-    appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-start', 'recovery', { worktree: state.worktree, previousStatus }))
-    appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', { taskIndex: state.currentTask ?? null }))
+    releaseLock = await acquireLock(commonDir, state.runId)
+    try {
+      await terminateAuthenticatedLease(stateDir, state.runId)
+      const previousStatus = state.status
+      state.status = 'running'
+      delete state.lastError
+      writeState(join(stateDir, 'run.json'), state)
+      appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-start', 'recovery', { worktree: state.worktree, previousStatus }))
+      appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', { taskIndex: state.currentTask ?? null }))
+    } catch (error) {
+      releaseLock()
+      throw error
+    }
   } else {
-    releaseLock = acquireLock(commonDir, runId)
+    releaseLock = await acquireLock(commonDir, runId)
     try {
       const setup = await createRunWorktree(repoRoot, checklistRelative, options.syncBranch, runId, options.fetch ?? true, options.syncMaxSeconds, signal)
       const baseTask = selectTask(parseChecklist(join(setup.worktree, checklistRelative)), options.taskMatch)
@@ -378,9 +397,15 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
 
   const eventsPath = join(stateDir, 'events.jsonl')
   const gateRepairPath = join(stateDir, 'gate-repair.json')
-  let gateRepairContext: GateRepairContext | undefined = existsSync(gateRepairPath)
-    ? JSON.parse(readFileSync(gateRepairPath, 'utf8')) as GateRepairContext
-    : undefined
+  let gateRepairContext: GateRepairContext | undefined
+  try {
+    gateRepairContext = existsSync(gateRepairPath)
+      ? JSON.parse(readFileSync(gateRepairPath, 'utf8')) as GateRepairContext
+      : undefined
+  } catch (error) {
+    releaseLock()
+    throw error
+  }
   let activeProgress: { task: ChecklistTask; totalTasks: number; attempt: number; startedAtMs: number } | undefined
   let retryGateAuthorized = Boolean(options.retryGate || options.repairGate)
   let repairCyclesRemaining = options.repairGate ? options.repairCycles : 0
@@ -402,7 +427,14 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     if (!publicationChecklistDigest || !publicationGate) throw new Error('publication conflict repair lacks a frozen checklist and final gate')
     const checklistPath = join(state.worktree, checklistRelative)
     const rebaseStepChecklistDigest = digest(readFileSync(checklistPath, 'utf8'))
-    const publicationRequest = { runId: state.runId, repoRoot: state.repoRoot, worktree: state.worktree, branch: state.branch, syncBranch: state.syncBranch }
+    const priorTargetCommit = state.publicationTargetCommit ?? latestPublicationTargetCommit(stateDir) ?? state.sourceHead
+    const publicationRequest = {
+      runId: state.runId, repoRoot: state.repoRoot, worktree: state.worktree, branch: state.branch,
+      syncBranch: options.publicationTarget ?? state.syncBranch,
+      originalSyncBranch: state.syncBranch,
+      ...(priorTargetCommit ? { priorTargetCommit } : {}),
+      ...(state.publicationRemoteHead ? { priorRemoteHead: state.publicationRemoteHead } : {}),
+    }
     if (!await isAuthenticatedPublicationRebase(publicationRequest, signal)) throw new Error('publication conflict worker requires the authenticated live rebase')
     const normalizeConflictPath = (path: string): string => {
       const absolute = resolve(state.worktree, path)
@@ -482,10 +514,9 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     if (await head(state.worktree) !== publicationOriginalHead) throw new Error('publication rollback did not restore the authenticated HEAD')
     if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('publication rollback did not restore a clean worktree')
   }
-  const validatePublicationBase = async (targetCommit: string): Promise<string> => {
+  const validatePublicationBase = async (targetCommit: string): Promise<{ receipt: string; validatedHead: string }> => {
     if (!publicationChecklistDigest || !publicationOriginalHead || !publicationGate) throw new Error('publication requires a frozen completed checklist and final gate')
-    try {
-      const currentDigest = digest(readFileSync(join(state.worktree, checklistRelative), 'utf8'))
+    const currentDigest = digest(readFileSync(join(state.worktree, checklistRelative), 'utf8'))
       if (currentDigest !== publicationChecklistDigest) throw new Error('rebase altered the controlling checklist')
       const currentHead = await head(state.worktree)
       const based = await runFile('git', ['merge-base', '--is-ancestor', targetCommit, currentHead], { cwd: state.worktree, signal, allowFailure: true })
@@ -509,17 +540,14 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       mkdirSync(join(stateDir, 'receipts'), { recursive: true })
       atomicWriteJson(join(stateDir, 'receipts', `publication-gate-${state.attempt}.json`), receipt)
       if (result.exitCode !== 0) throw new Error(`post-rebase publication gate failed (${result.exitCode}): ${redact(result.stderr || result.stdout)}`)
+      if (await head(state.worktree) !== currentHead) throw new Error('post-rebase publication gate changed the validated HEAD')
+      if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('post-rebase publication gate left a dirty worktree')
+      if (digest(readFileSync(join(state.worktree, checklistRelative), 'utf8')) !== publicationChecklistDigest) throw new Error('post-rebase publication gate altered the controlling checklist')
       publicationValidationReceipt = validationReceipt
+      state.publicationTargetCommit = targetCommit
+      writeState(join(stateDir, 'run.json'), state)
       appendEvent(eventsPath, event(state.runId, 'gate-end', 'publish', { exitCode: 0, publicationValidation: true, targetCommit }, gate, state.attempt))
-      return validationReceipt
-    } catch (error) {
-      try {
-        await restorePrePublicationHead()
-      } catch (rollbackError) {
-        throw new Error(`${error instanceof Error ? error.message : String(error)}; publication rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`)
-      }
-      throw error
-    }
+    return { receipt: validationReceipt, validatedHead: currentHead }
   }
   const reopenRepairClosure = async (): Promise<void> => {
     if (repairCyclesRemaining < 1) throw new Error('gate repair cycle limit exhausted')
@@ -556,14 +584,18 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     if (options.repairGate) await reopenRepairClosure()
     for (let iteration = 0; iteration < options.maxIterations; iteration += 1) {
       if (signal.aborted) throw abortReason(signal)
-      const publicationRequest = {
-        runId: state.runId,
-        repoRoot: state.repoRoot,
-        worktree: state.worktree,
-        branch: state.branch,
-        syncBranch: state.syncBranch,
+      const recoveryPublicationRequest = {
+        runId: state.runId, repoRoot: state.repoRoot, worktree: state.worktree, branch: state.branch, syncBranch: state.syncBranch,
       }
-      if (options.openPullRequest && !state.pullRequestUrl) await abortInterruptedPublicationRebase(publicationRequest, signal)
+      if (options.openPullRequest && !state.pullRequestUrl) await abortInterruptedPublicationRebase(recoveryPublicationRequest, signal)
+      const priorTargetCommit = state.publicationTargetCommit ?? latestPublicationTargetCommit(stateDir) ?? state.sourceHead
+      const publicationRequest = {
+        ...recoveryPublicationRequest,
+        syncBranch: options.publicationTarget ?? state.syncBranch,
+        originalSyncBranch: state.syncBranch,
+        ...(priorTargetCommit ? { priorTargetCommit } : {}),
+        ...(state.publicationRemoteHead ? { priorRemoteHead: state.publicationRemoteHead } : {}),
+      }
       const checklistPath = join(state.worktree, checklistRelative)
       const parsed = parseChecklist(checklistPath)
       const task = selectTask(parsed, options.taskMatch)
@@ -571,7 +603,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         delete state.currentTask
         if (options.openPullRequest && !state.pullRequestUrl) {
           if (!dependencies.publishPullRequest) throw new Error('pull request publication is unavailable in this composition')
-          appendEvent(eventsPath, event(state.runId, 'publish-start', 'publish', { branch: state.branch, syncBranch: state.syncBranch }))
+          appendEvent(eventsPath, event(state.runId, 'publish-start', 'publish', { branch: state.branch, syncBranch: state.syncBranch, publicationTarget: options.publicationTarget ?? state.syncBranch }))
           try {
             publicationChecklistDigest = digest(parsed.source)
             publicationOriginalHead = await head(state.worktree)
@@ -583,13 +615,23 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             const published = await dependencies.publishPullRequest(publicationRequest, signal, {
               repairConflict: repairPublicationConflict,
               validateBeforePush: validatePublicationBase,
+              recordRemoteHead: async remoteHead => {
+                if (remoteHead) state.publicationRemoteHead = remoteHead
+                else delete state.publicationRemoteHead
+                writeState(join(stateDir, 'run.json'), state)
+              },
             })
-            if (!publicationValidationReceipt || published.validationReceipt !== publicationValidationReceipt) throw new Error('publisher did not consume the controller-owned final-gate receipt')
+            if (!published.reconciledExisting && (!publicationValidationReceipt || published.validationReceipt !== publicationValidationReceipt)) throw new Error('publisher did not consume the controller-owned final-gate receipt')
             state.pullRequestUrl = published.url
             writeState(join(stateDir, 'run.json'), state)
             appendEvent(eventsPath, event(state.runId, 'publish-done', 'publish', { url: state.pullRequestUrl }))
           } catch (error) {
-            const message = redact(error instanceof Error ? error.message : String(error)).slice(-16 * 1024)
+            let failure = error instanceof Error ? error.message : String(error)
+            if (publicationOriginalHead) {
+              try { await restorePrePublicationHead() }
+              catch (rollbackError) { failure = `${failure}; publication rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}` }
+            }
+            const message = redact(failure).slice(-16 * 1024)
             state.status = 'stalled'
             state.lastError = message
             writeState(join(stateDir, 'run.json'), state)
@@ -598,7 +640,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
               schemaVersion: 1,
               runId: state.runId,
               reason: message,
-              command: `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)}`,
+              command: '/leppy-loop',
             })
             return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, diagnostics, detail: message }
           }

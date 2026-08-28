@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import type { RunEvent } from './types.js'
 import { redact } from './security.js'
@@ -17,6 +17,15 @@ export interface LeasePayload {
 
 export interface SignedLease { payload: LeasePayload; signature: string }
 
+interface RepositoryLockPayload {
+  schemaVersion: 1
+  runId: string
+  pid: number
+  processStart: string
+  token: string
+  startedAt: string
+}
+
 export function atomicWriteJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true })
   const temporary = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
@@ -29,19 +38,112 @@ export function appendEvent(path: string, event: RunEvent, knownSecrets: readonl
   writeFileSync(path, `${JSON.stringify(redact(event, knownSecrets))}\n`, { encoding: 'utf8', flag: 'a' })
 }
 
-export function acquireLock(commonDir: string, runId: string): () => void {
+interface LockObservation {
+  raw: string
+  mtimeMs: number
+  payload?: RepositoryLockPayload
+}
+
+function readLock(path: string): LockObservation | undefined {
+  let raw: string
+  let mtimeMs: number
+  try {
+    raw = readFileSync(path, 'utf8')
+    mtimeMs = statSync(path).mtimeMs
+  } catch { return undefined }
+  try {
+    const value = JSON.parse(raw) as Partial<RepositoryLockPayload>
+    const payload = value.schemaVersion === 1
+      && typeof value.runId === 'string'
+      && Number.isSafeInteger(value.pid) && (value.pid ?? 0) > 0
+      && typeof value.processStart === 'string'
+      && typeof value.token === 'string'
+      && typeof value.startedAt === 'string'
+      ? value as RepositoryLockPayload
+      : undefined
+    return { raw, mtimeMs, ...(payload ? { payload } : {}) }
+  } catch { return { raw, mtimeMs } }
+}
+
+function processExists(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+async function lockOwnerIsLive(lock: LockObservation | undefined): Promise<boolean> {
+  const owner = lock?.payload
+  if (!owner) {
+    if (!lock || Date.now() - lock.mtimeMs < 30_000) return true
+    try {
+      const legacy = JSON.parse(lock.raw) as { pid?: unknown }
+      return typeof legacy.pid === 'number' && processExists(legacy.pid)
+    } catch { return false }
+  }
+  const identity = await processIdentity(owner.pid)
+  if (identity !== undefined) return identity === owner.processStart
+  return processExists(owner.pid)
+}
+
+function writeExclusiveLock(path: string, payload: RepositoryLockPayload): void {
+  const descriptor = openSync(path, 'wx')
+  try { writeFileSync(descriptor, `${JSON.stringify(payload)}\n`) }
+  catch (error) { rmSync(path, { force: true }); throw error }
+  finally { closeSync(descriptor) }
+}
+
+export async function acquireLock(commonDir: string, runId: string): Promise<() => void> {
   const lockDir = join(commonDir, 'leppy-loop')
   mkdirSync(lockDir, { recursive: true })
   const path = join(lockDir, 'active.lock')
-  let descriptor: number
-  try {
-    descriptor = openSync(path, 'wx')
-  } catch {
-    throw new Error(`another Leppy Loop owns repository lock ${path}`)
+  const reclaimPath = join(lockDir, 'active.reclaim')
+  const processStart = await processIdentity(process.pid) ?? String(Date.now() - Math.floor(process.uptime() * 1000))
+  const payload: RepositoryLockPayload = {
+    schemaVersion: 1,
+    runId,
+    pid: process.pid,
+    processStart,
+    token: randomBytes(16).toString('hex'),
+    startedAt: new Date().toISOString(),
   }
-  writeFileSync(descriptor, `${JSON.stringify({ runId, pid: process.pid, startedAt: new Date().toISOString() })}\n`)
-  closeSync(descriptor)
-  return () => { rmSync(path, { force: true }) }
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const reclaim = readLock(reclaimPath)
+    if (reclaim) {
+      if (await lockOwnerIsLive(reclaim)) throw new Error(`another Leppy Loop is reclaiming repository lock ${path}`)
+      if (readLock(reclaimPath)?.raw === reclaim.raw) rmSync(reclaimPath, { force: true })
+      continue
+    }
+    try {
+      writeExclusiveLock(path, payload)
+      return () => {
+        const current = readLock(path)?.payload
+        if (current?.token === payload.token) rmSync(path, { force: true })
+      }
+    } catch {
+      const observed = readLock(path)
+      if (!observed || await lockOwnerIsLive(observed)) throw new Error(`another Leppy Loop owns repository lock ${path}`)
+      try { writeExclusiveLock(reclaimPath, payload) } catch { continue }
+      try {
+        const current = readLock(path)
+        if (!current || current.raw !== observed.raw) continue
+        rmSync(path, { force: true })
+        writeExclusiveLock(path, payload)
+        return () => {
+          const held = readLock(path)?.payload
+          if (held?.token === payload.token) rmSync(path, { force: true })
+        }
+      } finally {
+        const held = readLock(reclaimPath)?.payload
+        if (held?.token === payload.token) rmSync(reclaimPath, { force: true })
+      }
+    }
+  }
+  throw new Error(`another Leppy Loop owns repository lock ${path}`)
 }
 
 export function createLeaseKey(stateDir: string): Buffer {

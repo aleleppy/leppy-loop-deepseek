@@ -330,6 +330,18 @@ describe('controller state machine', () => {
     expect(readFileSync(join(result.stateDir!, 'resume.json'), 'utf8')).toContain('"status": "human"')
   }, 90_000)
 
+  it('releases the repository lock when authenticated recovery metadata fails after acquisition', async () => {
+    const repo = repository('- [?] [human/live] Confirm behavior in the release client.\n')
+    const worker = new FakeWorker()
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    writeFileSync(join(first.stateDir!, 'gate-repair.json'), '{"schemaVersion":')
+    const recover = () => runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker })
+    await expect(recover()).rejects.toThrow(/JSON|Unexpected end/u)
+    await expect(recover()).rejects.toThrow(/JSON|Unexpected end/u)
+  }, 90_000)
+
   it('preserves WIP and the same open row after timeout', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
     const worker = new FakeWorker([{ status: 'timeout', output: '', error: 'timeout' }])
@@ -491,7 +503,7 @@ describe('controller state machine', () => {
       publishPullRequest: async (request: PullRequestRequest, _signal: AbortSignal, hooks: PublicationHooks) => {
         published.push(request.branch)
         const receipt = await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
-        return { url: 'https://github.com/example/repo/pull/7', validationReceipt: receipt }
+        return { url: 'https://github.com/example/repo/pull/7', validationReceipt: receipt.receipt }
       },
     }
     const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true }, dependencies)
@@ -503,6 +515,20 @@ describe('controller state machine', () => {
     const events = readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')
     expect(events).toContain('"type":"publish-start"')
     expect(events).toContain('"type":"publish-done"')
+  }, 90_000)
+
+  it('reconciles an authenticated existing PR without demanding a duplicate final-gate callback', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n- [~] Gate: node version | gate=`node --version`\n')
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true },
+      {
+        ...modelDeps, worker: new FakeWorker(),
+        publishPullRequest: async () => ({
+          url: 'https://github.com/example/repo/pull/46', validationReceipt: 'reconciled-existing-pr', reconciledExisting: true,
+        }),
+      },
+    )
+    expect(result).toMatchObject({ status: 'completed', pullRequestUrl: 'https://github.com/example/repo/pull/46' })
   }, 90_000)
 
   it('rejects a publisher that ignores the mandatory final-gate receipt', async () => {
@@ -519,6 +545,27 @@ describe('controller state machine', () => {
     expect(result.pullRequestUrl).toBeUndefined()
     expect(result.detail).toContain('publisher did not consume')
     expect(JSON.parse(readFileSync(join(result.stateDir!, 'run.json'), 'utf8')).lastError).toContain('publisher did not consume')
+  }, 90_000)
+
+  it('rolls back the authenticated pre-publication HEAD after a post-gate publisher failure', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n- [~] Gate: node version | gate=`node --version`\n')
+    let originalHead = ''
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true },
+      {
+        ...modelDeps,
+        worker: new FakeWorker(),
+        publishPullRequest: async (request, _signal, hooks) => {
+          originalHead = git(request.worktree, 'rev-parse', 'HEAD')
+          git(request.worktree, 'commit', '--allow-empty', '-m', 'test: simulated publication rebase')
+          await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
+          throw new Error('simulated push failure after final gate')
+        },
+      },
+    )
+    expect(result).toMatchObject({ status: 'stalled', detail: expect.stringContaining('simulated push failure') })
+    expect(git(result.worktree!, 'rev-parse', 'HEAD')).toBe(originalHead)
+    expect(git(result.worktree!, 'status', '--porcelain')).toBe('')
   }, 90_000)
 
   it('refuses publication without a completed authenticated final gate', async () => {
@@ -548,7 +595,7 @@ describe('controller state machine', () => {
           writeFileSync(join(request.worktree, 'tasks.task.md'), '# unauthorized base mutation\n')
           const receipt = await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
           remoteMutationReached = true
-          return { url: 'https://example.invalid/should-not-open', validationReceipt: receipt }
+          return { url: 'https://example.invalid/should-not-open', validationReceipt: receipt.receipt }
         },
       },
     )
@@ -585,7 +632,7 @@ describe('controller state machine', () => {
           git(request.worktree, '-c', 'core.editor=true', 'rebase', '--continue')
           validationCalls += 1
           const receipt = await hooks.validateBeforePush(git(request.worktree, 'rev-parse', 'origin/main'))
-          return { url: 'https://github.com/example/repo/pull/8', validationReceipt: receipt }
+          return { url: 'https://github.com/example/repo/pull/8', validationReceipt: receipt.receipt }
         },
       },
     )
