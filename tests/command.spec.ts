@@ -122,7 +122,7 @@ describe('chat task progress', () => {
 })
 
 describe('simple human slash surface', () => {
-  it('registers the slash command, durable controller tool and native lifecycle skill globally', async () => {
+  it('reserves /leppy-loop for the command and registers a distinct model-only operator skill', async () => {
     let definition: CommandDefinition | undefined
     let globalTool: ToolDefinition | undefined
     let skillProvider: SkillProvider | undefined
@@ -133,12 +133,14 @@ describe('simple human slash surface', () => {
       effect: (setup: () => (() => void)) => setup(),
     } as unknown as Context
     apply(ctx)
+    expect(definition?.name).toBe('leppy-loop')
     expect(definition?.input).toEqual({ hint: '[natural-language intent|status|parar]' })
     expect(globalTool?.name).toBe('leppy_loop_control')
     const candidates = await skillProvider!.list({})
     expect(Array.isArray(candidates)).toBe(true)
     if (!Array.isArray(candidates)) throw new Error('expected static skill candidates')
-    expect(candidates).toMatchObject([{ name: 'leppy-loop', invocation: { modelInvocable: true, userInvocable: true } }])
+    expect(candidates).toMatchObject([{ name: 'leppy-loop-operator', invocation: { modelInvocable: true, userInvocable: false } }])
+    expect(candidates[0]!.name).not.toBe(definition!.name)
     const skill = await skillProvider!.get(candidates[0]!, {})
     expect(skill?.content).toContain('Never invent, remember, or pass a `leppy-loop-*` job ID')
 

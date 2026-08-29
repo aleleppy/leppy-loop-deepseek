@@ -47,13 +47,13 @@ const LIFECYCLE_PROMPT = `The human invoked /leppy-loop and authorized one bound
 
 Use leppy_loop_control for exactly one next lifecycle transition now. Read-only status/preflight calls do not consume that transition. Always call operation=status before claiming that a controller job is running; only a returned live jobId proves that claim. Choose technical recovery and publication behavior from the authenticated controller state and the human's conversation. The permit authorizes branch push and pull-request creation unless the Host says it is local-only; it never authorizes merge, deployment, scope widening, or another run. For a new run, resolve the tracked checklist and authoritative Git base, call operation=preflight, and start only after it returns ready. You may correct only explicit path/Done metadata in the tracked source checklist to resolve reported preflight diagnostics, then rerun preflight. For an existing run, use only the exact Host-provided run/checklist/base facts and never edit its controller. You may set publicationTarget only to a live replacement base justified by repository history when the original publication base was removed. Return after the background job starts. Never emulate the controller with shell, subagents, generic background jobs, or direct worktree edits. Never invent or remember a leppy-loop-* job id across turns.`
 
-const SKILL_PROVIDER_NAME = 'leppy-loop'
-const SKILL_BODY_URL = new URL('../skills/leppy-loop/SKILL.md', import.meta.url)
-const SKILL_RESOURCE_BASE = { kind: 'directory', path: fileURLToPath(new URL('../skills/leppy-loop/', import.meta.url)) } as const
+const SKILL_PROVIDER_NAME = 'leppy-loop-operator'
+const SKILL_BODY_URL = new URL('../skills/leppy-loop-operator/SKILL.md', import.meta.url)
+const SKILL_RESOURCE_BASE = { kind: 'directory', path: fileURLToPath(new URL('../skills/leppy-loop-operator/', import.meta.url)) } as const
 const SKILL_CANDIDATE: SkillCandidate = {
-  name: 'leppy-loop',
-  description: 'Operate one bounded Leppy Loop lifecycle from natural language. Use for /leppy-loop, Leppy status/continue/repair/publication, or an existing Leppy task card.',
-  invocation: { modelInvocable: true, userInvocable: true },
+  name: 'leppy-loop-operator',
+  description: 'Model-only guidance for operating an already human-authorized Leppy lifecycle, status, recovery, or publication.',
+  invocation: { modelInvocable: true, userInvocable: false },
   provider: SKILL_PROVIDER_NAME,
   source: 'bundled',
   resourceBase: SKILL_RESOURCE_BASE,

@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.8] - 2026-08-29
+
+### Fixed
+
+- Reserved the user-facing `/leppy-loop` name exclusively for the Host command that mints direct-human lifecycle authority. The packaged guidance is now the model-only, non-user-invocable `leppy-loop-operator` skill, preventing slash-menu ambiguity that could load instructions without issuing the required permit.
+
 ## [0.3.7] - 2026-08-28
 
 ### Added

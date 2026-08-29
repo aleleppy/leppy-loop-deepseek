@@ -1,9 +1,11 @@
 ---
-name: leppy-loop
-description: Operate one bounded Leppy Loop lifecycle from natural language. Use for /leppy-loop, Leppy status/continue/repair/publication, or when a user refers to an existing Leppy task card.
+name: leppy-loop-operator
+description: Model-only guidance for operating an already human-authorized Leppy lifecycle, status, recovery, or publication.
 ---
 
-# Leppy Loop lifecycle
+# Leppy Loop lifecycle operator
+
+This skill is model-only. The user-facing `/leppy-loop` name is reserved exclusively for the Host command that creates direct-human lifecycle authority. Never ask a human who already invoked that command to invoke a second skill or phase command.
 
 The Host plugin—not this chat—is the controller of checklist mutation, worker worktrees, commits, recovery, gates, and publication.
 
