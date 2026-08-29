@@ -1,0 +1,104 @@
+import { mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { describe, expect, it } from 'vitest'
+import { appendLifecycleAuthorityReceipt, inspectLifecycleAuthority, readAuthenticatedLifecycleAuthority } from '../src/lifecycle-authority.js'
+import type { LifecycleAuthority } from '../src/types.js'
+
+function stateDir(): string {
+  const root = mkdtempSync(join(tmpdir(), 'leppy-authority-'))
+  mkdirSync(root, { recursive: true })
+  return root
+}
+
+function authority(overrides: Partial<LifecycleAuthority> = {}): LifecycleAuthority {
+  return {
+    sessionId: 'session-a', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+    maxTransitions: 16, transitions: 1, issuedAt: 1_000, expiresAt: 86_401_000,
+    ...overrides,
+  }
+}
+
+describe('append-only lifecycle authority receipts', () => {
+  it('authenticates monotonic admissions and chooses the newest complete receipt chain', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions: 2 }))
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({
+      sequence: 2, authority: { sessionId: 'session-a', transitions: 2, allowPublication: false },
+    })
+  })
+
+  it.each([
+    ['sessionId', 'session-b'], ['allowPublication', true], ['maxIterations', 65],
+    ['maxRepairCycles', 4], ['maxTransitions', 17], ['transitions', 2],
+    ['issuedAt', 999], ['expiresAt', 86_401_001], ['revokedAt', 2_000],
+  ] as const)('fails closed when signed authority field %s is tampered', (field, replacement) => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    const path = join(dir, 'lifecycle-authority', 'authority-000001.json')
+    const receipt = JSON.parse(readFileSync(path, 'utf8')) as { authority: Record<string, unknown> }
+    receipt.authority[field] = replacement
+    writeFileSync(path, `${JSON.stringify(receipt)}\n`)
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toBeUndefined()
+  })
+
+  it('rejects stale receipt replay, gaps and immutable authority changes', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    const stale = readFileSync(join(dir, 'lifecycle-authority', 'authority-000001.json'), 'utf8')
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions: 2 }))
+    writeFileSync(join(dir, 'lifecycle-authority', 'authority-000003.json'), stale)
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toBeUndefined()
+
+    const clean = stateDir()
+    appendLifecycleAuthorityReceipt(clean, 'run-a', authority())
+    expect(() => appendLifecycleAuthorityReceipt(clean, 'run-a', authority({ maxIterations: 65, transitions: 2 }))).toThrow('immutable facts changed')
+  })
+
+  it('rejects tail deletion for admission, publication downgrade, and revocation', () => {
+    const cases: Array<(dir: string) => void> = [
+      dir => {
+        appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+        appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions: 2 }))
+      },
+      dir => {
+        appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: true }))
+        appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: false }))
+      },
+      dir => {
+        appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+        appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ revokedAt: 2_000 }))
+      },
+    ]
+    for (const build of cases) {
+      const dir = stateDir()
+      build(dir)
+      unlinkSync(join(dir, 'lifecycle-authority', 'authority-000002.json'))
+      expect(inspectLifecycleAuthority(dir, 'run-a')).toMatchObject({ status: 'invalid', reason: expect.stringContaining('length') })
+    }
+  })
+
+  it('does not reinterpret a modern run with a missing head as legacy', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    unlinkSync(join(dir, 'lifecycle-authority-head.json'))
+    expect(inspectLifecycleAuthority(dir, 'run-a')).toMatchObject({ status: 'invalid', reason: expect.stringContaining('head') })
+  })
+
+  it('permits only a monotonic publication downgrade within the same authority chain', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: true }))
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: false }))
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({ authority: { allowPublication: false, transitions: 1 } })
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: true, transitions: 2 }))).toThrow('monotonic')
+  })
+
+  it('records direct-human revocation without consuming another transition and forbids later admission', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ revokedAt: 2_000 }))
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({ authority: { transitions: 1, revokedAt: 2_000 } })
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions: 2 }))).toThrow('revoked')
+  })
+})

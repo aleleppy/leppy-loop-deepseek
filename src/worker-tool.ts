@@ -57,9 +57,13 @@ export function resolveAllowed(policy: WorkerPolicy, candidate: string, writing:
   const { real, suffix } = nearestReal(absolute)
   const canonical = resolve(real, suffix)
   if (!inside(policy.root, canonical)) throw new Error('path escapes worktree through traversal or link')
+  const repoRelative = relative(policy.root, canonical)
+  if (repoRelative === '.git' || repoRelative.startsWith(`.git${sep}`)) throw new Error('Git metadata is denied')
   if (canonical === policy.checklist) throw new Error('controlling checklist is denied')
-  const permitted = policy.allowed.some(scope => canonical === scope || (policy.mode !== 'publication-conflict' && inside(scope, canonical)))
-  if (!permitted) throw new Error(`path is outside this task scope: ${candidate}`)
+  const permitted = !writing && policy.mode !== 'publication-conflict'
+    ? true
+    : policy.allowed.some(scope => canonical === scope || (policy.mode !== 'publication-conflict' && inside(scope, canonical)))
+  if (!permitted) throw new Error(`path is outside this task write scope: ${candidate}`)
   if (!writing && !existsSync(canonical)) throw new Error(`path does not exist: ${candidate}`)
   return canonical
 }
@@ -71,6 +75,14 @@ export function resolveExecCwd(policy: WorkerPolicy, candidate?: string): string
 
 function textOutput(value: unknown): [{ type: 'text'; text: string }] {
   return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }]
+}
+
+export function validatedExecOutput(exitCode: number, stdout: string, stderr: string): { exitCode: number; stdout: string; stderr: string } {
+  if (exitCode !== 0) {
+    const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join('\n').slice(-16 * 1024)
+    throw new Error(`command failed with exit ${exitCode}${detail ? `: ${detail}` : ''}`)
+  }
+  return { exitCode, stdout, stderr }
 }
 
 async function gitCommand(ctx: Context, policy: WorkerPolicy, args: readonly string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -127,6 +139,45 @@ export function apply(ctx: Context): void {
     output: { schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } }, render: (_args, value) => textOutput((value as { text: string }).text) },
     async execute(args) {
       return { text: readFileSync(resolveAllowed(policy, args.path, false), 'utf8') }
+    },
+  }))
+  if (policy.mode !== 'publication-conflict') ctx.tools.register(defineTool({
+    name: 'leppy_search',
+    description: 'Search tracked repository text with Git grep. Use this instead of rg, grep, find, or shell pipelines.',
+    parameters: {
+      pattern: { type: 'string', required: true },
+      paths: { type: 'array', items: { type: 'string' }, description: 'Optional repo-relative files or directories. Reads may inspect the worktree, but never the controller.' },
+    },
+    output: { schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } }, render: (_args, value) => textOutput((value as { text: string }).text) },
+    async execute(args) {
+      const relativePaths = (args.paths ?? []).map(candidate => relative(policy.root, resolveAllowed(policy, candidate, false)))
+      const pathspecs = relativePaths.length > 0 ? relativePaths : ['.']
+      pathspecs.push(`:(exclude)${relative(policy.root, policy.checklist).replaceAll('\\', '/')}`)
+      const result = await gitCommand(ctx, policy, ['grep', '-n', '-e', args.pattern, '--', ...pathspecs])
+      if (result.exitCode === 1) return { text: '' }
+      if (result.exitCode !== 0) throw new Error(`repository search failed: ${result.stderr || `exit ${result.exitCode}`}`)
+      return { text: result.stdout }
+    },
+  }))
+  if (policy.mode !== 'publication-conflict') ctx.tools.register(defineTool({
+    name: 'leppy_edit',
+    description: 'Replace exact UTF-8 text inside one writable task path. Prefer this over rewriting whole files or constructing patches.',
+    parameters: {
+      path: { type: 'string', required: true },
+      oldText: { type: 'string', required: true },
+      newText: { type: 'string', required: true },
+      replaceAll: { type: 'boolean', description: 'Replace every match. Defaults to false, which requires exactly one match.' },
+    },
+    output: { schema: { type: 'object', additionalProperties: false, properties: { replacements: { type: 'number', required: true } } }, render: (_args, value) => textOutput(value) },
+    async execute(args) {
+      if (args.oldText === '') throw new Error('oldText must not be empty')
+      const path = resolveAllowed(policy, args.path, true)
+      const source = readFileSync(path, 'utf8')
+      const matches = source.split(args.oldText).length - 1
+      if (matches === 0) throw new Error('oldText was not found')
+      if (!args.replaceAll && matches !== 1) throw new Error(`oldText matched ${matches} times; provide a unique match or set replaceAll`)
+      writeFileSync(path, args.replaceAll ? source.replaceAll(args.oldText, args.newText) : source.replace(args.oldText, args.newText), 'utf8')
+      return { replacements: args.replaceAll ? matches : 1 }
     },
   }))
   if (policy.mode !== 'publication-conflict') ctx.tools.register(defineTool({
@@ -192,7 +243,7 @@ export function apply(ctx: Context): void {
       const outcome = await handle.done
       const stdout = handle.collected.stdout?.readFrom(0).text ?? ''
       const stderr = handle.collected.stderr?.readFrom(0).text ?? ''
-      return { exitCode: outcome.exitCode ?? -1, stdout, stderr }
+      return validatedExecOutput(outcome.exitCode ?? -1, stdout, stderr)
     },
   }))
 }

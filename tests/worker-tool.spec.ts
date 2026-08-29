@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
-import { apply as applyWorkerTools, commitTaskChanges, resolveAllowed, resolveExecCwd, type WorkerPolicy } from '../src/worker-tool.js'
+import { apply as applyWorkerTools, commitTaskChanges, resolveAllowed, resolveExecCwd, validatedExecOutput, type WorkerPolicy } from '../src/worker-tool.js'
 
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
@@ -52,6 +52,11 @@ function registeredTools(root: string, mode: 'task' | 'publication-conflict'): s
 }
 
 describe('worker commit capability', () => {
+  it('surfaces nonzero argv outcomes as real tool errors', () => {
+    expect(validatedExecOutput(0, 'ok', '')).toEqual({ exitCode: 0, stdout: 'ok', stderr: '' })
+    expect(() => validatedExecOutput(127, '', 'missing executable')).toThrow('command failed with exit 127: missing executable')
+  })
+
   it('normalizes an explicit dot cwd to the repository root without widening file scope', () => {
     const root = repository()
     const policy: WorkerPolicy = { root, checklist: join(root, 'tasks.task.md'), allowed: [join(root, 'prisma', 'schemas')] }
@@ -59,7 +64,10 @@ describe('worker commit capability', () => {
     expect(resolveExecCwd(policy, '.')).toBe(root)
     expect(resolveExecCwd(policy, './')).toBe(root)
     expect(resolveExecCwd(policy, 'prisma/schemas')).toBe(join(root, 'prisma', 'schemas'))
-    expect(() => resolveExecCwd(policy, 'prisma')).toThrow('outside this task scope')
+    expect(resolveExecCwd(policy, 'prisma')).toBe(join(root, 'prisma'))
+    expect(resolveAllowed(policy, '.gitignore', false)).toBe(join(root, '.gitignore'))
+    expect(() => resolveAllowed(policy, '.git', false)).toThrow('Git metadata is denied')
+    expect(() => resolveAllowed(policy, '.gitignore', true)).toThrow('outside this task write scope')
   })
 
   it('gives publication conflict workers exact file scope and no commit capability', async () => {
@@ -72,8 +80,8 @@ describe('worker commit capability', () => {
       mode: 'publication-conflict',
     }
     expect(resolveAllowed(policy, 'prisma/schemas/auth.prisma', false)).toBe(exact)
-    expect(() => resolveAllowed(policy, 'prisma/schemas', false)).toThrow('outside this task scope')
-    expect(() => resolveAllowed(policy, 'prisma/schemas/nested.prisma', true)).toThrow('outside this task scope')
+    expect(() => resolveAllowed(policy, 'prisma/schemas', false)).toThrow('outside this task write scope')
+    expect(() => resolveAllowed(policy, 'prisma/schemas/nested.prisma', true)).toThrow('outside this task write scope')
     expect(() => resolveAllowed(policy, 'tasks.task.md', false)).toThrow('controlling checklist is denied')
     await expect(commitTaskChanges(policy, 'fix: forbidden conflict commit', runner(root))).rejects.toThrow('cannot commit')
   })
@@ -81,7 +89,7 @@ describe('worker commit capability', () => {
   it('registers only edit tools in publication conflict mode', () => {
     const root = repository()
     expect(registeredTools(root, 'publication-conflict')).toEqual(['leppy_read', 'leppy_write', 'leppy_delete'])
-    expect(registeredTools(root, 'task')).toEqual(['leppy_read', 'leppy_commit', 'leppy_write', 'leppy_exec'])
+    expect(registeredTools(root, 'task')).toEqual(['leppy_read', 'leppy_search', 'leppy_edit', 'leppy_commit', 'leppy_write', 'leppy_exec'])
   })
 
   it('force-adds only changed ignored files inside the declared task scope', async () => {

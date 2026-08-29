@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { isAbsolute, relative, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
@@ -8,15 +10,18 @@ import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-credentials'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
+import { BUNDLED_SKILL_RANK, type SkillCandidate, type SkillDefinition, type SkillProvider } from '@deepseek-ai/dsh-skill'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { inspectAuthenticatedControllers, selectControllerForStatus } from './controller-auth.js'
 import type { AuthenticatedController } from './controller-auth.js'
 import { resolveRepoRoot } from './git.js'
+import { appendLifecycleAuthorityReceipt, lifecycleStateDir } from './lifecycle-authority.js'
 import { harnessRunDependencies } from './harness-runtime.js'
 import { HumanGrantStore } from './human-grant.js'
 import type { RecoveryAuthority } from './human-grant.js'
 import { runLeppyLoop } from './runner.js'
-import type { LeppyLoopOptions, RunDependencies, RunProgress, RunResult, WorkerPolicy } from './types.js'
+import { DIRECT_HUMAN_STOP_REASON } from './types.js'
+import type { LeppyLoopOptions, LifecycleAuthority, RunDependencies, RunProgress, RunResult, WorkerPolicy } from './types.js'
 
 declare module '@deepseek-ai/dsh-commands/types' {
   interface CommandSourceMap {
@@ -36,25 +41,49 @@ const GRANT_MAX_REPAIR_CYCLES = 3
 const GRANT_MAX_TRANSITIONS = 16
 
 export const name = 'leppy-loop-command'
-export const inject = ['commands', 'tools', 'jobs', 'credentials', 'settings', 'llm', 'agentDefaultModel']
+export const inject = ['commands', 'tools', 'jobs', 'credentials', 'settings', 'llm', 'agentDefaultModel', 'skills']
 
 const LIFECYCLE_PROMPT = `The human invoked /leppy-loop and authorized one bounded Leppy lifecycle in this session and repository. The lifecycle permit survives controller transitions, so the human must not be asked to type separate continue, repair, or publish commands.
 
-Use leppy_loop_control for exactly one next transition now. Choose technical recovery and publication behavior from the authenticated controller state and the human's conversation. The permit authorizes branch push and pull-request creation unless the Host says it is local-only; it never authorizes merge, deployment, scope widening, or another run. For a new run, resolve the tracked checklist and authoritative Git base. For an existing run, use only the exact Host-provided run/checklist/base facts. You may set publicationTarget only to a live replacement base justified by repository history when the original publication base was removed. Return after the background job starts. Never emulate the controller with shell/subagents or edit its worktree.`
+Use leppy_loop_control for exactly one next lifecycle transition now. Read-only status/preflight calls do not consume that transition. Always call operation=status before claiming that a controller job is running; only a returned live jobId proves that claim. Choose technical recovery and publication behavior from the authenticated controller state and the human's conversation. The permit authorizes branch push and pull-request creation unless the Host says it is local-only; it never authorizes merge, deployment, scope widening, or another run. For a new run, resolve the tracked checklist and authoritative Git base, call operation=preflight, and start only after it returns ready. You may correct only explicit path/Done metadata in the tracked source checklist to resolve reported preflight diagnostics, then rerun preflight. For an existing run, use only the exact Host-provided run/checklist/base facts and never edit its controller. You may set publicationTarget only to a live replacement base justified by repository history when the original publication base was removed. Return after the background job starts. Never emulate the controller with shell, subagents, generic background jobs, or direct worktree edits. Never invent or remember a leppy-loop-* job id across turns.`
+
+const SKILL_PROVIDER_NAME = 'leppy-loop'
+const SKILL_BODY_URL = new URL('../skills/leppy-loop/SKILL.md', import.meta.url)
+const SKILL_RESOURCE_BASE = { kind: 'directory', path: fileURLToPath(new URL('../skills/leppy-loop/', import.meta.url)) } as const
+const SKILL_CANDIDATE: SkillCandidate = {
+  name: 'leppy-loop',
+  description: 'Operate one bounded Leppy Loop lifecycle from natural language. Use for /leppy-loop, Leppy status/continue/repair/publication, or an existing Leppy task card.',
+  invocation: { modelInvocable: true, userInvocable: true },
+  provider: SKILL_PROVIDER_NAME,
+  source: 'bundled',
+  resourceBase: SKILL_RESOURCE_BASE,
+  rank: BUNDLED_SKILL_RANK,
+  locator: SKILL_BODY_URL,
+}
+const skillProvider: SkillProvider = {
+  name: SKILL_PROVIDER_NAME,
+  list: () => Promise.resolve([SKILL_CANDIDATE]),
+  async get(): Promise<SkillDefinition> {
+    return { ...SKILL_CANDIDATE, content: await readFile(SKILL_BODY_URL, 'utf8') }
+  },
+}
 
 export interface LeppyLoopCommandHooks {
   run?: (options: LeppyLoopOptions, dependencies: RunDependencies) => Promise<RunResult>
   dependencies?: (ctx: Context, signal: AbortSignal) => RunDependencies
   inspectControllers?: (cwd: string) => Promise<AuthenticatedController[]>
+  persistAuthority?: (repoRoot: string, runId: string, authority: LifecycleAuthority) => Promise<void>
 }
 
 export interface LeppyLoopControlArguments {
-  operation: 'start' | 'continue' | 'status' | 'stop'
+  operation: 'preflight' | 'start' | 'continue' | 'status' | 'stop'
   tasks?: string
   syncBranch?: string
   runId?: string
   taskMatch?: string
   recovery?: 'resume' | 'retry-gate' | 'repair-gate'
+  /** Internal direct-human status path; never exposed in the model schema. */
+  internalHumanStatus?: boolean
   publish?: boolean
   publicationTarget?: string
   fetch?: boolean
@@ -170,6 +199,11 @@ function recoveryOf(args: LeppyLoopControlArguments): RecoveryAuthority {
   return 'none'
 }
 
+function visibleControllers(agent: Agent, controllers: readonly AuthenticatedController[], allowLegacy: boolean): AuthenticatedController[] {
+  return controllers.filter(controller => controller.lifecycleAuthority?.sessionId === String(agent.id)
+    || (allowLegacy && controller.lifecycleAuthority === undefined))
+}
+
 async function authenticatedController(runtime: LeppyLoopRuntime, cwd: string, runId: string): Promise<AuthenticatedController> {
   const controllers = await (runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers)(cwd)
   const controller = controllers.find(candidate => candidate.runId === runId)
@@ -189,6 +223,20 @@ function validateTechnicalArguments(
   if (controller) {
     if (resolve(cwd, tasks) !== resolve(repoRoot, controller.checklistRelative)) throw new Error('tool checklist does not match the human-authorized run')
     if (syncBranch !== controller.syncBranch) throw new Error('tool base does not match the human-authorized run')
+  }
+}
+
+async function persistLifecycleAuthority(runtime: LeppyLoopRuntime, repoRoot: string, runId: string, authority: LifecycleAuthority): Promise<void> {
+  if (runtime.hooks.persistAuthority) await runtime.hooks.persistAuthority(repoRoot, runId, authority)
+  else appendLifecycleAuthorityReceipt(await lifecycleStateDir(repoRoot, runId), runId, authority)
+}
+
+function lifecycleAuthority(grant: ReturnType<HumanGrantStore['reserve']>['grant']): LifecycleAuthority {
+  return {
+    sessionId: grant.sessionId, allowPublication: grant.allowPublication, maxIterations: grant.maxIterations,
+    maxRepairCycles: grant.maxRepairCycles, maxTransitions: grant.maxTransitions, transitions: grant.transitions,
+    issuedAt: grant.issuedAt, expiresAt: grant.expiresAt,
+    ...(grant.revokedAt === undefined ? {} : { revokedAt: grant.revokedAt }),
   }
 }
 
@@ -218,6 +266,7 @@ function controllerOptions(
     ...(args.publish === true ? { publicationRepairCycles: grant.maxRepairCycles } : {}),
     ...(args.publicationTarget ? { publicationTarget: args.publicationTarget } : {}),
     repoRoot,
+    lifecycleAuthority: lifecycleAuthority(grant),
   }
   if (args.operation === 'continue') {
     options.recoverExistingWip = true
@@ -263,7 +312,7 @@ async function scheduleLifecycleFollowup(runtime: LeppyLoopRuntime, agent: Agent
         runtime.grants.close(agent, repoRoot, runId)
         return
       }
-      const recoverable = controller.status === 'stalled' || controller.status === 'interrupted'
+      const recoverable = (controller.status === 'stalled' || controller.status === 'interrupted') && controller.autoRecoveryBlocked !== true
       const publicationDecision = controller.status === 'completed' && permit.allowPublication
       if ((!recoverable && !publicationDecision) || controller.openTask?.kind === 'human') return
       const intent: HumanIntent = {
@@ -365,17 +414,42 @@ export async function executeLeppyLoopControl(
         } : {}),
       }
     }
-    const controllers = await inspect(cwd)
+    const controllers = visibleControllers(agent, await inspect(cwd), args.internalHumanStatus === true)
     const selected = args.runId
       ? controllers.find(candidate => candidate.runId === args.runId)
       : selectControllerForStatus(controllers)
+    const durableStatus = selected?.status === 'running' ? 'orphaned' : selected?.status
+    const durableDetail = selected?.status === 'running'
+      ? 'Durable controller state says running, but no session-owned Host job exists. Recover with operation=continue; do not claim a background job is active.'
+      : selected?.detail
     return selected ? {
-      operation: 'status', status: selected.status, runId: selected.runId,
+      operation: 'status', status: durableStatus!, runId: selected.runId,
       completedTasks: selected.completedTasks, attempt: selected.attempt, branch: selected.branch,
-      ...(selected.detail ? { detail: selected.detail } : {}),
+      ...(durableDetail ? { detail: durableDetail } : {}),
       ...(selected.currentTask === undefined ? {} : { currentTask: selected.currentTask }),
       ...(selected.openTask ? { task: selected.openTask.text } : {}),
     } : { operation: 'status', status: 'not-found' }
+  }
+
+  if (args.operation === 'preflight') {
+    validateTechnicalArguments(args, cwd, repoRoot)
+    const signal = runtime.lifetime.signal
+    const dependencies = runtime.hooks.dependencies?.(ctx, signal) ?? harnessRunDependencies(ctx, signal)
+    const result = await (runtime.hooks.run ?? runLeppyLoop)({
+      tasks: requireString(args.tasks, 'tasks'), syncBranch: requireString(args.syncBranch, 'syncBranch'),
+      dryRun: true, fetch: args.fetch !== false, repoRoot,
+      ...(args.taskMatch ? { taskMatch: args.taskMatch } : {}),
+      ...(args.workerPolicy ? { workerPolicy: args.workerPolicy } : {}),
+    }, dependencies)
+    const invalid = result.diagnostics.some(item => item.severity === 'error')
+    return {
+      operation: 'preflight', status: invalid ? 'invalid' : 'ready', runId: result.runId,
+      detail: result.diagnostics.length > 0
+        ? result.diagnostics.map(item => `${item.line ?? '-'} ${item.code}: ${item.message}`).join('\n')
+        : 'Checklist, canonical scopes, model selection, and authoritative base passed preflight.',
+      ...(result.preview?.selectedLine ? { task: result.preview.selectedLine } : {}),
+      ...(result.preview?.branch ? { branch: result.preview.branch } : {}),
+    }
   }
 
   const runId = args.operation === 'start'
@@ -388,23 +462,38 @@ export async function executeLeppyLoopControl(
   if (args.operation === 'stop' && (!record || record.runId !== runId)) throw new Error(`no active background controller job exists for run ${runId}`)
   validateTechnicalArguments(args, cwd, repoRoot, controller)
   if (args.operation === 'stop') {
+    const stopPermit = runtime.grants.permits(agent, repoRoot).find(permit => permit.runId === runId)
+    if (!stopPermit) throw new Error(`no live lifecycle authority exists for run ${runId}`)
+    await persistLifecycleAuthority(runtime, repoRoot, runId, { ...runtime.grants.authority(stopPermit), revokedAt: Date.now() })
     runtime.grants.close(agent, repoRoot, runId)
-    const outcome = ctx.jobs.kill(record!.id, agent, 'Stopped through direct human Leppy intent')
+    const outcome = ctx.jobs.kill(record!.id, agent, DIRECT_HUMAN_STOP_REASON)
     return { operation: 'stop', status: outcome === 'requested' ? 'stopping' : 'already-finished', runId, jobId: String(record!.id) }
   }
 
+  const livePermits = runtime.grants.permits(agent, repoRoot).filter(permit => permit.runId === runId)
+  if (args.operation === 'continue' && controller?.autoRecoveryBlocked === true
+    && !livePermits.some(permit => permit.reauthorizedAt > Date.parse(controller.updatedAt))) {
+    throw new Error('automatic recovery circuit is open; a fresh direct human /leppy-loop authorization is required before another unchanged attempt')
+  }
+  if (args.operation === 'continue' && controller?.lifecycleAuthority && livePermits.length === 0) {
+    runtime.grants.hydrate({ agent, repoRoot, runId, authority: controller.lifecycleAuthority })
+  }
   const reservation = runtime.grants.reserve({
     agent, repoRoot, runId, operation: args.operation, publishRemote: args.publish === true,
   })
   const options = controllerOptions(args, cwd, repoRoot, runId, reservation.grant, controller)
+  let authorityPersisted = false
   try {
+    await persistLifecycleAuthority(runtime, repoRoot, runId, options.lifecycleAuthority!)
+    authorityPersisted = true
     const jobId = startControllerJob(ctx, runtime, agent, options, repoRoot, runId, async () => {
       runtime.grants.settle(reservation)
       await scheduleLifecycleFollowup(runtime, agent, cwd, repoRoot, runId)
     })
     return { operation: args.operation, status: 'running', runId, jobId: String(jobId) }
   } catch (error) {
-    runtime.grants.restore(reservation)
+    if (authorityPersisted) runtime.grants.settle(reservation)
+    else runtime.grants.restore(reservation)
     throw error
   }
 }
@@ -446,6 +535,7 @@ The Host authenticated and bound the lifecycle to these exact controller facts:
 - attempt: ${controller.attempt}
 - open row: ${controller.openTask?.text ?? 'none'}
 - durable detail: ${controller.detail ?? 'none'}
+- automatic recovery blocked: ${controller.autoRecoveryBlocked === true ? 'yes; do not loop without changed conditions or direct human intervention' : 'no'}
 - recorded PR: ${controller.pullRequestUrl ?? 'none'}
 ` : '\nNo authenticated controller exists yet. Resolve one tracked checklist and its authoritative Git base, then start exactly one new run.\n'
   return `${LIFECYCLE_PROMPT}
@@ -458,9 +548,9 @@ ${facts}`
 function toolDefinition(ctx: Context, runtime: LeppyLoopRuntime) {
   return defineTool({
     name: 'leppy_loop_control',
-    description: 'Private controller interface enabled by one direct human /leppy-loop lifecycle permit. Advance the same bounded run through start, recovery, repair, publication, status, or stop without asking for phase-specific slash commands.',
+    description: 'Durable Leppy controller interface. Use status before any availability claim; never infer a job id or use subagents/generic jobs. Start needs a fresh /leppy-loop permit; continue uses only the same session-bound persisted lifecycle authority.',
     parameters: {
-      operation: { type: 'string', enum: ['start', 'continue', 'status'], required: true },
+      operation: { type: 'string', enum: ['preflight', 'start', 'continue', 'status'], required: true },
       tasks: { type: 'string', description: 'Resolved tracked checklist path for start/continue.' },
       syncBranch: { type: 'string', description: 'Resolved authoritative Git base for start/continue.' },
       runId: { type: 'string', description: 'Exact authenticated run for continue/status/stop.' },
@@ -489,12 +579,6 @@ function toolDefinition(ctx: Context, runtime: LeppyLoopRuntime) {
   })
 }
 
-function ensureScopedTool(ctx: Context, runtime: LeppyLoopRuntime, agent: Agent): void {
-  if (runtime.registeredAgents.has(agent)) return
-  agent.ctx.tools.register(toolDefinition(ctx, runtime))
-  runtime.registeredAgents.add(agent)
-}
-
 /** Execute the simple human command; long-running work always transfers to ctx.jobs. */
 export async function executeLeppyLoopCommand(
   ctx: Context,
@@ -507,7 +591,7 @@ export async function executeLeppyLoopCommand(
     const repoRoot = resolve(await resolveRepoRoot(cwd, invocation.signal))
     const intent = parseHumanIntent(invocation.rawInput)
     if (intent.mode === 'status') {
-      const value = await executeLeppyLoopControl(ctx, runtime, invocation.agent, { operation: 'status' })
+      const value = await executeLeppyLoopControl(ctx, runtime, invocation.agent, { operation: 'status', internalHumanStatus: true })
       if (value.status === 'not-found') return { kind: 'error', text: 'No authenticated Leppy controller was found in this repository.' }
       const facts = [
         `run=${value.runId}`,
@@ -524,23 +608,30 @@ export async function executeLeppyLoopCommand(
     if (intent.mode === 'stop') {
       const record = liveJobRecord(ctx, runtime, invocation.agent, repoRoot)
       if (!record) return { kind: 'error', text: 'No active Leppy background controller was found in this session and repository.' }
-      ensureScopedTool(ctx, runtime, invocation.agent)
       const value = await executeLeppyLoopControl(ctx, runtime, invocation.agent, { operation: 'stop', runId: record.runId })
       return { kind: 'success', text: `Leppy Loop stop requested. run=${record.runId} | job=${value.jobId} | status=${value.status}` }
     }
 
-    const controllers = await (runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers)(cwd)
+    const controllers = visibleControllers(invocation.agent, await (runtime.hooks.inspectControllers ?? inspectAuthenticatedControllers)(cwd), true)
     const latest = selectControllerForStatus(controllers)
     const explicitlyNew = /\b(?:novo|nova|new|iniciar|start)\b/u.test(normalizeIntent(intent.naturalLanguage))
     const selected = explicitlyNew || (latest?.status === 'completed' && latest.pullRequestUrl) ? undefined : latest
-    runtime.grants.issue({
-      agent: invocation.agent, repoRoot, ...(selected ? { runId: selected.runId } : {}),
-      allowPublication: intent.allowPublication,
-      maxIterations: GRANT_MAX_ITERATIONS, maxRepairCycles: GRANT_MAX_REPAIR_CYCLES, maxTransitions: GRANT_MAX_TRANSITIONS,
-    })
-    ensureScopedTool(ctx, runtime, invocation.agent)
+    const grant = selected?.lifecycleAuthority
+      ? runtime.grants.reauthorize({
+          agent: invocation.agent, repoRoot, runId: selected.runId,
+          authority: selected.lifecycleAuthority, allowPublication: intent.allowPublication,
+        })
+      : runtime.grants.issue({
+          agent: invocation.agent, repoRoot, ...(selected ? { runId: selected.runId } : {}),
+          allowPublication: intent.allowPublication,
+          maxIterations: GRANT_MAX_ITERATIONS, maxRepairCycles: GRANT_MAX_REPAIR_CYCLES, maxTransitions: GRANT_MAX_TRANSITIONS,
+        })
+    if (selected?.lifecycleAuthority && grant.allowPublication !== selected.lifecycleAuthority.allowPublication) {
+      await persistLifecycleAuthority(runtime, repoRoot, selected.runId, runtime.grants.authority(grant))
+    }
+    const effectiveIntent = { ...intent, allowPublication: grant.allowPublication }
     invocation.agent.followup(createUserMessage({
-      content: [{ type: 'text', text: lifecyclePrompt(selected, intent) }],
+      content: [{ type: 'text', text: lifecyclePrompt(selected, effectiveIntent) }],
       source: { kind: 'plugin', plugin: name },
     }))
     return { kind: 'success', text: `Leppy Loop lifecycle authorized${selected ? ` for run ${selected.runId}` : ' for one new run'}. The AI will manage bounded continuation, repair, and publication without more phase commands.` }
@@ -555,6 +646,8 @@ export function apply(ctx: Context): void {
   const runtime: LeppyLoopRuntime = {
     grants: new HumanGrantStore(), jobs: [], activeRepositories: new Set(), registeredAgents: new WeakSet(), lifetime: new AbortController(), hooks: {},
   }
+  ctx.tools.register(toolDefinition(ctx, runtime))
+  ctx.skills.registerProvider(() => skillProvider)
   ctx.commands.register({
     name: 'leppy-loop',
     description: 'authorize one bounded Leppy lifecycle from natural-language intent',

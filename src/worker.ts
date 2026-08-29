@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -6,6 +7,7 @@ import type { HarnessNotification } from '@deepseek-ai/dsh-sdk-client'
 import type { WorkerAdapter, WorkerOutcome, WorkerRequest } from './types.js'
 import { createLeaseKey } from './state.js'
 import { redact, scrubEnvironment } from './security.js'
+import { parseWorkerReport, renderWorkerOutcomeContract } from './worker-report.js'
 
 export interface WorkerCredential {
   envName?: string
@@ -19,12 +21,81 @@ export interface HarnessWorkerAdapterOptions {
   workerConfigPath?: string
   /** Non-secret runtime facts for deterministic/keyless test compositions. */
   runtimeEnv?: NodeJS.ProcessEnv
+  /** Stop a worker turn after this many identical failed tool calls. */
+  identicalToolFailureLimit?: number
+  /** Stop a worker turn after this many failed tool calls in total, even when arguments differ. */
+  toolFailureBudget?: number
 }
 
 function byteLength(value: string): number { return Buffer.byteLength(value, 'utf8') }
 
 function nestedRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' ? value as Record<string, unknown> : undefined
+}
+
+function nestedTexts(value: unknown, out: string[] = []): string[] {
+  if (Array.isArray(value)) {
+    for (const child of value) nestedTexts(child, out)
+  } else if (value && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'text' && typeof child === 'string') out.push(child)
+      else nestedTexts(child, out)
+    }
+  }
+  return out
+}
+
+function nestedTrue(value: unknown, key: string): boolean {
+  if (Array.isArray(value)) return value.some(child => nestedTrue(child, key))
+  if (!value || typeof value !== 'object') return false
+  return Object.entries(value).some(([childKey, child]) => (childKey === key && child === true) || nestedTrue(child, key))
+}
+
+/** Bounds deterministic tool thrashing inside one Harness turn before the runner regains control. */
+export class WorkerToolFailureCircuitBreaker {
+  private readonly calls = new Map<string, { name: string; arguments: string }>()
+  private readonly signatures = new Map<string, number>()
+  private failures = 0
+
+  constructor(private readonly identicalLimit = 3, private readonly totalBudget = 8) {
+    if (!Number.isSafeInteger(identicalLimit) || identicalLimit < 2 || identicalLimit > 10) throw new Error('identical tool failure limit must be an integer from 2 to 10')
+    if (!Number.isSafeInteger(totalBudget) || totalBudget < identicalLimit || totalBudget > 32) throw new Error('tool failure budget must be an integer from identical limit to 32')
+  }
+
+  observe(notification: unknown): string | undefined {
+    const envelope = nestedRecord(notification)
+    if (envelope?.method !== 'session.event') return undefined
+    const event = nestedRecord(nestedRecord(envelope.params)?.event)
+    const data = nestedRecord(event?.data)
+    if (event?.type === 'tool/call' && typeof data?.callId === 'string' && typeof data.name === 'string') {
+      this.calls.set(data.callId, { name: data.name, arguments: typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments ?? null) })
+      return undefined
+    }
+    if (event?.type !== 'tool/result') return undefined
+    const callId = nestedRecord(nestedRecord(data?.message)?.source)?.callId
+    if (typeof callId !== 'string') return undefined
+    const call = this.calls.get(callId)
+    if (!call) return undefined
+    const texts = nestedTexts(data?.message)
+    const execFailure = texts.map(text => {
+      try {
+        const parsed = JSON.parse(text) as { exitCode?: unknown; stderr?: unknown }
+        return typeof parsed.exitCode === 'number' && parsed.exitCode !== 0
+          ? { code: `exit-${parsed.exitCode}`, detail: typeof parsed.stderr === 'string' && parsed.stderr.trim() ? parsed.stderr.trim() : text }
+          : undefined
+      } catch { return undefined }
+    }).find(Boolean)
+    if (!nestedTrue(data?.message, 'isError') && !execFailure) return undefined
+    const detail = (execFailure?.detail ?? texts.join('\n') ?? 'tool error').replace(/\bline \d+\b/giu, 'line #').slice(0, 2_048)
+    const code = execFailure?.code ?? 'tool-error'
+    const signature = createHash('sha256').update([call.name, call.arguments, code, detail].join('\0')).digest('hex')
+    const count = (this.signatures.get(signature) ?? 0) + 1
+    this.signatures.set(signature, count)
+    this.failures += 1
+    if (count >= this.identicalLimit) return `repeated deterministic tool failure: ${call.name} (${code}) repeated ${count} times: ${detail}`
+    if (this.failures >= this.totalBudget) return `worker tool failure budget exhausted after ${this.failures} failures; last=${call.name} (${code}): ${detail}`
+    return undefined
+  }
 }
 
 /** Extract an Agent failure because SDK run() may resolve after a terminal error notification. */
@@ -121,6 +192,7 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
       model: request.model,
     })
     const notifications: string[] = []
+    const failureCircuit = new WorkerToolFailureCircuitBreaker(this.options.identicalToolFailureLimit ?? 3, this.options.toolFailureBudget ?? 8)
     let transcriptBytes = 0
     let overflow: WorkerOutcome['status'] | undefined
     let runtimeFailure: string | undefined
@@ -131,6 +203,11 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
       const result = await harness.run(prompt, { onNotification(notification: HarnessNotification) {
         const failure = workerFailureFromNotification(notification)
         if (failure && !runtimeFailure) runtimeFailure = redact(failure, secrets)
+        const toolFailure = failureCircuit.observe(notification)
+        if (toolFailure && !runtimeFailure) {
+          runtimeFailure = redact(toolFailure, secrets)
+          void harness.close()
+        }
         if (overflow) return
         const line = `${JSON.stringify(redact(notification, secrets))}\n`
         transcriptBytes += byteLength(line)
@@ -143,9 +220,16 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
       writeFileSync(transcriptPath, notifications.join(''), 'utf8')
       if (overflow) return { status: overflow, output, transcriptPath }
       if (runtimeFailure) return { status: workerStatusForFailure(runtimeFailure), output, transcriptPath, error: runtimeFailure }
-      return { status: 'completed', output, transcriptPath }
+      try {
+        const report = parseWorkerReport(output)
+        if (report.status !== 'completed') return { status: report.status, output, transcriptPath, report, error: report.summary }
+        return { status: 'completed', output, transcriptPath, report }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { status: 'failed', output, transcriptPath, error: message }
+      }
     } catch (error) {
-      const message = redact(error instanceof Error ? error.message : String(error), secrets)
+      const message = runtimeFailure ?? redact(error instanceof Error ? error.message : String(error), secrets)
       writeFileSync(transcriptPath, notifications.join(''), 'utf8')
       if (overflow) return { status: overflow, output: '', transcriptPath, error: message }
       if (signal.aborted) return { status: 'interrupted', output: '', transcriptPath, error: message }
@@ -164,16 +248,19 @@ function workerPrompt(request: WorkerRequest): string {
     `You are one ephemeral Leppy Loop worker for a ${publicationConflict ? 'publication conflict resolution' : kind}.`,
     `Execute only this line: ${request.task.raw}`,
     request.task.metadata.done ? `Done contract: ${request.task.metadata.done}` : 'Closure contract: inspect the completed phase and correct only defects inside scope.',
-    `Allowed repo-relative paths: ${request.allowedPaths.map(path => JSON.stringify(path)).join(', ')}`,
+    `Writable repo-relative paths: ${request.allowedPaths.map(path => JSON.stringify(path)).join(', ')}`,
+    `Runtime platform: ${process.platform}.`,
     publicationConflict
       ? 'Use only the provided leppy_read, leppy_write, and leppy_delete tools. Every allowed path is exact; no directory descendants are authorized.'
-      : 'Use only the provided leppy_read, leppy_write, leppy_exec, and leppy_commit tools.',
-    'Never read or edit the controlling checklist. Never push, publish, deploy, mutate PRs, fetch, merge, rebase, or manage worktrees.',
+      : 'Use only the provided leppy_read, leppy_write, leppy_edit, leppy_search, leppy_exec, and leppy_commit tools. Use leppy_search instead of rg/grep/find, leppy_edit instead of patches, and never invoke a shell command string.',
+    'Never read or edit the controlling checklist. Never push, publish, deploy, mutate PRs, fetch, merge, rebase, or manage worktrees. Never use git apply, restore, reset, clean, add, commit, or checkout through leppy_exec.',
     publicationConflict
       ? 'Resolve the exact files and finish without staging or committing. The authenticated controller exclusively owns the Git index and rebase continuation.'
       : request.task.kind === 'task'
         ? 'Finish with exactly one conventional commit through leppy_commit and a clean working tree.'
         : 'If correction is needed, make at most one conventional commit and leave a clean tree. If no correction is needed, make no commit.',
     ...request.instructions,
+    'Applicable project instructions have already been injected above. Do not try to re-read CLAUDE.md, AGENTS.md, or instruction files unless an explicit writable path also authorizes them.',
+    ...renderWorkerOutcomeContract(publicationConflict ? 'publication-conflict' : request.task.kind === 'closure' ? 'closure' : 'task'),
   ].join('\n')
 }

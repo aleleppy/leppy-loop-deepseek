@@ -2,7 +2,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { HarnessWorkerAdapter, workerFailureFromNotification, workerStatusForFailure } from '../src/worker.js'
+import { HarnessWorkerAdapter, WorkerToolFailureCircuitBreaker, workerFailureFromNotification, workerStatusForFailure } from '../src/worker.js'
 import type { WorkerRequest } from '../src/types.js'
 
 function request(stateDir: string): WorkerRequest {
@@ -63,6 +63,46 @@ describe('Harness worker cancellation', () => {
   it('ignores successful and unrelated SDK notifications', () => {
     expect(workerFailureFromNotification({ method: 'session.event', params: { event: { type: 'turn/end', data: { reason: { kind: 'completed' } } } } })).toBeUndefined()
     expect(workerFailureFromNotification({ method: 'session.status', params: { status: 'idle' } })).toBeUndefined()
+  })
+
+  it('opens the circuit on the third identical failed tool call', () => {
+    const circuit = new WorkerToolFailureCircuitBreaker(3, 8)
+    const observe = (callId: string): string | undefined => {
+      expect(circuit.observe({ method: 'session.event', params: { event: { type: 'tool/call', data: { callId, name: 'leppy_search', arguments: '{"pattern":"x"}' } } } })).toBeUndefined()
+      return circuit.observe({
+        method: 'session.event',
+        params: { event: { type: 'tool/result', data: { message: { source: { callId }, content: [{ content: [{ isError: true, content: [{ type: 'text', text: 'Error: search unavailable' }] }] }] } } } },
+      })
+    }
+    expect(observe('one')).toBeUndefined()
+    expect(observe('two')).toBeUndefined()
+    expect(observe('three')).toContain('repeated deterministic tool failure: leppy_search')
+  })
+
+  it('keeps distinct failures separate and enforces a total failure budget', () => {
+    const circuit = new WorkerToolFailureCircuitBreaker(3, 4)
+    const fail = (index: number): string | undefined => {
+      const callId = `call-${index}`
+      circuit.observe({ method: 'session.event', params: { event: { type: 'tool/call', data: { callId, name: 'leppy_exec', arguments: JSON.stringify({ command: `missing-${index}` }) } } } })
+      return circuit.observe({
+        method: 'session.event',
+        params: {
+          event: {
+            type: 'tool/result',
+            data: {
+              message: {
+                source: { callId },
+                content: [{ content: [{ content: [{ type: 'text', text: JSON.stringify({ exitCode: 127, stderr: `missing-${index}` }) }] }] }],
+              },
+            },
+          },
+        },
+      })
+    }
+    expect(fail(1)).toBeUndefined()
+    expect(fail(2)).toBeUndefined()
+    expect(fail(3)).toBeUndefined()
+    expect(fail(4)).toContain('failure budget exhausted')
   })
 
   it('rejects a pre-aborted signal before requesting credentials', async () => {

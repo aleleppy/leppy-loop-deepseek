@@ -3,6 +3,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandDefinition, CommandInvocation } from '@deepseek-ai/dsh-commands'
 import type { JobHooks, JobId, JobStart } from '@deepseek-ai/dsh-jobs'
+import type { SkillProvider } from '@deepseek-ai/dsh-skill'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { describe, expect, it, vi } from 'vitest'
 import {
@@ -13,7 +14,7 @@ import type { AuthenticatedController } from '../src/controller-auth.js'
 import { HumanGrantStore } from '../src/human-grant.js'
 import { parseLeppyLoopCommandInput, tokenizeLeppyLoopCommandInput } from '../src/options.js'
 import type { LeppyLoopRuntime } from '../src/command.js'
-import type { LeppyLoopOptions, RunProgress, RunResult } from '../src/types.js'
+import type { LeppyLoopOptions, LifecycleAuthority, RunProgress, RunResult } from '../src/types.js'
 
 const cwd = process.cwd()
 
@@ -75,7 +76,7 @@ function context(jobs = new FakeJobs()): Context {
 
 function runtime(hooks: LeppyLoopRuntime['hooks'] = {}): LeppyLoopRuntime {
   return {
-    grants: new HumanGrantStore(), jobs: [], activeRepositories: new Set(), registeredAgents: new WeakSet(), lifetime: new AbortController(), hooks,
+    grants: new HumanGrantStore(), jobs: [], activeRepositories: new Set(), registeredAgents: new WeakSet(), lifetime: new AbortController(), hooks: { persistAuthority: async () => {}, ...hooks },
   }
 }
 
@@ -121,17 +122,25 @@ describe('chat task progress', () => {
 })
 
 describe('simple human slash surface', () => {
-  it('registers only the simple command globally and creates the private tool in agent scope', async () => {
+  it('registers the slash command, durable controller tool and native lifecycle skill globally', async () => {
     let definition: CommandDefinition | undefined
     let globalTool: ToolDefinition | undefined
+    let skillProvider: SkillProvider | undefined
     const ctx = {
       commands: { register: (value: CommandDefinition) => { definition = value; return () => {} } },
       tools: { register: (value: ToolDefinition) => { globalTool = value; return () => {} } },
+      skills: { registerProvider: (factory: () => SkillProvider) => { skillProvider = factory(); return () => {} } },
       effect: (setup: () => (() => void)) => setup(),
     } as unknown as Context
     apply(ctx)
     expect(definition?.input).toEqual({ hint: '[natural-language intent|status|parar]' })
-    expect(globalTool).toBeUndefined()
+    expect(globalTool?.name).toBe('leppy_loop_control')
+    const candidates = await skillProvider!.list({})
+    expect(Array.isArray(candidates)).toBe(true)
+    if (!Array.isArray(candidates)) throw new Error('expected static skill candidates')
+    expect(candidates).toMatchObject([{ name: 'leppy-loop', invocation: { modelInvocable: true, userInvocable: true } }])
+    const skill = await skillProvider!.get(candidates[0]!, {})
+    expect(skill?.content).toContain('Never invent, remember, or pass a `leppy-loop-*` job ID')
 
     const messages: unknown[] = []
     const owner = agent('scope-agent', message => { messages.push(message) })
@@ -139,10 +148,8 @@ describe('simple human slash surface', () => {
     expect(result).toMatchObject({ kind: 'success', text: expect.stringContaining('lifecycle authorized') })
     expect(messages).toHaveLength(1)
     const register = owner.ctx.tools.register as ReturnType<typeof vi.fn>
-    expect(register).toHaveBeenCalledOnce()
-    const scopedTool = register.mock.calls[0]![0] as ToolDefinition
-    expect(scopedTool.name).toBe('leppy_loop_control')
-    const toolProperties = (scopedTool.parameters as { properties: Record<string, { enum?: string[] }> }).properties
+    expect(register).not.toHaveBeenCalled()
+    const toolProperties = (globalTool!.parameters as { properties: Record<string, { enum?: string[] }> }).properties
     expect(toolProperties).not.toHaveProperty('phaseGateCommand')
     expect(toolProperties).not.toHaveProperty('repairPaths')
     expect(toolProperties).not.toHaveProperty('repairCycles')
@@ -241,15 +248,107 @@ describe('simple human slash surface', () => {
       expect(followup).toHaveBeenCalledOnce()
     }
   }, 30_000)
+
+  it('persists a direct-human publication downgrade before acknowledging or enqueueing followup', async () => {
+    const order: string[] = []
+    const owner = agent('downgrade-owner', () => { order.push('followup') })
+    const durable = controller({
+      lifecycleAuthority: {
+        sessionId: 'downgrade-owner', allowPublication: true, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 2, issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    let persisted: LifecycleAuthority | undefined
+    const rt = runtime({
+      inspectControllers: async () => [durable],
+      persistAuthority: async (_repo, _runId, authority) => { persisted = authority; order.push('persist') },
+    })
+    await expect(executeLeppyLoopCommand(context(), invocation(owner, 'continuar localmente, nao publicar'), rt)).resolves.toMatchObject({ kind: 'success' })
+    expect(order).toEqual(['persist', 'followup'])
+    expect(persisted).toMatchObject({ allowPublication: false, transitions: 2, issuedAt: durable.lifecycleAuthority!.issuedAt })
+  })
 })
 
 describe('grant-validated background controller tool', () => {
+  it('runs read-only checklist preflight without consuming a lifecycle permit or creating a job', async () => {
+    const owner = agent('preflight-agent')
+    let observed: LeppyLoopOptions | undefined
+    const jobs = new FakeJobs()
+    const value = await executeLeppyLoopControl(context(jobs), runtime({
+      run: async options => {
+        observed = options
+        return {
+          runId: 'preview-run', status: 'dry-run', completedTasks: 0,
+          diagnostics: [{ severity: 'error', code: 'unsupported-path-syntax', message: 'extension-only fragments are not paths', line: 4 }],
+        }
+      },
+    }), owner, { operation: 'preflight', tasks: 'examples/feature.task.md', syncBranch: 'origin/plugins' })
+    expect(value).toMatchObject({ operation: 'preflight', status: 'invalid', detail: expect.stringContaining('unsupported-path-syntax') })
+    expect(observed).toMatchObject({ dryRun: true, repoRoot: cwd })
+    expect(jobs.starts).toHaveLength(0)
+  })
+
+  it('reports a durable running controller as orphaned when no owned Host job exists', async () => {
+    const owner = agent('session-a')
+    const value = await executeLeppyLoopControl(context(), runtime({
+      inspectControllers: async () => [controller({
+        status: 'running',
+        lifecycleAuthority: {
+          sessionId: 'session-a', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+          maxTransitions: 16, transitions: 1, issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
+        },
+      })],
+    }), owner, { operation: 'status', runId: '44c85fb806c6' })
+    expect(value).toMatchObject({ status: 'orphaned', runId: '44c85fb806c6', detail: expect.stringContaining('no session-owned Host job') })
+    expect(value).not.toHaveProperty('jobId')
+  })
+
+  it('does not expose another session durable controller through global status', async () => {
+    const owner = agent('session-a')
+    const foreign = controller({
+      runId: 'foreign-run', detail: 'private failure detail',
+      lifecycleAuthority: {
+        sessionId: 'session-b', allowPublication: true, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 4, issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const rt = runtime({ inspectControllers: async () => [foreign] })
+    await expect(executeLeppyLoopControl(context(), rt, owner, { operation: 'status' })).resolves.toEqual({ operation: 'status', status: 'not-found' })
+    await expect(executeLeppyLoopControl(context(), rt, owner, { operation: 'status', runId: foreign.runId })).resolves.toEqual({ operation: 'status', status: 'not-found' })
+  })
+
+  it('hydrates the same session-bound lifecycle permit and continues after a Host restart', async () => {
+    const owner = agent('session-a')
+    const durable = controller({
+      lifecycleAuthority: {
+        sessionId: 'session-a', allowPublication: true, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 1, issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    let observed: LeppyLoopOptions | undefined
+    const jobs = new FakeJobs()
+    const rt = runtime({
+      inspectControllers: async () => [durable],
+      run: async options => { observed = options; return { ...completed, runId: durable.runId } },
+    })
+    const value = await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: durable.runId, tasks: durable.checklistRelative, syncBranch: durable.syncBranch,
+    })
+    expect(value).toMatchObject({ status: 'running', runId: durable.runId, jobId: 'leppy-loop-1' })
+    expect(observed?.lifecycleAuthority).toMatchObject({ sessionId: 'session-a', transitions: 2, allowPublication: true })
+    await expect(jobs.starts[0]!.hooks.done).resolves.toMatchObject({ status: 'completed' })
+  })
+
   it('starts a jobs-owned controller immediately without awaiting its promise', async () => {
     const owner = agent('background-agent')
     const jobs = new FakeJobs()
     let settle!: (result: RunResult) => void
     const run = new Promise<RunResult>(resolveRun => { settle = resolveRun })
-    const rt = runtime({ run: async () => await run })
+    const order: string[] = []
+    const rt = runtime({
+      persistAuthority: async (_repo, _runId, authority) => { order.push(`persist-${authority.transitions}`) },
+      run: async () => { order.push('run'); return await run },
+    })
     issueGrant(rt, owner)
 
     const value = await executeLeppyLoopControl(context(jobs), rt, owner, {
@@ -257,6 +356,7 @@ describe('grant-validated background controller tool', () => {
     })
     expect(value).toMatchObject({ status: 'running', jobId: 'leppy-loop-1' })
     expect(jobs.starts).toHaveLength(1)
+    expect(order).toEqual(['persist-1', 'run'])
     settle({ ...completed, runId: value.runId! })
     await expect(jobs.starts[0]!.hooks.done).resolves.toMatchObject({ status: 'completed' })
   })
@@ -284,6 +384,53 @@ describe('grant-validated background controller tool', () => {
     expect(jobs.starts).toHaveLength(2)
     expect(rt.grants.permits(owner, cwd)[0]?.transitions).toBe(2)
     expect(followup).toHaveBeenCalled()
+  })
+
+  it('does not auto-loop a controller whose durable failure circuit is open', async () => {
+    const followup = vi.fn()
+    const owner = agent('blocked-loop-agent', followup)
+    const jobs = new FakeJobs()
+    const rt = runtime({
+      inspectControllers: async () => [controller({ autoRecoveryBlocked: true, detail: 'scope missing', updatedAt: new Date(Date.now() - 1_000).toISOString() })],
+      run: async () => ({ runId: '44c85fb806c6', status: 'stalled', completedTasks: 5, diagnostics: [], detail: 'scope missing' }),
+    })
+    issueGrant(rt, owner, { runId: '44c85fb806c6' })
+    await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: '44c85fb806c6', tasks: 'examples/feature.task.md', syncBranch: 'origin/plugins', fetch: false,
+    })
+    await jobs.starts[0]!.hooks.done
+    await vi.waitFor(() => { expect(rt.grants.permits(owner, cwd)[0]?.inFlight).toBe(false) })
+    expect(followup).not.toHaveBeenCalled()
+  })
+
+  it('rejects old model authority at an open circuit and accepts fresh direct-human reauthorization without resetting its budget', async () => {
+    const owner = agent('circuit-owner')
+    const updatedAt = new Date(Date.now() - 1_000).toISOString()
+    const stalled = controller({
+      autoRecoveryBlocked: true, updatedAt,
+      lifecycleAuthority: {
+        sessionId: 'circuit-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 2, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const jobs = new FakeJobs()
+    let persisted: LifecycleAuthority | undefined
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      persistAuthority: async (_repo, _runId, authority) => { persisted = authority },
+      run: async () => ({ ...completed, runId: stalled.runId }),
+    })
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })).rejects.toThrow('fresh direct human /leppy-loop authorization is required')
+    expect(rt.grants.permits(owner, cwd)).toHaveLength(0)
+
+    await expect(executeLeppyLoopCommand(context(jobs), invocation(owner, 'continuar'), rt)).resolves.toMatchObject({ kind: 'success' })
+    const resumed = await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })
+    expect(resumed).toMatchObject({ status: 'running', runId: stalled.runId })
+    expect(persisted).toMatchObject({ transitions: 3, issuedAt: stalled.lifecycleAuthority!.issuedAt, allowPublication: false })
   })
 
   it('retries transient automatic follow-up handoff failures within the lifecycle', async () => {
@@ -420,8 +567,12 @@ describe('grant-validated background controller tool', () => {
   it('stops the owned background job through a one-shot stop grant', async () => {
     const owner = agent('stop-agent')
     const jobs = new FakeJobs()
+    const order: string[] = []
+    const originalKill = jobs.kill.bind(jobs)
+    jobs.kill = (...args) => { order.push('kill'); return originalKill(...args) }
     const rt = runtime({
       inspectControllers: async () => [controller()],
+      persistAuthority: async (_repo, _runId, authority) => { order.push(authority.revokedAt === undefined ? 'admission' : 'revocation') },
       run: async (_options, dependencies) => await new Promise<RunResult>(resolveRun => {
         dependencies.signal!.addEventListener('abort', () => resolveRun({
           runId: '44c85fb806c6', status: 'interrupted', completedTasks: 5, currentTask: 11, diagnostics: [],
@@ -434,6 +585,7 @@ describe('grant-validated background controller tool', () => {
     })
     const stopped = await executeLeppyLoopControl(context(jobs), rt, owner, { operation: 'stop', runId: '44c85fb806c6' })
     expect(stopped.status).toBe('stopping')
+    expect(order).toEqual(['admission', 'revocation', 'kill'])
     await expect(jobs.starts[0]!.hooks.done).resolves.toMatchObject({ status: 'killed' })
   })
 })

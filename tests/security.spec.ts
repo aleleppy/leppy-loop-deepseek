@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { fingerprint, redact, scrubEnvironment, validateArgv } from '../src/security.js'
 
@@ -20,9 +23,26 @@ describe('security boundary', () => {
     expect(() => validateArgv(command, args, process.cwd(), process.cwd())).toThrow()
   })
 
-  it('allows local test and commit argv and denies a fingerprinted gate', () => {
-    expect(() => validateArgv('pnpm', ['test', '--', 'focused'], process.cwd(), process.cwd())).not.toThrow()
-    expect(() => validateArgv('git', ['commit', '-m', 'fix: x'], process.cwd(), process.cwd())).toThrow(/leppy_commit/)
-    expect(() => validateArgv('node', ['script.js'], process.cwd(), process.cwd(), fingerprint(['node', 'script.js'].join('\0')))).toThrow(/gate/)
+  it('allows local tests, real repo-local PowerShell files and only read-only Git verbs', () => {
+    const root = mkdtempSync(join(tmpdir(), 'leppy-security-'))
+    mkdirSync(join(root, 'scripts'))
+    writeFileSync(join(root, 'scripts', 'focused.ps1'), 'exit 0\n')
+    expect(() => validateArgv('pnpm', ['test', '--', 'focused'], root, root)).not.toThrow()
+    expect(() => validateArgv('pwsh', ['-NoProfile', '-File', 'scripts/focused.ps1'], root, root)).not.toThrow()
+    for (const selector of ['-Com', '-Comm', '-Enc', '-EncodedCommand']) {
+      expect(() => validateArgv('powershell.exe', [selector, 'Write-Output bypass', '-File', 'scripts/focused.ps1'], root, root)).toThrow(/requires exact -File/)
+    }
+    expect(() => validateArgv('pwsh', ['-File', 'scripts/focused.ps1', '-File', 'scripts/focused.ps1'], root, root)).toThrow(/requires exact -File/)
+    expect(() => validateArgv('git', ['status', '--short'], root, root)).not.toThrow()
+    expect(() => validateArgv('git', ['show', 'HEAD:tasks/task.md'], root, root)).toThrow(/read-only/)
+    expect(() => validateArgv('git', ['grep', 'secret', '--', 'tasks/task.md'], root, root)).toThrow(/read-only/)
+    expect(() => validateArgv('git', ['commit', '-m', 'fix: x'], root, root)).toThrow(/leppy_commit/)
+    expect(() => validateArgv('git', ['apply', 'change.patch'], root, root)).toThrow(/read-only/)
+    expect(() => validateArgv('git', ['restore', '--', 'src'], root, root)).toThrow(/read-only/)
+    expect(() => validateArgv('git', ['diff', '--output=patch.txt'], root, root)).toThrow(/read-only/)
+    expect(() => validateArgv('git', ['diff', '--no-index', 'NUL', '..\\outside.txt'], root, root)).toThrow(/read-only/)
+    expect(() => validateArgv('git', ['log', '--ext-diff'], root, root)).toThrow(/read-only/)
+    expect(() => validateArgv('pwsh', ['-File', '..\\outside.ps1'], root, root)).toThrow(/denied/)
+    expect(() => validateArgv('node', ['script.js'], root, root, fingerprint(['node', 'script.js'].join('\0')))).toThrow(/gate/)
   })
 })

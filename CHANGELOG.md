@@ -2,6 +2,31 @@
 
 All notable changes are documented here.
 
+## [0.3.7] - 2026-08-28
+
+### Added
+
+- Workers must finish with a structured `LEPPY_OUTCOME` disposition. `completed` requires passed validation evidence; blocked, failed, missing, malformed, and contradictory reports stall with the controller row open.
+- New read-wide/write-scoped `leppy_search` and exact-text `leppy_edit` tools remove dependence on unavailable shell utilities and patches. Repo-local PowerShell `-File` scripts are supported on Windows.
+- A native model-invocable `leppy-loop` skill and read-only `preflight` operation document and enforce canonical checklist/base resolution before a worktree is created.
+
+### Changed
+
+- Checklist lint rejects extension fragments, brace/glob syntax, ambiguous inferred basenames, and tasks that require tests without a test-capable write scope.
+- Ordinary workers may read the worktree except for controlling/Git metadata, while every write and commit remains confined to declared task paths. Generic worker Git access is now a small positive metadata-only allowlist; content search goes through controller-excluding `leppy_search`, and mutation stays exclusive to `leppy_commit`. Nonzero argv exits are real tool errors.
+- Retry attempt state is atomically persisted before a replacement worker starts. Three identical tool failures or eight total tool failures stop one worker turn; blocked/unavailable/repeated failures open a durable automatic-recovery circuit instead of consuming lifecycle transitions repeatedly.
+
+### Fixed
+
+- Closure prose such as `BLOQUEADO` and tasks reporting failed validation can no longer be adopted merely because Git invariants look clean.
+- `leppy_loop_control` is always discoverable. Status reports a durable `running` controller with no session-owned Host job as `orphaned` and never returns or invents a stale job ID.
+- Same-session lifecycle authority uses HMAC receipts plus an authenticated required-marker and monotonic head. Admissions persist before job start, publication downgrades before slash acknowledgment, and Stop revocation before kill; missing/corrupt modern authority is quarantined instead of treated as legacy. Mutable `run.json` is never authority. Plain continuation uses the exact durable `runId`; subagents and generic job monitoring are forbidden.
+
+### Security
+
+- Start still requires a direct human `/leppy-loop` permit. Signed authority remains session/repository/run-bound, expires after 24 hours, retains publication and transition limits, allows only publication downgrade, and cannot authorize another run. Direct-human Stop revokes it; Stop is absent from the model tool schema.
+- Publication-conflict workers retain exact-path read/write/delete only; read widening and PowerShell execution apply only to ordinary task/closure workers.
+
 ## [0.3.6] - 2026-08-28
 
 ### Changed

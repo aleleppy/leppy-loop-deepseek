@@ -13,9 +13,11 @@ import { fingerprint, redact, scrubEnvironment } from './security.js'
 import { runFile, runOpaqueShell } from './process.js'
 import { physicalRelative } from './path.js'
 import { abortInterruptedPublicationRebase, isAuthenticatedPublicationRebase } from './publish.js'
+import { appendLifecycleAuthorityReceipt, inspectLifecycleAuthority } from './lifecycle-authority.js'
+import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import type {
-  ChecklistTask, LeppyLoopOptions, ModelCapability, RunDependencies, RunEvent,
-  PublicationConflict, RunEventType, RunProgress, RunResult, WorkerRequest,
+  ChecklistTask, LeppyLoopOptions, LifecycleAuthority, ModelCapability, RunDependencies, RunEvent,
+  PublicationConflict, RunEventType, RunProgress, RunResult, WorkerOutcome, WorkerRequest,
 } from './types.js'
 
 const DEFAULTS = {
@@ -57,6 +59,9 @@ interface RunState {
   publicationTargetCommit?: string
   publicationRemoteHead?: string
   lastError?: string
+  lifecycleAuthority?: LifecycleAuthority
+  failureStreak?: { taskKey: string; signature: string; count: number }
+  autoRecoveryBlocked?: boolean
   updatedAt: string
 }
 
@@ -72,6 +77,26 @@ function nextTaskAttempt(state: RunState, task: ChecklistTask): number {
 }
 function currentTaskAttempt(state: RunState, task: ChecklistTask): number {
   return state.taskAttempts[taskAttemptKey(task)] ?? 1
+}
+function recordWorkerFailure(state: RunState, task: ChecklistTask, outcome: WorkerOutcome): void {
+  const taskKey = taskAttemptKey(task)
+  const signature = digest(JSON.stringify({
+    status: outcome.status,
+    error: outcome.error?.replace(/\b\d+(?:\.\d+)?(?:ms|s)?\b/giu, '#').slice(0, 4_096),
+    report: outcome.report,
+  }))
+  const count = state.failureStreak?.taskKey === taskKey && state.failureStreak.signature === signature
+    ? state.failureStreak.count + 1
+    : 1
+  state.failureStreak = { taskKey, signature, count }
+  state.autoRecoveryBlocked = outcome.status === 'blocked'
+    || outcome.status === 'unavailable'
+    || /(?:repeated deterministic tool failure|tool failure budget exhausted)/iu.test(outcome.error ?? '')
+    || count >= 2
+}
+function clearWorkerFailure(state: RunState): void {
+  delete state.failureStreak
+  delete state.autoRecoveryBlocked
 }
 function workerGateFingerprint(parsed: ReturnType<typeof parseChecklist>, task: ChecklistTask, fallback?: string): string | undefined {
   const gate = parsed.tasks.find(candidate => candidate.kind === 'gate' && candidate.mark !== 'x' && candidate.phase === task.phase)
@@ -128,7 +153,34 @@ function event(runId: string, type: RunEventType, phase: RunEvent['phase'], data
 function alreadySatisfiedEvidence(output: string): boolean {
   const lines = output.trimEnd().split(/\r?\n/u)
   const evidence = lines.filter(line => /^LEPPY_ALREADY_SATISFIED:\s+\S/u.test(line))
-  return evidence.length === 1 && lines.at(-1) === evidence[0]
+  const disposition = lines.at(-1)?.startsWith('LEPPY_OUTCOME:') ? lines.at(-2) : lines.at(-1)
+  return evidence.length === 1 && disposition === evidence[0]
+}
+
+function applyLifecycleAuthority(state: RunState, next: LifecycleAuthority | undefined): void {
+  if (!next) return
+  if (!Number.isSafeInteger(next.transitions) || next.transitions < 1 || next.transitions > next.maxTransitions) throw new Error('invalid lifecycle authority transition count')
+  if (next.expiresAt <= next.issuedAt || next.maxIterations < 1 || next.maxRepairCycles < 1 || next.maxTransitions < 1
+    || (next.revokedAt !== undefined && next.revokedAt < next.issuedAt)) throw new Error('invalid lifecycle authority bounds')
+  const current = state.lifecycleAuthority
+  if (current && (current.sessionId !== next.sessionId
+    || (current.allowPublication !== next.allowPublication && !(current.allowPublication && !next.allowPublication))
+    || current.maxIterations !== next.maxIterations
+    || current.maxRepairCycles !== next.maxRepairCycles
+    || current.maxTransitions !== next.maxTransitions
+    || current.issuedAt !== next.issuedAt
+    || current.expiresAt !== next.expiresAt
+    || current.revokedAt !== next.revokedAt
+    || next.transitions < current.transitions)) throw new Error('lifecycle authority does not match the authenticated run')
+  state.lifecycleAuthority = { ...next }
+}
+
+function assertCompletedWorkerReport(outcome: WorkerOutcome, label: string): void {
+  if (outcome.status !== 'completed') throw new Error(`${label} is not completed`)
+  if (!outcome.report) throw new Error(`${label} completed without the required structured outcome report`)
+  if (outcome.report.status !== 'completed' || outcome.report.validation.status !== 'passed') {
+    throw new Error(`${label} reported ${outcome.report.status} with validation ${outcome.report.validation.status}`)
+  }
 }
 
 function taskProgress(
@@ -382,6 +434,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   if (recovered) {
     state = recovered.state
     state.taskAttempts ??= {}
+    applyLifecycleAuthority(state, options.lifecycleAuthority)
     stateDir = recovered.dir
     releaseLock = await acquireLock(commonDir, state.runId)
     try {
@@ -407,7 +460,14 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       }
       stateDir = statePath(stateBase, runId)
       mkdirSync(stateDir, { recursive: true })
-      state = { schemaVersion: 1, runId, status: 'running', repoRoot, checklistRelative, sourceHead: setup.sourceHead, branch: setup.branch, worktree: setup.worktree, syncBranch: options.syncBranch, attempt: 0, taskAttempts: {}, completedTasks: 0, gateAttempts: {}, updatedAt: clock().toISOString() }
+      state = {
+        schemaVersion: 1, runId, status: 'running', repoRoot, checklistRelative, sourceHead: setup.sourceHead,
+        branch: setup.branch, worktree: setup.worktree, syncBranch: options.syncBranch, attempt: 0,
+        taskAttempts: {}, completedTasks: 0, gateAttempts: {},
+        ...(options.lifecycleAuthority ? { lifecycleAuthority: options.lifecycleAuthority } : {}),
+        updatedAt: clock().toISOString(),
+      }
+      applyLifecycleAuthority(state, options.lifecycleAuthority)
       const key = createLeaseKey(stateDir)
       writeState(join(stateDir, 'run.json'), state)
       writeFileSync(join(stateDir, 'ownership.hmac'), `${ownership(state, key)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
@@ -527,6 +587,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     if (signal.aborted) throw abortReason(signal)
     if (digest(readFileSync(checklistPath, 'utf8')) !== rebaseStepChecklistDigest) throw new Error('publication repair worker altered the controlling checklist')
     if (outcome.status !== 'completed') throw new Error(`publication conflict worker ${outcome.status}: ${outcome.error ?? 'no error detail'}`)
+    assertCompletedWorkerReport(outcome, 'publication conflict worker')
     if (await head(state.worktree) !== previousHead) throw new Error('publication conflict worker changed HEAD')
     if (!await isAuthenticatedPublicationRebase(publicationRequest, signal)) throw new Error('publication conflict worker changed the authenticated rebase identity')
     appendEvent(eventsPath, event(state.runId, 'recovery-done', 'publish', { publicationConflict: true, cycle: publicationRepairsUsed, resolvedPaths: allowedPaths }, task, state.attempt))
@@ -795,6 +856,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           validateModelSelection(catalog, retryModel.model, retryModel.effort)
           if (signal.aborted) throw abortReason(signal)
           outcomeAttempt += 1
+          state.attempt = outcomeAttempt
+          writeState(join(stateDir, 'run.json'), state)
           const retryRequest: WorkerRequest = {
             ...request,
             model: retryModel.model,
@@ -818,13 +881,15 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         validateModelSelection(catalog, retryModel.model, retryModel.effort)
         if (signal.aborted) throw abortReason(signal)
         outcomeAttempt += 1
+        state.attempt = outcomeAttempt
+        writeState(join(stateDir, 'run.json'), state)
         const retryRequest: WorkerRequest = {
           ...request,
           model: retryModel.model,
           attempt: outcomeAttempt,
           instructions: [
             ...request.instructions,
-            'A prior attempt reported completion but produced no commit. Independently re-evaluate the Done contract. If work is missing, implement it and finish with exactly one conventional commit. If the Done contract is already fully satisfied and no repository change is needed, leave the tree clean and end with exactly one evidence line: LEPPY_ALREADY_SATISFIED: <concrete evidence>. Do not use that marker when any required work remains.',
+            'A prior attempt reported completion but produced no commit. Independently re-evaluate the Done contract. If work is missing, implement it and finish with exactly one conventional commit. If the Done contract is already fully satisfied and no repository change is needed, leave the tree clean and place exactly one evidence line immediately before the required final outcome record: LEPPY_ALREADY_SATISFIED: <concrete evidence>. Do not use that marker when any required work remains.',
           ],
           ...(retryModel.effort ? { effort: retryModel.effort } : {}),
         }
@@ -841,14 +906,20 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         writeState(join(stateDir, 'run.json'), state)
       }
       if (outcome.status !== 'completed') {
+        recordWorkerFailure(state, task, outcome)
         const type = outcome.status === 'timeout' ? 'timeout' : 'stall'
-        appendEvent(eventsPath, event(state.runId, type, task.kind === 'closure' ? 'closure' : 'worker', { status: outcome.status, error: outcome.error ?? null }, task, outcomeAttempt))
+        appendEvent(eventsPath, event(state.runId, type, task.kind === 'closure' ? 'closure' : 'worker', {
+          status: outcome.status, error: outcome.error ?? null,
+          failureStreak: state.failureStreak?.count ?? 1, autoRecoveryBlocked: state.autoRecoveryBlocked === true,
+        }, task, outcomeAttempt))
         state.status = outcome.status === 'interrupted' ? 'interrupted' : 'stalled'
+        state.lastError = outcome.error ?? outcome.status
         writeState(join(stateDir, 'run.json'), state)
         atomicWriteJson(join(stateDir, 'resume.json'), { runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: outcome.status, worktree: state.worktree, command: `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)}` })
         await settleProgress('task-failed', outcome.error ?? outcome.status)
         return { runId: state.runId, status: state.status, branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
       }
+      assertCompletedWorkerReport(outcome, task.kind === 'closure' ? 'closure worker' : 'task worker')
       const verifiedAlreadySatisfied = task.kind === 'task'
         && verifyingNoCommit
         && await commitCount(state.worktree, previousHead) === 0
@@ -865,6 +936,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         if (count === 1 && !isConventional(await commitSubject(state.worktree))) throw new Error('closure commit is not conventional')
         if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('closure must leave a clean tree')
       }
+      clearWorkerFailure(state)
+      delete state.lastError
       const marked = markTaskDone(parsed, task)
       const newCommits = await commitCount(state.worktree, previousHead)
       if (newCommits === 1) await writeChecklistAndAmend(state.worktree, checklistRelative, marked, 'chore(leppy-loop): complete task')
@@ -875,14 +948,32 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       state.completedTasks += 1
       writeState(join(stateDir, 'run.json'), state)
       writeFileSync(join(stateDir, `diff-${task.index}.txt`), await summarizeDiff(state.worktree, previousHead), 'utf8')
-      appendEvent(eventsPath, event(state.runId, 'done', task.kind === 'closure' ? 'closure' : 'worker', { commit: await head(state.worktree), ...(verifiedAlreadySatisfied ? { verifiedAlreadySatisfied: true } : {}) }, task, outcomeAttempt))
+      appendEvent(eventsPath, event(state.runId, 'done', task.kind === 'closure' ? 'closure' : 'worker', {
+        commit: await head(state.worktree),
+        outcome: outcome.report,
+        ...(verifiedAlreadySatisfied ? { verifiedAlreadySatisfied: true } : {}),
+      }, task, outcomeAttempt))
       await settleProgress('task-done')
     }
     appendEvent(eventsPath, event(state.runId, 'stall', 'complete', { reason: 'max iterations reached' }))
     state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
     return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, ...(state.currentTask !== undefined ? { currentTask: state.currentTask } : {}), diagnostics }
   } catch (error) {
-    const message = redact(error instanceof Error ? error.message : String(error)).slice(-16 * 1024)
+    let message = redact(error instanceof Error ? error.message : String(error)).slice(-16 * 1024)
+    if (message.includes(DIRECT_HUMAN_STOP_REASON) && state.lifecycleAuthority && state.lifecycleAuthority.revokedAt === undefined) {
+      const revoked = { ...state.lifecycleAuthority, revokedAt: clock().getTime() }
+      try {
+        const durable = inspectLifecycleAuthority(stateDir, state.runId)
+        if (durable.status === 'valid' && durable.authority.revokedAt !== undefined) state.lifecycleAuthority = durable.authority
+        else {
+          appendLifecycleAuthorityReceipt(stateDir, state.runId, revoked)
+          state.lifecycleAuthority = revoked
+        }
+      } catch (revocationError) {
+        message = `${message}; durable lifecycle revocation failed: ${revocationError instanceof Error ? revocationError.message : String(revocationError)}`.slice(-16 * 1024)
+        state.status = 'failed'
+      }
+    }
     if (state.status === 'running') state.status = signal.aborted ? 'interrupted' : 'failed'
     state.lastError = message
     writeState(join(stateDir, 'run.json'), state)

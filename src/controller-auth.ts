@@ -3,9 +3,10 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { parseChecklist, selectTask } from './checklist.js'
 import { branch as gitBranch, resolveRepoRoot } from './git.js'
+import { inspectLifecycleAuthority } from './lifecycle-authority.js'
 import { isAuthenticatedPublicationRebase } from './publish.js'
 import { runFile } from './process.js'
-import type { ChecklistTask, RunResult } from './types.js'
+import type { ChecklistTask, LifecycleAuthority, RunResult } from './types.js'
 
 interface StoredRunState {
   schemaVersion: 1
@@ -26,6 +27,9 @@ interface StoredRunState {
   publicationTargetCommit?: string
   publicationRemoteHead?: string
   lastError?: string
+  lifecycleAuthority?: LifecycleAuthority
+  failureStreak?: { taskKey: string; signature: string; count: number }
+  autoRecoveryBlocked?: boolean
   updatedAt: string
 }
 
@@ -48,6 +52,8 @@ export interface AuthenticatedController {
   pullRequestUrl?: string
   publicationRebase?: boolean
   detail?: string
+  lifecycleAuthority?: LifecycleAuthority
+  autoRecoveryBlocked?: boolean
 }
 
 function ownershipPayload(state: StoredRunState): string {
@@ -73,6 +79,29 @@ function validTaskAttempts(value: unknown): value is Record<string, number> {
     && typeof count === 'number' && Number.isSafeInteger(count) && count > 0)
 }
 
+function validFailureStreak(value: unknown): boolean {
+  if (value === undefined) return true
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const streak = value as { taskKey?: unknown; signature?: unknown; count?: unknown }
+  return typeof streak.taskKey === 'string' && /^[0-9a-f]{64}$/u.test(streak.taskKey)
+    && typeof streak.signature === 'string' && /^[0-9a-f]{64}$/u.test(streak.signature)
+    && typeof streak.count === 'number' && Number.isSafeInteger(streak.count) && streak.count > 0
+}
+
+function validLifecycleAuthority(value: unknown): value is LifecycleAuthority | undefined {
+  if (value === undefined) return true
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const authority = value as Partial<LifecycleAuthority>
+  return typeof authority.sessionId === 'string'
+    && typeof authority.allowPublication === 'boolean'
+    && [authority.maxIterations, authority.maxRepairCycles, authority.maxTransitions, authority.transitions, authority.issuedAt, authority.expiresAt]
+      .every(candidate => typeof candidate === 'number' && Number.isSafeInteger(candidate))
+    && authority.maxIterations! > 0 && authority.maxRepairCycles! > 0 && authority.maxTransitions! > 0
+    && authority.transitions! > 0 && authority.transitions! <= authority.maxTransitions!
+    && authority.expiresAt! > authority.issuedAt!
+    && (authority.revokedAt === undefined || (Number.isSafeInteger(authority.revokedAt) && authority.revokedAt >= authority.issuedAt!))
+}
+
 function parseStoredRun(path: string): StoredRunState | undefined {
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<StoredRunState>
@@ -87,6 +116,9 @@ function parseStoredRun(path: string): StoredRunState | undefined {
       || typeof value.attempt !== 'number'
       || typeof value.completedTasks !== 'number'
       || !validTaskAttempts(value.taskAttempts)
+      || !validLifecycleAuthority(value.lifecycleAuthority)
+      || !validFailureStreak(value.failureStreak)
+      || (value.autoRecoveryBlocked !== undefined && typeof value.autoRecoveryBlocked !== 'boolean')
       || typeof value.updatedAt !== 'string'
       || (value.lastError !== undefined && typeof value.lastError !== 'string')
       || (value.publicationTargetCommit !== undefined && (typeof value.publicationTargetCommit !== 'string' || !/^[0-9a-f]{40}$/u.test(value.publicationTargetCommit)))
@@ -122,6 +154,9 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
     const key = Buffer.from(readFileSync(keyPath, 'utf8').trim(), 'base64')
     const expected = createHmac('sha256', key).update(ownershipPayload(state)).digest('base64url')
     if (!equalProof(readFileSync(proofPath, 'utf8').trim(), expected)) continue
+    const lifecycleReceipt = inspectLifecycleAuthority(stateDir, state.runId)
+    if (lifecycleReceipt.status === 'invalid' || (state.lifecycleAuthority !== undefined && lifecycleReceipt.status !== 'valid')) continue
+    const lifecycleAuthority = lifecycleReceipt.status === 'valid' ? lifecycleReceipt.authority : undefined
     const attachedBranch = await gitBranch(state.worktree)
     const publicationRebase = attachedBranch !== state.branch && await isAuthenticatedPublicationRebase({
       runId: state.runId,
@@ -164,6 +199,10 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       publicationRemoteHead: state.publicationRemoteHead,
       pullRequestUrl: state.pullRequestUrl,
       lastError: state.lastError,
+      lifecycleAuthorityDigest: lifecycleReceipt.status === 'valid' ? lifecycleReceipt.digest : undefined,
+      lifecycleAuthority,
+      failureStreak: state.failureStreak,
+      autoRecoveryBlocked: state.autoRecoveryBlocked,
     })).digest('hex')
     controllers.push({
       runId: state.runId,
@@ -182,6 +221,8 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       ...(openTask ? { openTask } : {}),
       ...(state.pullRequestUrl ? { pullRequestUrl: state.pullRequestUrl } : {}),
       ...(state.lastError ? { detail: state.lastError } : {}),
+      ...(lifecycleAuthority ? { lifecycleAuthority } : {}),
+      ...(state.autoRecoveryBlocked === undefined ? {} : { autoRecoveryBlocked: state.autoRecoveryBlocked }),
       ...(publicationRebase ? { publicationRebase: true } : {}),
     })
   }

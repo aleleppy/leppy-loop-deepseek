@@ -74,14 +74,17 @@ function parseMetadata(segments: string[], kind: TaskKind): { text: string; meta
       const legacy = extractLegacyFields(segment)
       if (legacy.text) textParts.push(legacy.text)
       if (legacy.done) metadata.done = legacy.done
-      if (legacy.paths.length > 0) metadata.paths.push(...legacy.paths)
+      if (legacy.paths.length > 0) {
+        metadata.paths.push(...legacy.paths)
+        metadata.pathsSource = 'explicit'
+      }
       continue
     }
     const key = META_KEYS.find(candidate => candidate.toLowerCase() === match[1]?.toLowerCase())
     const value = match[2]?.trim() ?? ''
     switch (key) {
       case 'Done': metadata.done = value; break
-      case 'paths': metadata.paths = value.split(',').map(unquote).filter(Boolean); break
+      case 'paths': metadata.paths = value.split(',').map(unquote).filter(Boolean); metadata.pathsSource = 'explicit'; break
       case 'model': metadata.model = unquote(value); break
       case 'effort': metadata.effort = unquote(value); break
       case 'gate': metadata.gate = unquote(value); break
@@ -92,6 +95,7 @@ function parseMetadata(segments: string[], kind: TaskKind): { text: string; meta
   if (metadata.paths.length === 0 && kind !== 'gate' && kind !== 'human') {
     const candidates = [...text.matchAll(/`([^`]+)`/g)].map(match => match[1]!).filter(looksLikePath)
     metadata.paths = [...new Set(candidates)]
+    if (metadata.paths.length > 0) metadata.pathsSource = 'inferred'
   }
   return { text, metadata }
 }
@@ -170,6 +174,23 @@ function canonicalInside(repoRoot: string, candidate: string): boolean {
   return physicalRelative(rootReal, existingReal) !== undefined && !isAbsolute(suffix) && suffix !== '..' && !suffix.startsWith(`..${sep}`)
 }
 
+function unsupportedPathSyntax(path: string): string | undefined {
+  if (/^\.[A-Za-z0-9_-]{1,12}$/u.test(path)) return 'extension-only fragments are not paths'
+  if (/[{}*?]/u.test(path) || path.includes('[') || path.includes(']')) return 'glob and brace syntax is not expanded'
+  return undefined
+}
+
+function requestsTestScope(task: ChecklistTask): boolean {
+  return /\b(?:test|tests|teste|testes|spec|specs)\b/iu.test(`${task.text} ${task.metadata.done ?? ''}`)
+}
+
+function scopeMayContainTests(path: string): boolean {
+  const normalized = path.replaceAll('\\', '/')
+  if (/(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:spec|test)\.[^/]+$/iu.test(normalized)) return true
+  const segments = normalized.split('/').filter(Boolean)
+  return !/\.[A-Za-z0-9_-]{1,12}$/u.test(normalized) && segments.length <= 2 && !segments.includes('main')
+}
+
 export function lintChecklist(parsed: ParsedChecklist, options: ChecklistLintOptions = {}): LintDiagnostic[] {
   const diagnostics: LintDiagnostic[] = []
   if (parsed.tasks.length === 0) diagnostics.push(diagnostic('empty-corpus', 'Checklist contains no executable checkbox lines.'))
@@ -188,7 +209,16 @@ export function lintChecklist(parsed: ParsedChecklist, options: ChecklistLintOpt
     if (task.kind !== 'gate' && task.kind !== 'human' && task.mark !== 'x' && task.metadata.paths.length === 0) {
       diagnostics.push(diagnostic('missing-paths', 'Open worker line requires paths=... or repo-relative paths in backticks.', task))
     }
+    if (task.kind !== 'gate' && task.kind !== 'human' && task.mark !== 'x'
+      && requestsTestScope(task) && !task.metadata.paths.some(scopeMayContainTests)) {
+      diagnostics.push(diagnostic('missing-test-scope', 'Task requires tests but no declared write scope can contain a test/spec file.', task))
+    }
     for (const path of task.metadata.paths) {
+      const unsupported = unsupportedPathSyntax(path)
+      if (unsupported) diagnostics.push(diagnostic('unsupported-path-syntax', `Unsupported path ${JSON.stringify(path)}: ${unsupported}.`, task))
+      if (task.metadata.pathsSource === 'inferred' && options.repoRoot && !/[\\/]/u.test(path) && !existsSync(resolve(options.repoRoot, path))) {
+        diagnostics.push(diagnostic('ambiguous-inferred-path', `Inferred basename ${JSON.stringify(path)} does not exist at repository root; declare its full repo-relative path with paths=....`, task))
+      }
       if (pathEscapesLexically(path)) diagnostics.push(diagnostic('unsafe-path', `Unsafe path: ${JSON.stringify(path)}.`, task))
       else if (options.repoRoot && !canonicalInside(options.repoRoot, path)) diagnostics.push(diagnostic('path-escape', `Path resolves outside the repository: ${JSON.stringify(path)}.`, task))
       if (options.controllerPath && resolve(options.repoRoot ?? '.', path) === resolve(options.controllerPath)) {

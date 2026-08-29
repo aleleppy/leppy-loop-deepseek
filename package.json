@@ -1,6 +1,6 @@
 {
   "name": "leppy-loop-deepseek",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Checklist-driven isolated worker loop for DeepSeek Harness",
   "type": "module",
   "license": "Apache-2.0",
@@ -63,7 +63,8 @@
     "LICENSE",
     "SECURITY.md",
     "CHANGELOG.md",
-    "examples/feature.task.md"
+    "examples/feature.task.md",
+    "skills"
   ],
   "dsh": {
     "bundle": {
@@ -122,6 +123,7 @@
     "@deepseek-ai/dsh-llm": "0.1.1-rc.2",
     "@deepseek-ai/dsh-jobs": "0.1.1-rc.2",
     "@deepseek-ai/dsh-settings": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-skill": "0.1.1-rc.2",
     "@deepseek-ai/dsh-tools": "0.1.1-rc.2"
   },
   "devDependencies": {
@@ -139,6 +141,7 @@
     "@deepseek-ai/dsh-jobs": "0.1.1-rc.2",
     "@deepseek-ai/dsh-llm-replay": "0.1.1-rc.2",
     "@deepseek-ai/dsh-settings": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-skill": "0.1.1-rc.2",
     "@deepseek-ai/dsh-tools": "0.1.1-rc.2",
     "@eslint/js": "^9.39.1",
     "@testing-library/react": "^16.3.2",

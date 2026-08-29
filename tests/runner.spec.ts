@@ -7,6 +7,13 @@ import { runLeppyLoop } from '../src/runner.js'
 import { PublicationConflictError } from '../src/publish.js'
 import type { PublicationHooks, PullRequestRequest, RunProgress, WorkerAdapter, WorkerOutcome, WorkerRequest } from '../src/types.js'
 
+function completedOutcome(output = 'done'): WorkerOutcome {
+  return {
+    status: 'completed', output,
+    report: { status: 'completed', summary: output, validation: { status: 'passed', evidence: 'focused validation passed' } },
+  }
+}
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
@@ -32,17 +39,17 @@ class FakeWorker implements WorkerAdapter {
   async run(request: WorkerRequest): Promise<WorkerOutcome> {
     this.calls.push(request)
     const outcome = this.outcomes.shift()
-    if (outcome) return outcome
+    if (outcome) return outcome.status === 'completed' && !outcome.report ? { ...outcome, report: completedOutcome(outcome.output).report! } : outcome
     if (request.mode === 'publication-conflict') {
       for (const path of request.allowedPaths) writeFileSync(join(request.worktree, path), 'authoritative-base\ndone-0\n')
-      return { status: 'completed', output: 'resolved without staging or committing' }
+      return completedOutcome('resolved without staging or committing')
     }
     if (request.task.kind === 'task') {
       writeFileSync(join(request.worktree, 'src', 'value.txt'), `done-${request.task.index}\n`)
       git(request.worktree, 'add', '--', 'src/value.txt')
       git(request.worktree, 'commit', '-m', `feat: finish task ${request.task.index}`)
     }
-    return { status: 'completed', output: 'done' }
+    return completedOutcome()
   }
 }
 
@@ -139,6 +146,49 @@ describe('controller state machine', () => {
     ])
   }, 90_000)
 
+  it('stalls a blocked closure without marking the controller row done', async () => {
+    const repo = repository('- [?] Closure: inspect `src` | paths=src\n')
+    const worker = new FakeWorker([{
+      status: 'blocked', output: 'BLOQUEADO: validation unavailable', error: 'validation unavailable',
+      report: { status: 'blocked', summary: 'validation unavailable', validation: { status: 'not-run', evidence: 'required validator unavailable' } },
+    }])
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result).toMatchObject({ status: 'stalled', completedTasks: 0, currentTask: 0 })
+    expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [?] Closure')
+    expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
+    expect(JSON.parse(readFileSync(join(result.stateDir!, 'run.json'), 'utf8'))).toMatchObject({ autoRecoveryBlocked: true, failureStreak: { count: 1 } })
+    expect(git(result.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('0')
+  }, 90_000)
+
+  it('preserves a committed task but does not adopt it when validation reports failure', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: focused validation passes\n')
+    const worker: WorkerAdapter = {
+      async run(request) {
+        writeFileSync(join(request.worktree, 'src', 'value.txt'), 'partial\n')
+        git(request.worktree, 'add', '--', 'src/value.txt')
+        git(request.worktree, 'commit', '-m', 'feat: partial task result')
+        return {
+          status: 'blocked', output: 'Tests failed: 2 failing', error: 'tests failed',
+          report: { status: 'blocked', summary: 'tests failed', validation: { status: 'failed', evidence: 'focused suite: 2 failing' } },
+        }
+      },
+    }
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result).toMatchObject({ status: 'stalled', completedTasks: 0 })
+    expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
+    expect(git(result.worktree!, 'log', '-1', '--pretty=%s')).toBe('feat: partial task result')
+    expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
+  }, 90_000)
+
+  it('rejects a clean closure that omits the structured completion report', async () => {
+    const repo = repository('- [?] Closure: inspect `src` | paths=src\n')
+    const worker: WorkerAdapter = { run: async () => ({ status: 'completed', output: 'looks good' }) }
+    await expect(runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker }))
+      .rejects.toThrow('completed without the required structured outcome report')
+    const worktree = git(repo.root, 'worktree', 'list', '--porcelain').split('\n').filter(line => line.startsWith('worktree ')).at(-1)!.slice('worktree '.length)
+    expect(readFileSync(join(worktree, 'tasks.task.md'), 'utf8')).toContain('- [?] Closure')
+  }, 90_000)
+
   it('retries a failed gate only after direct exact-run authorization', async () => {
     const suffix = Math.random().toString(16).slice(2)
     const flag = join(tmpdir(), `leppy-gate-${suffix}.flag`).replaceAll('\\', '/')
@@ -203,7 +253,7 @@ describe('controller state machine', () => {
             git(request.worktree, 'commit', '-m', 'fix: repair failed phase gate')
           }
         }
-        return { status: 'completed', output: 'done' }
+        return completedOutcome()
       },
     }
     const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
@@ -265,7 +315,7 @@ describe('controller state machine', () => {
             git(request.worktree, 'commit', '-m', `fix: repair gate stage ${stage}`)
           }
         }
-        return { status: 'completed', output: 'done' }
+        return completedOutcome()
       },
     }
     const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
@@ -440,7 +490,7 @@ describe('controller state machine', () => {
     const dependencies = { ...adaptiveDeps, worker, onProgress: (update: RunProgress) => { progress.push(update) } }
     const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, dependencies)
     expect(first.status).toBe('stalled')
-    const failedWorker: WorkerAdapter = { run: async () => ({ status: 'completed', output: 'no commit' }) }
+    const failedWorker: WorkerAdapter = { run: async () => completedOutcome('no commit') }
     await expect(runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...adaptiveDeps, worker: failedWorker })).rejects.toThrow('exactly one commit')
     const resumed = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true }, dependencies)
     expect(resumed.status).toBe('completed')
@@ -767,7 +817,7 @@ describe('controller state machine', () => {
         git(request.worktree, 'commit', '-m', 'feat: first unauthorized commit')
         writeFileSync(join(request.worktree, 'src', 'value.txt'), 'second\n')
         git(request.worktree, 'commit', '-am', 'feat: second unauthorized commit')
-        return { status: 'completed', output: 'two commits' }
+        return completedOutcome('two commits')
       },
     }
     await expect(runLeppyLoop(

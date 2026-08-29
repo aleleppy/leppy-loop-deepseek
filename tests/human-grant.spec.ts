@@ -36,6 +36,23 @@ describe('HumanGrantStore lifecycle permits', () => {
     expect(() => store.reserve({ agent: alice, repoRoot: '/repo/a', runId: 'run-b', operation: 'continue', publishRemote: false })).toThrow('another run')
   })
 
+  it('survives Agent object recreation and hydrates a persisted same-session authority', () => {
+    const original = new HumanGrantStore()
+    const firstAgent = agent('owner')
+    const issued = issue(original, firstAgent, { runId: 'run-a' })
+    const first = original.reserve({ agent: firstAgent, repoRoot: '/repo/a', runId: 'run-a', operation: 'continue', publishRemote: false })
+    original.settle(first)
+    const replacementAgent = agent('owner')
+    const second = original.reserve({ agent: replacementAgent, repoRoot: '/repo/a', runId: 'run-a', operation: 'continue', publishRemote: false })
+    expect(second.grant.transitions).toBe(2)
+    original.settle(second)
+
+    const restarted = new HumanGrantStore()
+    restarted.hydrate({ agent: replacementAgent, repoRoot: '/repo/a', runId: 'run-a', authority: original.authority(issued) })
+    const recovered = restarted.reserve({ agent: replacementAgent, repoRoot: '/repo/a', runId: 'run-a', operation: 'continue', publishRemote: false })
+    expect(recovered.grant.transitions).toBe(3)
+  })
+
   it('enforces cumulative transition budget without accepting replay', () => {
     const store = new HumanGrantStore()
     const owner = agent('owner')
@@ -72,8 +89,11 @@ describe('HumanGrantStore lifecycle permits', () => {
     now = 111
     expect(() => store.reserve({ agent: owner, repoRoot: '/repo/a', runId: 'run-a', operation: 'continue', publishRemote: false })).toThrow('expired')
     now = 100
-    issue(store, owner, { runId: 'run-b' })
+    const stopped = issue(store, owner, { runId: 'run-b' })
     store.close(owner, '/repo/a', 'run-b')
     expect(store.permits(owner, '/repo/a').some(grant => grant.runId === 'run-b')).toBe(false)
+    expect(() => new HumanGrantStore(() => now).hydrate({
+      agent: owner, repoRoot: '/repo/a', runId: 'run-b', authority: store.authority(stopped),
+    })).toThrow('revoked by direct human stop')
   })
 })

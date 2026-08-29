@@ -23,8 +23,8 @@
     "kind": "chunks",
     "chunks": [
       { "type": "block-start", "index": 0, "blockType": "text" },
-      { "type": "text-delta", "index": 0, "text": "KEYLESS_DONE" },
-      { "type": "block-end", "index": 0, "block": { "type": "text", "text": "KEYLESS_DONE" } },
+      { "type": "text-delta", "index": 0, "text": "KEYLESS_DONE\nLEPPY_OUTCOME: {\"status\":\"completed\",\"summary\":\"keyless worker committed\",\"validation\":{\"status\":\"passed\",\"evidence\":\"replay tool write and commit succeeded\"}}" },
+      { "type": "block-end", "index": 0, "block": { "type": "text", "text": "KEYLESS_DONE\nLEPPY_OUTCOME: {\"status\":\"completed\",\"summary\":\"keyless worker committed\",\"validation\":{\"status\":\"passed\",\"evidence\":\"replay tool write and commit succeeded\"}}" } },
       { "type": "usage", "usage": { "inputTokens": 35, "outputTokens": 2 } },
       { "type": "finish", "reason": { "kind": "stop" } }
     ]

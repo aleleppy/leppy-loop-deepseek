@@ -1,3 +1,5 @@
+export const DIRECT_HUMAN_STOP_REASON = 'Stopped through direct human Leppy intent'
+
 export const RUN_EVENT_TYPES = [
   'run-start', 'start', 'done', 'recovery-start', 'recovery-done',
   'gate-start', 'gate-end', 'publish-start', 'publish-done',
@@ -14,6 +16,7 @@ export type WorkerMode = 'task' | 'publication-conflict'
 export interface TaskMetadata {
   done?: string
   paths: string[]
+  pathsSource?: 'explicit' | 'inferred'
   model?: string
   effort?: string
   gate?: string
@@ -59,6 +62,18 @@ export interface ChecklistLintOptions {
   phaseGateCommand?: string
 }
 
+export interface LifecycleAuthority {
+  sessionId: string
+  allowPublication: boolean
+  maxIterations: number
+  maxRepairCycles: number
+  maxTransitions: number
+  transitions: number
+  issuedAt: number
+  expiresAt: number
+  revokedAt?: number
+}
+
 export interface LeppyLoopOptions {
   tasks: string
   syncBranch: string
@@ -87,6 +102,8 @@ export interface LeppyLoopOptions {
   openPullRequest?: boolean
   publicationTarget?: string
   repoRoot?: string
+  /** Durable slash-command authority for same-session lifecycle continuation across Host restarts. */
+  lifecycleAuthority?: LifecycleAuthority
 }
 
 export interface RunEvent<T = Record<string, unknown>> {
@@ -143,11 +160,21 @@ export interface WorkerRequest {
   instructions: string[]
 }
 
+export interface WorkerReport {
+  status: 'completed' | 'blocked' | 'failed'
+  summary: string
+  validation: {
+    status: 'passed' | 'failed' | 'not-run'
+    evidence: string
+  }
+}
+
 export interface WorkerOutcome {
-  status: 'completed' | 'timeout' | 'output-limit' | 'transcript-limit' | 'unavailable' | 'failed' | 'interrupted'
+  status: 'completed' | 'blocked' | 'timeout' | 'output-limit' | 'transcript-limit' | 'unavailable' | 'failed' | 'interrupted'
   output: string
   transcriptPath?: string
   error?: string
+  report?: WorkerReport
 }
 
 export interface WorkerAdapter {
