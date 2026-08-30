@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.20] - 2026-08-30
+
+### Fixed
+
+- A fresh direct-human `/leppy-loop continuar` command now renews an expired same-session durable lifecycle permit instead of being rejected by the stale expiry. Reauthorization preserves the consumed transition count and immutable publication downgrade, mints a new bounded TTL, and persists that renewed authority before enqueueing the controller follow-up, so a Host restart cannot lose the renewal.
+
 ## [0.3.19] - 2026-08-30
 
 ### Fixed

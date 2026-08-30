@@ -297,7 +297,33 @@ describe('simple human slash surface', () => {
     })
     await expect(executeLeppyLoopCommand(context(), invocation(owner, 'continuar localmente, nao publicar'), rt)).resolves.toMatchObject({ kind: 'success' })
     expect(order).toEqual(['persist', 'followup'])
-    expect(persisted).toMatchObject({ allowPublication: false, transitions: 2, issuedAt: durable.lifecycleAuthority!.issuedAt })
+    expect(persisted).toMatchObject({ allowPublication: false, transitions: 2 })
+    expect(persisted!.issuedAt).toBeGreaterThan(durable.lifecycleAuthority!.issuedAt)
+    expect(persisted!.expiresAt).toBeGreaterThan(durable.lifecycleAuthority!.expiresAt)
+  })
+
+  it('renews and durably persists an expired permit from one fresh direct-human continue command', async () => {
+    const order: string[] = []
+    const owner = agent('expired-owner', () => { order.push('followup') })
+    const expired = controller({
+      lifecycleAuthority: {
+        sessionId: 'expired-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 7, issuedAt: Date.now() - 172_800_000, expiresAt: Date.now() - 86_400_000,
+      },
+    })
+    let persisted: LifecycleAuthority | undefined
+    const rt = runtime({
+      inspectControllers: async () => [expired],
+      persistAuthority: async (_repo, _runId, authority) => { persisted = authority; order.push('persist') },
+    })
+    await expect(executeLeppyLoopCommand(context(), invocation(owner, 'continuar'), rt)).resolves.toMatchObject({
+      kind: 'success', text: expect.stringContaining(expired.runId),
+    })
+    expect(order).toEqual(['persist', 'followup'])
+    expect(persisted).toMatchObject({ sessionId: 'expired-owner', allowPublication: false, transitions: 7 })
+    expect(persisted!.issuedAt).toBeGreaterThan(expired.lifecycleAuthority!.expiresAt)
+    expect(persisted!.expiresAt).toBeGreaterThan(Date.now())
+    expect(rt.grants.permits(owner, cwd)).toHaveLength(1)
   })
 })
 
@@ -462,7 +488,9 @@ describe('grant-validated background controller tool', () => {
       operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
     })
     expect(resumed).toMatchObject({ status: 'running', runId: stalled.runId })
-    expect(persisted).toMatchObject({ transitions: 3, issuedAt: stalled.lifecycleAuthority!.issuedAt, allowPublication: false })
+    expect(persisted).toMatchObject({ transitions: 3, allowPublication: false })
+    expect(persisted!.issuedAt).toBeGreaterThan(stalled.lifecycleAuthority!.issuedAt)
+    expect(persisted!.expiresAt).toBeGreaterThan(stalled.lifecycleAuthority!.expiresAt)
   })
 
   it('reuses persisted authority when an exact-lock dependency bridge changes an ENOTCACHED condition', async () => {

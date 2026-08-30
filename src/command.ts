@@ -648,7 +648,7 @@ export async function executeLeppyLoopCommand(
           allowPublication: intent.allowPublication,
           maxIterations: GRANT_MAX_ITERATIONS, maxRepairCycles: GRANT_MAX_REPAIR_CYCLES, maxTransitions: GRANT_MAX_TRANSITIONS,
         })
-    if (selected?.lifecycleAuthority && grant.allowPublication !== selected.lifecycleAuthority.allowPublication) {
+    if (selected?.lifecycleAuthority) {
       await persistLifecycleAuthority(runtime, repoRoot, selected.runId, runtime.grants.authority(grant))
     }
     const effectiveIntent = { ...intent, allowPublication: grant.allowPublication }

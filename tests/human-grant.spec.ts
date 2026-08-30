@@ -64,6 +64,25 @@ describe('HumanGrantStore lifecycle permits', () => {
     expect(() => store.reserve({ agent: owner, repoRoot: '/repo/a', runId: 'run-a', operation: 'continue', publishRemote: false })).toThrow('budget exhausted')
   })
 
+  it('never resurrects a live publication downgrade from stale durable authority', () => {
+    let now = 100
+    const store = new HumanGrantStore(() => now, 1_000)
+    const owner = agent('owner')
+    const issued = issue(store, owner, { runId: 'run-a', allowPublication: true })
+    const stale = store.authority(issued)
+    now = 101
+    const downgraded = store.reauthorize({
+      agent: owner, repoRoot: '/repo/a', runId: 'run-a', authority: stale, allowPublication: false,
+    })
+    expect(downgraded.allowPublication).toBe(false)
+    now = 102
+    const replayed = store.reauthorize({
+      agent: owner, repoRoot: '/repo/a', runId: 'run-a', authority: stale, allowPublication: true,
+    })
+    expect(replayed.allowPublication).toBe(false)
+    expect(store.authority(replayed).allowPublication).toBe(false)
+  })
+
   it('never lets a model upgrade a local-only lifecycle to publication', () => {
     const store = new HumanGrantStore()
     const owner = agent('owner')
@@ -79,6 +98,25 @@ describe('HumanGrantStore lifecycle permits', () => {
     store.restore(reservation)
     expect(reservation.grant.runId).toBeUndefined()
     expect(reservation.grant.transitions).toBe(0)
+  })
+
+  it('lets a fresh direct-human command renew an expired durable permit without resetting its transition budget', () => {
+    let now = 100
+    const original = new HumanGrantStore(() => now, 10)
+    const owner = agent('owner')
+    const issued = issue(original, owner, { runId: 'run-a' })
+    const used = original.reserve({ agent: owner, repoRoot: '/repo/a', runId: 'run-a', operation: 'continue', publishRemote: false })
+    original.settle(used)
+    const expired = original.authority(issued)
+    now = 111
+
+    const restarted = new HumanGrantStore(() => now, 10)
+    const renewed = restarted.reauthorize({
+      agent: owner, repoRoot: '/repo/a', runId: 'run-a', authority: expired, allowPublication: true,
+    })
+    expect(renewed).toMatchObject({ transitions: 1, issuedAt: 111, expiresAt: 121, reauthorizedAt: 111 })
+    const resumed = restarted.reserve({ agent: owner, repoRoot: '/repo/a', runId: 'run-a', operation: 'continue', publishRemote: false })
+    expect(resumed.grant.transitions).toBe(2)
   })
 
   it('expires in Host memory and closes on direct stop', () => {

@@ -94,10 +94,33 @@ export class HumanGrantStore {
   }
 
   reauthorize(input: { agent: Agent; repoRoot: string; runId: string; authority: LifecycleAuthority; allowPublication: boolean }): HumanGrant {
-    const grant = this.hydrate(input)
-    if (!input.allowPublication) grant.allowPublication = false
-    grant.agent = input.agent
-    grant.reauthorizedAt = this.now()
+    if (input.authority.sessionId !== String(input.agent.id)) throw new Error('durable lifecycle permit belongs to another session')
+    if (input.authority.revokedAt !== undefined) throw new Error('durable lifecycle permit was revoked by direct human stop')
+    if (input.authority.transitions >= input.authority.maxTransitions) throw new Error(`human lifecycle transition budget exhausted at ${input.authority.maxTransitions}`)
+    const reauthorizedAt = this.now()
+    const existing = [...this.grants].reverse().find(grant => grant.sessionId === input.authority.sessionId
+      && grant.repoRoot === input.repoRoot && grant.runId === input.runId && grant.revokedAt === undefined)
+    const allowPublication = input.authority.allowPublication && input.allowPublication
+    if (existing) {
+      existing.agent = input.agent
+      existing.allowPublication = existing.allowPublication && allowPublication
+      existing.maxIterations = input.authority.maxIterations
+      existing.maxRepairCycles = input.authority.maxRepairCycles
+      existing.maxTransitions = input.authority.maxTransitions
+      existing.transitions = Math.max(existing.transitions, input.authority.transitions)
+      existing.issuedAt = reauthorizedAt
+      existing.expiresAt = reauthorizedAt + this.ttlMs
+      existing.reauthorizedAt = reauthorizedAt
+      return existing
+    }
+    const grant: HumanGrant = {
+      id: randomUUID(), agent: input.agent, sessionId: input.authority.sessionId, repoRoot: input.repoRoot, runId: input.runId,
+      allowPublication, maxIterations: input.authority.maxIterations, maxRepairCycles: input.authority.maxRepairCycles,
+      maxTransitions: input.authority.maxTransitions, transitions: input.authority.transitions, issuedAt: reauthorizedAt,
+      expiresAt: reauthorizedAt + this.ttlMs, reauthorizedAt, inFlight: false,
+    }
+    this.grants.push(grant)
+    if (this.grants.length > 64) this.grants.splice(0, this.grants.length - 64)
     return grant
   }
 
