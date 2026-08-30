@@ -79,6 +79,48 @@ describe('Harness worker cancellation', () => {
     expect(observe('three')).toContain('repeated deterministic tool failure: leppy_search')
   })
 
+  it('stops after the first deterministic offline dependency miss', () => {
+    const circuit = new WorkerToolFailureCircuitBreaker(3, 8)
+    const callId = 'dependency-miss'
+    expect(circuit.observe({ method: 'session.event', params: { event: { type: 'tool/call', data: { callId, name: 'leppy_exec', arguments: '{"command":"npx","args":["tsc"]}' } } } })).toBeUndefined()
+    expect(circuit.observe({
+      method: 'session.event',
+      params: { event: { type: 'tool/result', data: { message: { source: { callId }, content: [{ content: [{ isError: true, content: [{ type: 'text', text: 'npm error code ENOTCACHED; cache mode is only-if-cached' }] }] }] } } } },
+    })).toContain('dependency unavailable after one tool failure')
+  })
+
+  it('stops after the first missing module under node_modules', () => {
+    const circuit = new WorkerToolFailureCircuitBreaker(3, 8)
+    const callId = 'module-miss'
+    expect(circuit.observe({ method: 'session.event', params: { event: { type: 'tool/call', data: { callId, name: 'leppy_exec', arguments: '{"command":"node","args":["node_modules/typescript/bin/tsc"]}' } } } })).toBeUndefined()
+    expect(circuit.observe({
+      method: 'session.event',
+      params: { event: { type: 'tool/result', data: { message: { source: { callId }, content: [{ content: [{ isError: true, content: [{ type: 'text', text: "code: MODULE_NOT_FOUND; Cannot find module 'worktree/node_modules/typescript/bin/tsc'" }] }] }] } } } },
+    })).toContain('dependency unavailable after one tool failure')
+  })
+
+  it('stops after the first localized Windows quoted-executable failure', () => {
+    const circuit = new WorkerToolFailureCircuitBreaker(3, 8)
+    const callId = 'windows-quoted-executable'
+    expect(circuit.observe({ method: 'session.event', params: { event: { type: 'tool/call', data: { callId, name: 'leppy_exec', arguments: '{"command":"node_modules/.bin/tsc","args":[]}' } } } })).toBeUndefined()
+    expect(circuit.observe({
+      method: 'session.event',
+      params: { event: { type: 'tool/result', data: { message: { source: { callId }, content: [{ content: [{ isError: true, content: [{ type: 'text', text: "Error: 'node_modules' não é reconhecido como um comando interno ou externo" }] }] }] } } } },
+    })).toContain('Windows argv compatibility failure after one tool call')
+  })
+
+  it('does not count non-error search discovery results toward the failure budget', () => {
+    const circuit = new WorkerToolFailureCircuitBreaker(3, 8)
+    for (let index = 0; index < 10; index += 1) {
+      const callId = `missing-path-${index}`
+      expect(circuit.observe({ method: 'session.event', params: { event: { type: 'tool/call', data: { callId, name: 'leppy_search', arguments: '{"paths":["messages"]}' } } } })).toBeUndefined()
+      expect(circuit.observe({
+        method: 'session.event',
+        params: { event: { type: 'tool/result', data: { message: { source: { callId }, content: [{ content: [{ content: [{ type: 'text', text: 'No requested search path exists: messages' }] }] }] } } } },
+      })).toBeUndefined()
+    }
+  })
+
   it('keeps distinct failures separate and enforces a total failure budget', () => {
     const circuit = new WorkerToolFailureCircuitBreaker(3, 4)
     const fail = (index: number): string | undefined => {

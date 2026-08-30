@@ -1,4 +1,7 @@
-import { resolve } from 'node:path'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandDefinition, CommandInvocation } from '@deepseek-ai/dsh-commands'
@@ -18,6 +21,33 @@ import type { LeppyLoopOptions, LifecycleAuthority, RunProgress, RunResult } fro
 
 const cwd = process.cwd()
 
+function git(root: string, ...args: string[]): string {
+  return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
+}
+
+function dependencyRecoveryRepository(): { root: string; worktree: string } {
+  const root = mkdtempSync(join(tmpdir(), 'leppy-command-dependencies-'))
+  writeFileSync(join(root, '.gitignore'), 'node_modules/\n')
+  writeFileSync(join(root, 'tasks.task.md'), '- [ ] Change `src/value.txt` | Done: value says done\n')
+  mkdirSync(join(root, 'src'))
+  writeFileSync(join(root, 'src', 'value.txt'), 'before\n')
+  writeFileSync(join(root, 'package.json'), '{"name":"command-fixture","private":true,"devDependencies":{"typescript":"5.9.3"}}\n')
+  writeFileSync(join(root, 'package-lock.json'), '{"name":"command-fixture","lockfileVersion":3,"packages":{"":{"name":"command-fixture","devDependencies":{"typescript":"5.9.3"}},"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
+  git(root, 'init', '-b', 'main')
+  git(root, 'config', 'user.email', 'tests@example.invalid')
+  git(root, 'config', 'user.name', 'Leppy Tests')
+  git(root, 'add', '--', '.gitignore', 'tasks.task.md', 'src/value.txt', 'package.json', 'package-lock.json')
+  git(root, 'commit', '-m', 'chore: seed')
+  mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true })
+  mkdirSync(join(root, 'node_modules', 'typescript'), { recursive: true })
+  writeFileSync(join(root, 'node_modules', 'typescript', 'package.json'), '{"name":"typescript","version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}\n')
+  writeFileSync(join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'), 'fixture shim\n')
+  writeFileSync(join(root, 'node_modules', '.package-lock.json'), '{"lockfileVersion":3,"packages":{"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
+  const worktree = `${root}-worker`
+  git(root, 'worktree', 'add', '-b', 'leppy-loop/recovery', worktree, 'HEAD')
+  return { root, worktree }
+}
+
 function controller(overrides: Partial<AuthenticatedController> = {}): AuthenticatedController {
   return {
     runId: '44c85fb806c6', status: 'stalled', repoRoot: cwd,
@@ -32,12 +62,12 @@ function controller(overrides: Partial<AuthenticatedController> = {}): Authentic
   }
 }
 
-function agent(id = 'session-a', followup: (message: unknown) => void = () => {}, append: (type: string, data: unknown) => void = () => {}): Agent {
+function agent(id = 'session-a', followup: (message: unknown) => void = () => {}, append: (type: string, data: unknown) => void = () => {}, workspace = cwd): Agent {
   const tools = { register: vi.fn(() => () => {}) }
   return {
     id,
     ctx: { tools },
-    session: { header: { cwd }, append },
+    session: { header: { cwd: workspace }, append },
     followup,
   } as unknown as Agent
 }
@@ -433,6 +463,98 @@ describe('grant-validated background controller tool', () => {
     })
     expect(resumed).toMatchObject({ status: 'running', runId: stalled.runId })
     expect(persisted).toMatchObject({ transitions: 3, issuedAt: stalled.lifecycleAuthority!.issuedAt, allowPublication: false })
+  })
+
+  it('reuses persisted authority when an exact-lock dependency bridge changes an ENOTCACHED condition', async () => {
+    const fixture = dependencyRecoveryRepository()
+    const owner = agent('dependency-owner', () => {}, () => {}, fixture.root)
+    const stalled = controller({
+      repoRoot: fixture.root,
+      worktree: fixture.worktree,
+      checklistRelative: 'tasks.task.md',
+      syncBranch: 'main',
+      autoRecoveryBlocked: true,
+      detail: 'npm error code ENOTCACHED; cache mode is only-if-cached',
+      lifecycleAuthority: {
+        sessionId: 'dependency-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 2, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const jobs = new FakeJobs()
+    let received: LeppyLoopOptions | undefined
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      run: async options => { received = options; return { ...completed, runId: stalled.runId } },
+    })
+
+    const resumed = await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })
+    expect(resumed).toMatchObject({ status: 'running', runId: stalled.runId })
+    expect(jobs.starts).toHaveLength(1)
+    await jobs.starts[0]!.hooks.done
+    expect(received?.dependencyHydrationRequired).toBe(true)
+    expect(received?.dependencyRecoveryDigest).toMatch(/^[0-9a-f]{64}$/u)
+    expect(rt.grants.permits(owner, fixture.root)[0]).toMatchObject({ transitions: 3 })
+  })
+
+  it('reuses persisted authority when a disappeared tree has integrity-covered bundled packages', async () => {
+    const fixture = dependencyRecoveryRepository()
+    rmSync(join(fixture.root, 'node_modules'), { recursive: true, force: true })
+    const lock = JSON.parse(readFileSync(join(fixture.worktree, 'package-lock.json'), 'utf8')) as { packages: Record<string, unknown> }
+    lock.packages['node_modules/bundled-parent'] = {
+      version: '1.0.0', resolved: 'https://registry.npmjs.org/bundled-parent/-/bundled-parent-1.0.0.tgz',
+      integrity: 'sha512-YWJjZA==', bundleDependencies: ['bundled-child'],
+    }
+    lock.packages['node_modules/bundled-parent/node_modules/bundled-child'] = { version: '2.0.0', inBundle: true }
+    writeFileSync(join(fixture.worktree, 'package-lock.json'), `${JSON.stringify(lock)}\n`)
+    const owner = agent('module-miss-owner', () => {}, () => {}, fixture.root)
+    const stalled = controller({
+      repoRoot: fixture.root, worktree: fixture.worktree, checklistRelative: 'tasks.task.md', syncBranch: 'main',
+      autoRecoveryBlocked: true,
+      detail: "worker dependency unavailable after one tool failure; code: MODULE_NOT_FOUND; Cannot find module 'worktree/node_modules/typescript/bin/tsc'",
+      lifecycleAuthority: {
+        sessionId: 'module-miss-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 4, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const jobs = new FakeJobs()
+    let received: LeppyLoopOptions | undefined
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      run: async options => { received = options; return { ...completed, runId: stalled.runId } },
+    })
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })).resolves.toMatchObject({ status: 'running' })
+    await jobs.starts[0]!.hooks.done
+    expect(received?.dependencyHydrationRequired).toBe(true)
+    expect(received?.dependencyRecoveryDigest).toMatch(/^[0-9a-f]{64}$/u)
+  })
+
+  it('reuses persisted authority once for the authenticated Windows quoted-executable failure', async () => {
+    const owner = agent('windows-argv-owner')
+    const stalled = controller({
+      autoRecoveryBlocked: true,
+      detail: "worker tool failure budget exhausted after 8 failures; last=leppy_exec: 'node_modules' não é reconhecido como um comando interno ou externo",
+      lifecycleAuthority: {
+        sessionId: 'windows-argv-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 2, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const jobs = new FakeJobs()
+    let received: LeppyLoopOptions | undefined
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      run: async options => { received = options; return { ...completed, runId: stalled.runId } },
+    })
+
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })).resolves.toMatchObject({ status: 'running', runId: stalled.runId })
+    await jobs.starts[0]!.hooks.done
+    expect(received?.windowsArgvRecoveryDigest).toMatch(/^[0-9a-f]{64}$/u)
+    expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ transitions: 3 })
   })
 
   it('retries transient automatic follow-up handoff failures within the lifecycle', async () => {

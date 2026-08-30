@@ -29,7 +29,7 @@
 - id: agent-spine
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
-    persona: !!js process.env.LEPPY_SYSTEM_PROMPT
+    persona: '{{leppy_prompt}}'
     workspaceContext: false
     skills:
       enabled: false

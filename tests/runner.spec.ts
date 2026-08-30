@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -31,6 +32,14 @@ function repository(checklist: string): { root: string; tasks: string } {
   git(root, 'add', '--', 'tasks.task.md', 'src/value.txt')
   git(root, 'commit', '-m', 'chore: seed')
   return { root, tasks }
+}
+
+async function fakeNpmInstall(installRoot: string): Promise<void> {
+  mkdirSync(join(installRoot, 'node_modules', '.bin'), { recursive: true })
+  mkdirSync(join(installRoot, 'node_modules', 'typescript'), { recursive: true })
+  writeFileSync(join(installRoot, 'node_modules', 'typescript', 'package.json'), '{"name":"typescript","version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}\n')
+  writeFileSync(join(installRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'), 'fixture shim\n')
+  writeFileSync(join(installRoot, 'node_modules', '.package-lock.json'), '{"lockfileVersion":3,"packages":{"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
 }
 
 class FakeWorker implements WorkerAdapter {
@@ -827,6 +836,144 @@ describe('controller state machine', () => {
     const stored = JSON.parse(readFileSync(join(repo.root, '.git', 'leppy-loop', 'runs', 'outerdetail', 'run.json'), 'utf8'))
     expect(stored.status).toBe('failed')
     expect(stored.lastError).toContain('exactly one commit')
+  }, 90_000)
+
+  it('activates an exact-lock dependency bridge once when recovering an ENOTCACHED stall', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'node_modules/\n')
+    writeFileSync(join(repo.root, 'package.json'), '{"name":"runner-fixture","private":true,"devDependencies":{"typescript":"5.9.3"}}\n')
+    writeFileSync(join(repo.root, 'package-lock.json'), '{"name":"runner-fixture","lockfileVersion":3,"packages":{"":{"name":"runner-fixture","devDependencies":{"typescript":"5.9.3"}},"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
+    git(repo.root, 'add', '--', '.gitignore', 'package.json', 'package-lock.json')
+    git(repo.root, 'commit', '-m', 'chore: add package metadata')
+    const firstWorker = new FakeWorker([{ status: 'failed', output: '', error: 'worker tool failure budget exhausted: npm error code ENOTCACHED; cache mode is only-if-cached' }])
+    const first = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, installNpmDependencies: fakeNpmInstall, worker: firstWorker },
+    )
+    expect(first.status).toBe('stalled')
+    const stalledState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    expect(stalledState).toMatchObject({ dependencyBridgeActive: true, autoRecoveryBlocked: true, lastError: expect.stringContaining('ENOTCACHED') })
+    rmSync(join(first.worktree!, 'node_modules'), { recursive: true, force: true })
+
+    const shim = join(repo.root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
+    mkdirSync(join(repo.root, 'node_modules', '.bin'), { recursive: true })
+    mkdirSync(join(repo.root, 'node_modules', 'typescript'), { recursive: true })
+    writeFileSync(join(repo.root, 'node_modules', 'typescript', 'package.json'), '{"name":"typescript","version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}\n')
+    writeFileSync(shim, 'fixture shim\n')
+    writeFileSync(join(repo.root, 'node_modules', '.package-lock.json'), '{"lockfileVersion":3,"packages":{"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
+    const recoveredWorker = new FakeWorker()
+    const recovered = await runLeppyLoop(
+      {
+        tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+        dependencyRecoveryDigest: createHash('sha256').update(stalledState.lastError).digest('hex'),
+      },
+      { ...modelDeps, worker: recoveredWorker },
+    )
+
+    expect(recovered.status).toBe('completed')
+    expect(existsSync(join(recovered.worktree!, 'node_modules', 'typescript'))).toBe(true)
+    expect(existsSync(join(repo.root, 'node_modules', 'typescript'))).toBe(true)
+    const state = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    expect(state.dependencyBridgeActive).toBe(true)
+    expect(state.autoRecoveryBlocked).toBeUndefined()
+    expect(state.failureStreak).toBeUndefined()
+  }, 90_000)
+
+  it('activates the Windows structured-argv bridge once for the exact authenticated failure', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'node_modules/\n')
+    writeFileSync(join(repo.root, 'package.json'), '{"name":"runner-fixture","private":true,"devDependencies":{"typescript":"5.9.3"}}\n')
+    writeFileSync(join(repo.root, 'package-lock.json'), '{"name":"runner-fixture","lockfileVersion":3,"packages":{"":{"name":"runner-fixture","devDependencies":{"typescript":"5.9.3"}},"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
+    git(repo.root, 'add', '--', '.gitignore', 'package.json', 'package-lock.json')
+    git(repo.root, 'commit', '-m', 'chore: add package metadata')
+    mkdirSync(join(repo.root, 'node_modules', '.bin'), { recursive: true })
+    mkdirSync(join(repo.root, 'node_modules', 'typescript'), { recursive: true })
+    writeFileSync(join(repo.root, 'node_modules', 'typescript', 'package.json'), '{"name":"typescript","version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}\n')
+    writeFileSync(join(repo.root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'), 'fixture shim\n')
+    writeFileSync(join(repo.root, 'node_modules', '.package-lock.json'), '{"lockfileVersion":3,"packages":{"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
+    const firstWorker = new FakeWorker([{ status: 'failed', output: '', error: "worker Windows argv compatibility failure after one tool call: 'node_modules' não é reconhecido como um comando interno ou externo" }])
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker: firstWorker })
+    expect(first.status).toBe('stalled')
+    const stalled = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    expect(stalled).toMatchObject({ dependencyBridgeActive: true, autoRecoveryBlocked: true })
+
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      windowsArgvRecoveryDigest: createHash('sha256').update(stalled.lastError).digest('hex'),
+    }, { ...modelDeps, worker: new FakeWorker() })
+    expect(recovered.status).toBe('completed')
+    expect(JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))).toMatchObject({ windowsArgvBridgeActive: true })
+  }, 90_000)
+
+  it('does not treat an unchanged structurally local tree as proof that MODULE_NOT_FOUND was repaired', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'node_modules/\n')
+    writeFileSync(join(repo.root, 'package.json'), '{"name":"runner-fixture","private":true,"devDependencies":{"typescript":"5.9.3"}}\n')
+    writeFileSync(join(repo.root, 'package-lock.json'), '{"name":"runner-fixture","lockfileVersion":3,"packages":{"":{"name":"runner-fixture","devDependencies":{"typescript":"5.9.3"}},"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
+    git(repo.root, 'add', '--', '.gitignore', 'package.json', 'package-lock.json')
+    git(repo.root, 'commit', '-m', 'chore: add package metadata')
+    await fakeNpmInstall(repo.root)
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, {
+      ...modelDeps,
+      worker: new FakeWorker([{ status: 'failed', output: '', error: "worker dependency unavailable after one tool failure; code: MODULE_NOT_FOUND; Cannot find module 'worktree/node_modules/typescript/bin/tsc'" }]),
+    })
+    expect(first.status).toBe('stalled')
+    const stalled = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    expect(existsSync(join(first.worktree!, 'node_modules', 'typescript', 'package.json'))).toBe(true)
+    const forbiddenWorker = new FakeWorker()
+    const refused = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      dependencyRecoveryDigest: createHash('sha256').update(stalled.lastError).digest('hex'),
+    }, { ...modelDeps, worker: forbiddenWorker })
+    expect(refused.status).toBe('stalled')
+    expect(refused.detail).toContain('did not publish a new isolated tree')
+    expect(forbiddenWorker.calls).toHaveLength(0)
+  }, 90_000)
+
+  it('rematerializes a disappeared dependency tree from the worktree lock before another worker starts', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'node_modules/\n')
+    writeFileSync(join(repo.root, 'package.json'), '{"name":"runner-fixture","private":true,"devDependencies":{"typescript":"5.9.3"}}\n')
+    writeFileSync(join(repo.root, 'package-lock.json'), '{"name":"runner-fixture","lockfileVersion":3,"packages":{"":{"name":"runner-fixture","devDependencies":{"typescript":"5.9.3"}},"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
+    git(repo.root, 'add', '--', '.gitignore', 'package.json', 'package-lock.json')
+    git(repo.root, 'commit', '-m', 'chore: add package metadata')
+    await fakeNpmInstall(repo.root)
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, {
+      ...modelDeps,
+      worker: new FakeWorker([{ status: 'failed', output: '', error: "worker tool failure budget exhausted after 8 failures; code: MODULE_NOT_FOUND; Cannot find module 'worktree/node_modules/typescript/bin/tsc'" }]),
+    })
+    expect(first.status).toBe('stalled')
+    const stalled = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    expect(stalled).toMatchObject({ dependencyBridgeActive: true, autoRecoveryBlocked: true })
+    rmSync(join(first.worktree!, 'node_modules'), { recursive: true, force: true })
+    rmSync(join(repo.root, 'node_modules'), { recursive: true, force: true })
+
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      dependencyHydrationRequired: true,
+      dependencyRecoveryDigest: createHash('sha256').update(stalled.lastError).digest('hex'),
+    }, { ...modelDeps, installNpmDependencies: fakeNpmInstall, worker: new FakeWorker() })
+    expect(recovered.status).toBe('completed')
+    expect(existsSync(join(first.worktree!, 'node_modules', 'typescript', 'package.json'))).toBe(true)
+  }, 90_000)
+
+  it('never releases another worker for an unresolved dependency miss even without a legacy hydration flag', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, {
+      ...modelDeps,
+      worker: new FakeWorker([{ status: 'failed', output: '', error: "worker dependency unavailable after one tool failure; code: MODULE_NOT_FOUND; Cannot find module 'worktree/node_modules/typescript/bin/tsc'" }]),
+    })
+    expect(first.status).toBe('stalled')
+    const firstState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    expect(firstState.dependencyBridgeActive).toBeUndefined()
+    const forbiddenWorker = new FakeWorker()
+    const refused = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker: forbiddenWorker })
+    expect(refused.status).toBe('stalled')
+    expect(refused.detail).toContain('newly published tree')
+    expect(refused.detail).toContain('MODULE_NOT_FOUND')
+    expect(forbiddenWorker.calls).toHaveLength(0)
   }, 90_000)
 
   it('honors a pre-aborted command signal before repository mutation', async () => {

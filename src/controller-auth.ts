@@ -1,4 +1,4 @@
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { parseChecklist, selectTask } from './checklist.js'
@@ -6,6 +6,8 @@ import { branch as gitBranch, resolveRepoRoot } from './git.js'
 import { inspectLifecycleAuthority } from './lifecycle-authority.js'
 import { isAuthenticatedPublicationRebase } from './publish.js'
 import { runFile } from './process.js'
+import { inspectRunStateProof, persistRunStateProof } from './run-state-proof.js'
+import { acquireLock, atomicWriteJson } from './state.js'
 import type { ChecklistTask, LifecycleAuthority, RunResult } from './types.js'
 
 interface StoredRunState {
@@ -30,6 +32,8 @@ interface StoredRunState {
   lifecycleAuthority?: LifecycleAuthority
   failureStreak?: { taskKey: string; signature: string; count: number }
   autoRecoveryBlocked?: boolean
+  dependencyBridgeActive?: boolean
+  windowsArgvBridgeActive?: boolean
   updatedAt: string
 }
 
@@ -54,22 +58,8 @@ export interface AuthenticatedController {
   detail?: string
   lifecycleAuthority?: LifecycleAuthority
   autoRecoveryBlocked?: boolean
-}
-
-function ownershipPayload(state: StoredRunState): string {
-  return JSON.stringify({
-    runId: state.runId,
-    repoRoot: state.repoRoot,
-    checklistRelative: state.checklistRelative,
-    branch: state.branch,
-    worktree: state.worktree,
-  })
-}
-
-function equalProof(actual: string, expected: string): boolean {
-  const left = Buffer.from(actual)
-  const right = Buffer.from(expected)
-  return left.length === right.length && timingSafeEqual(left, right)
+  dependencyBridgeActive?: boolean
+  windowsArgvBridgeActive?: boolean
 }
 
 function validTaskAttempts(value: unknown): value is Record<string, number> {
@@ -119,6 +109,8 @@ function parseStoredRun(path: string): StoredRunState | undefined {
       || !validLifecycleAuthority(value.lifecycleAuthority)
       || !validFailureStreak(value.failureStreak)
       || (value.autoRecoveryBlocked !== undefined && typeof value.autoRecoveryBlocked !== 'boolean')
+      || (value.dependencyBridgeActive !== undefined && typeof value.dependencyBridgeActive !== 'boolean')
+      || (value.windowsArgvBridgeActive !== undefined && typeof value.windowsArgvBridgeActive !== 'boolean')
       || typeof value.updatedAt !== 'string'
       || (value.lastError !== undefined && typeof value.lastError !== 'string')
       || (value.publicationTargetCommit !== undefined && (typeof value.publicationTargetCommit !== 'string' || !/^[0-9a-f]{40}$/u.test(value.publicationTargetCommit)))
@@ -129,6 +121,39 @@ function parseStoredRun(path: string): StoredRunState | undefined {
     return { ...value, taskAttempts: value.taskAttempts ?? {} } as StoredRunState
   } catch {
     return undefined
+  }
+}
+
+/** One-time lock-protected migration from the stable legacy ownership proof to full security-state authentication. */
+export async function migrateRunStateSecurityProof(cwd: string, runId: string): Promise<void> {
+  const repoRoot = realpathSync(await resolveRepoRoot(cwd))
+  const commonRaw = (await runFile('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot })).stdout.trim()
+  const commonDir = resolve(repoRoot, commonRaw)
+  const stateDir = join(commonDir, 'leppy-loop', 'runs', runId)
+  const statePath = join(stateDir, 'run.json')
+  const proofPath = join(stateDir, 'ownership.hmac')
+  const keyPath = join(stateDir, 'lease.key')
+  if (!existsSync(statePath) || !existsSync(proofPath) || !existsSync(keyPath)) return
+  const release = await acquireLock(commonDir, `state-proof-${runId}`)
+  try {
+    let state = parseStoredRun(statePath)
+    if (!state || state.runId !== runId || realpathSync(state.repoRoot) !== repoRoot || !existsSync(state.worktree)) return
+    const key = Buffer.from(readFileSync(keyPath, 'utf8').trim(), 'base64')
+    const status = inspectRunStateProof(stateDir, state, key)
+    if (status === 'invalid') throw new Error(`run ${runId} has an invalid ownership proof`)
+    if (status === 'legacy') {
+      state = { ...state }
+      delete state.lastError
+      delete state.failureStreak
+      delete state.autoRecoveryBlocked
+      delete state.dependencyBridgeActive
+      delete state.windowsArgvBridgeActive
+      state.updatedAt = new Date().toISOString()
+      atomicWriteJson(statePath, state)
+      persistRunStateProof(stateDir, state, key)
+    }
+  } finally {
+    release()
   }
 }
 
@@ -152,8 +177,7 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
     try { storedRoot = realpathSync(state.repoRoot) } catch { continue }
     if (storedRoot !== repoRoot || !existsSync(state.worktree)) continue
     const key = Buffer.from(readFileSync(keyPath, 'utf8').trim(), 'base64')
-    const expected = createHmac('sha256', key).update(ownershipPayload(state)).digest('base64url')
-    if (!equalProof(readFileSync(proofPath, 'utf8').trim(), expected)) continue
+    if (inspectRunStateProof(stateDir, state, key) === 'invalid') continue
     const lifecycleReceipt = inspectLifecycleAuthority(stateDir, state.runId)
     if (lifecycleReceipt.status === 'invalid' || (state.lifecycleAuthority !== undefined && lifecycleReceipt.status !== 'valid')) continue
     const lifecycleAuthority = lifecycleReceipt.status === 'valid' ? lifecycleReceipt.authority : undefined
@@ -203,6 +227,8 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       lifecycleAuthority,
       failureStreak: state.failureStreak,
       autoRecoveryBlocked: state.autoRecoveryBlocked,
+      dependencyBridgeActive: state.dependencyBridgeActive,
+      windowsArgvBridgeActive: state.windowsArgvBridgeActive,
     })).digest('hex')
     controllers.push({
       runId: state.runId,
@@ -223,6 +249,8 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       ...(state.lastError ? { detail: state.lastError } : {}),
       ...(lifecycleAuthority ? { lifecycleAuthority } : {}),
       ...(state.autoRecoveryBlocked === undefined ? {} : { autoRecoveryBlocked: state.autoRecoveryBlocked }),
+      ...(state.dependencyBridgeActive === undefined ? {} : { dependencyBridgeActive: state.dependencyBridgeActive }),
+      ...(state.windowsArgvBridgeActive === undefined ? {} : { windowsArgvBridgeActive: state.windowsArgvBridgeActive }),
       ...(publicationRebase ? { publicationRebase: true } : {}),
     })
   }

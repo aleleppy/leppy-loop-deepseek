@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { inspectAuthenticatedControllers } from '../src/controller-auth.js'
+import { inspectAuthenticatedControllers, migrateRunStateSecurityProof } from '../src/controller-auth.js'
 import { appendLifecycleAuthorityReceipt } from '../src/lifecycle-authority.js'
 import { createLeaseKey } from '../src/state.js'
 import type { LifecycleAuthority } from '../src/types.js'
@@ -54,6 +54,32 @@ describe('authenticated controller lifecycle authority integrity', () => {
     await expect(inspectAuthenticatedControllers(modern.root)).resolves.toHaveLength(1)
     const legacy = repository(false)
     await expect(inspectAuthenticatedControllers(legacy.root)).resolves.toHaveLength(1)
+  })
+
+  it('migrates legacy ownership once and rejects later recovery-state tampering', async () => {
+    const legacy = repository(false)
+    const statePath = join(legacy.stateDir, 'run.json')
+    const legacyState = JSON.parse(readFileSync(statePath, 'utf8')) as { lastError?: string; autoRecoveryBlocked?: boolean; dependencyBridgeActive?: boolean; windowsArgvBridgeActive?: boolean }
+    legacyState.lastError = 'forged legacy failure'
+    legacyState.autoRecoveryBlocked = true
+    legacyState.dependencyBridgeActive = true
+    legacyState.windowsArgvBridgeActive = true
+    writeFileSync(statePath, `${JSON.stringify(legacyState)}\n`)
+
+    await migrateRunStateSecurityProof(legacy.root, legacy.runId)
+    expect(readFileSync(join(legacy.stateDir, 'run-state-auth-required.hmac'), 'utf8')).not.toBe('')
+    const migrated = JSON.parse(readFileSync(statePath, 'utf8')) as typeof legacyState
+    expect(migrated.lastError).toBeUndefined()
+    expect(migrated.autoRecoveryBlocked).toBeUndefined()
+    expect(migrated.dependencyBridgeActive).toBeUndefined()
+    expect(migrated.windowsArgvBridgeActive).toBeUndefined()
+    await expect(inspectAuthenticatedControllers(legacy.root)).resolves.toHaveLength(1)
+
+    migrated.lastError = 'npm error code ENOTCACHED; cache mode is only-if-cached'
+    migrated.autoRecoveryBlocked = true
+    migrated.windowsArgvBridgeActive = true
+    writeFileSync(statePath, `${JSON.stringify(migrated)}\n`)
+    await expect(inspectAuthenticatedControllers(legacy.root)).resolves.toHaveLength(0)
   })
 
   it('quarantines a modern controller after receipt corruption or head deletion', async () => {

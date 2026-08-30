@@ -8,6 +8,7 @@ import type { WorkerAdapter, WorkerOutcome, WorkerRequest } from './types.js'
 import { createLeaseKey } from './state.js'
 import { redact, scrubEnvironment } from './security.js'
 import { parseWorkerReport, renderWorkerOutcomeContract } from './worker-report.js'
+import { windowsQuotedExecutableFailure } from './windows-command.js'
 
 export interface WorkerCredential {
   envName?: string
@@ -88,6 +89,14 @@ export class WorkerToolFailureCircuitBreaker {
     if (!nestedTrue(data?.message, 'isError') && !execFailure) return undefined
     const detail = (execFailure?.detail ?? texts.join('\n') ?? 'tool error').replace(/\bline \d+\b/giu, 'line #').slice(0, 2_048)
     const code = execFailure?.code ?? 'tool-error'
+    if ((/\bENOTCACHED\b/iu.test(detail) && /only-if-cached/iu.test(detail))
+      || (/\bMODULE_NOT_FOUND\b/iu.test(detail) && /node_modules[\\/]/iu.test(detail))
+      || /\bLEPPY_DEPENDENCY_UNAVAILABLE\b/iu.test(detail)) {
+      return `worker dependency unavailable after one tool failure; do not retry install or executable variants: ${detail}`
+    }
+    if (windowsQuotedExecutableFailure(detail)) {
+      return `worker Windows argv compatibility failure after one tool call; do not retry quoted executable variants: ${detail}`
+    }
     const signature = createHash('sha256').update([call.name, call.arguments, code, detail].join('\0')).digest('hex')
     const count = (this.signatures.get(signature) ?? 0) + 1
     this.signatures.set(signature, count)

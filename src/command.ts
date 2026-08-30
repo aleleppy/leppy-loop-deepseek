@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { isAbsolute, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,7 +12,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
 import { BUNDLED_SKILL_RANK, type SkillCandidate, type SkillDefinition, type SkillProvider } from '@deepseek-ai/dsh-skill'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { inspectAuthenticatedControllers, selectControllerForStatus } from './controller-auth.js'
+import { inspectAuthenticatedControllers, migrateRunStateSecurityProof, selectControllerForStatus } from './controller-auth.js'
 import type { AuthenticatedController } from './controller-auth.js'
 import { resolveRepoRoot } from './git.js'
 import { appendLifecycleAuthorityReceipt, lifecycleStateDir } from './lifecycle-authority.js'
@@ -21,6 +21,8 @@ import { HumanGrantStore } from './human-grant.js'
 import type { RecoveryAuthority } from './human-grant.js'
 import { runLeppyLoop } from './runner.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
+import { dependencyBridgeRecoveryAvailable, dependencyHydrationAvailable } from './worktree-dependencies.js'
+import { windowsQuotedExecutableFailure } from './windows-command.js'
 import type { LeppyLoopOptions, LifecycleAuthority, RunDependencies, RunProgress, RunResult, WorkerPolicy } from './types.js'
 
 declare module '@deepseek-ai/dsh-commands/types' {
@@ -455,6 +457,7 @@ export async function executeLeppyLoopControl(
   const runId = args.operation === 'start'
     ? randomUUID().replaceAll('-', '').slice(0, 12)
     : requireString(args.runId, 'runId')
+  if (args.operation === 'continue' && !runtime.hooks.inspectControllers) await migrateRunStateSecurityProof(cwd, runId)
   const controller = args.operation === 'continue' ? await authenticatedController(runtime, cwd, runId) : undefined
   const record = args.operation === 'stop'
     ? liveJobRecord(ctx, runtime, agent, repoRoot)
@@ -471,7 +474,12 @@ export async function executeLeppyLoopControl(
   }
 
   const livePermits = runtime.grants.permits(agent, repoRoot).filter(permit => permit.runId === runId)
+  const dependencyHydration = args.operation === 'continue' && controller !== undefined && dependencyHydrationAvailable(controller)
+  const dependencyRepair = dependencyHydration && controller !== undefined && dependencyBridgeRecoveryAvailable(controller)
+  const windowsArgvRepair = args.operation === 'continue' && controller?.autoRecoveryBlocked === true
+    && controller.windowsArgvBridgeActive !== true && windowsQuotedExecutableFailure(controller.detail)
   if (args.operation === 'continue' && controller?.autoRecoveryBlocked === true
+    && !dependencyRepair && !windowsArgvRepair
     && !livePermits.some(permit => permit.reauthorizedAt > Date.parse(controller.updatedAt))) {
     throw new Error('automatic recovery circuit is open; a fresh direct human /leppy-loop authorization is required before another unchanged attempt')
   }
@@ -481,7 +489,16 @@ export async function executeLeppyLoopControl(
   const reservation = runtime.grants.reserve({
     agent, repoRoot, runId, operation: args.operation, publishRemote: args.publish === true,
   })
-  const options = controllerOptions(args, cwd, repoRoot, runId, reservation.grant, controller)
+  const options: LeppyLoopOptions = {
+    ...controllerOptions(args, cwd, repoRoot, runId, reservation.grant, controller),
+    ...(dependencyHydration ? { dependencyHydrationRequired: true } : {}),
+    ...(dependencyRepair && controller?.detail
+      ? { dependencyRecoveryDigest: createHash('sha256').update(controller.detail).digest('hex') }
+      : {}),
+    ...(windowsArgvRepair && controller?.detail
+      ? { windowsArgvRecoveryDigest: createHash('sha256').update(controller.detail).digest('hex') }
+      : {}),
+  }
   let authorityPersisted = false
   try {
     await persistLifecycleAuthority(runtime, repoRoot, runId, options.lifecycleAuthority!)

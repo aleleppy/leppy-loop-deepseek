@@ -11,6 +11,12 @@ const project = resolve(import.meta.dirname, '..')
 function git(cwd: string, ...args: string[]): string { return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim() }
 
 describe('real Harness keyless composition', () => {
+  it('routes published and keyless worker personas through the same opaque prompt variable', () => {
+    for (const manifest of ['worker.cordis.yml', join('tests', 'fixtures', 'keyless-worker.cordis.yml')]) {
+      expect(readFileSync(join(project, manifest), 'utf8')).toContain("persona: '{{leppy_prompt}}'")
+    }
+  })
+
   it('opens an isolated SDK session, emits events, edits and commits through the scoped tools', async () => {
     const root = mkdtempSync(join(tmpdir(), 'leppy-keyless-'))
     mkdirSync(join(root, 'src'))
@@ -21,7 +27,7 @@ describe('real Harness keyless composition', () => {
     git(root, 'add', '--', 'src/value.txt')
     git(root, 'commit', '-m', 'chore: seed')
     const stateDir = mkdtempSync(join(tmpdir(), 'leppy-keyless-state-'))
-    const task: ChecklistTask = { index: 0, line: 1, phase: 'P', mark: ' ', kind: 'task', text: 'change value', raw: '- [ ] change', metadata: { done: 'value changed', paths: ['src/value.txt'] } }
+    const task: ChecklistTask = { index: 0, line: 1, phase: 'P', mark: ' ', kind: 'task', text: 'change value', raw: '- [ ] change', metadata: { done: 'value changed with {{ duration: 200 }}', paths: ['src/value.txt'] } }
     const adapter = new HarnessWorkerAdapter({
       credential: async () => ({ envName: 'REPLAY_API_KEY', value: 'keyless-unused', providerProfile: {} }),
       workerHostPath: join(project, 'dist', 'worker-host.js'),

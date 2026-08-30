@@ -104,6 +104,12 @@ export interface LeppyLoopOptions {
   repoRoot?: string
   /** Durable slash-command authority for same-session lifecycle continuation across Host restarts. */
   lifecycleAuthority?: LifecycleAuthority
+  /** Internal binding for a one-shot dependency-condition recovery; never exposed on the human surface. */
+  dependencyRecoveryDigest?: string
+  /** Require lock-protected publication of a new isolated tree before starting this transition. */
+  dependencyHydrationRequired?: boolean
+  /** Bind one recovery to the exact authenticated Windows structured-argv failure. */
+  windowsArgvRecoveryDigest?: string
 }
 
 export interface RunEvent<T = Record<string, unknown>> {
@@ -239,5 +245,7 @@ export interface RunDependencies {
   defaultModel?: () => Promise<{ provider: string; model: string; effort?: string }>
   publishPullRequest?: (request: PullRequestRequest, signal: AbortSignal, hooks: PublicationHooks) => Promise<PublishedPullRequest>
   onProgress?: (progress: RunProgress) => void | Promise<void>
+  /** Test seam for controller-owned npm lock materialization; production uses npm ci with scripts disabled. */
+  installNpmDependencies?: (installRoot: string, cacheRoot: string, signal?: AbortSignal) => Promise<void>
   signal?: AbortSignal
 }

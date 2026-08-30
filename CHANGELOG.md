@@ -2,6 +2,64 @@
 
 All notable changes are documented here.
 
+## [0.3.16] - 2026-08-29
+
+### Fixed
+
+- npm lock validation now recognizes `inBundle` package entries only when each child is explicitly named by its lock-recorded bundle parent and that recursive authority chain terminates at a credential-free HTTPS tarball with a supported integrity digest. This allows real npm locks such as Tailwind's integrity-covered WASM bundle to be materialized without weakening origin checks.
+- A prior `ENOTCACHED` or `MODULE_NOT_FOUND` dependency error is itself a pre-worker readiness requirement. The runner no longer depends on a legacy `dependencyBridgeActive` flag to fail closed, and a structurally `local` tree is not accepted as proof of repair: recovery requires the authenticated digest plus a newly published `copied` tree before another worker can start.
+- Dependency quota and payload validation now use bounded concurrent traversal instead of serially reopening every path. npm-installed trees retain receipt/package/shim/link/hardlink/count/byte/depth checks while npm's lock integrity remains the byte authority; trusted source copies still compare complete SHA-256 manifests. An isolated production smoke materialized the current 1,120-package rep-front lock in 2m49s instead of timing out after ten minutes.
+
+## [0.3.15] - 2026-08-29
+
+### Fixed
+
+- The controller no longer releases a worker when an npm worktree lacks its dependency tree. It copies a validated exact-lock source tree when available or materializes an integrity-pinned HTTPS npm lock itself in private staging, then validates and publishes the result before worker startup. A previously activated dependency bridge whose tree disappeared now fails closed during setup or recovers the exact authenticated `MODULE_NOT_FOUND` condition under the existing lifecycle authority; no second slash command is required.
+- `MODULE_NOT_FOUND` below `node_modules` now stops a worker after its first tool failure instead of consuming the eight-call budget.
+
+### Security
+
+- Controller-owned `npm ci` uses the Host Node installation's exact `npm-cli.js`, isolated empty npm configs and cache, an environment allowlist, disabled lifecycle scripts/audit/funding, HTTPS origins with supported integrity digests only, live file/byte/depth quotas, and process-tree cancellation. Unexpected packages, shims, hidden payloads, links and hardlinks are rejected, and publication never replaces an existing target.
+
+## [0.3.14] - 2026-08-29
+
+### Fixed
+
+- `leppy_exec` now removes redundant shell quotes from its structured executable field and, on Windows, resolves a repository-local `node_modules/.bin/<tool>` to its existing `.cmd` shim before sandbox confinement. Worker guidance states that command and args are separate argv fields, so POSIX quoting is never passed to `cmd.exe`.
+- Localized Windows `cmd.exe` failures for a quoted `node_modules` executable stop after the first tool error instead of exhausting eight calls. An exact authenticated prior failure may activate this compatibility bridge once under the existing lifecycle authority and repository lock; the condition digest and one-shot state are covered by the run-state HMAC.
+
+## [0.3.13] - 2026-08-29
+
+### Fixed
+
+- Fresh npm worktrees may receive an isolated copy of a trusted, already-installed source `node_modules` only with one unambiguous npm lock, equal source/worktree metadata, a structurally current hidden npm receipt, exactly the recorded package directories, and only declared executable shims. Hydration copies that allowlist without dereferencing into private run-state staging, rejects external links and hardlinks, enforces file/byte limits and cancellation, validates staging, and publishes by atomic rename. It performs no download or install script and never deletes a target; the bounded isolated tree follows the preserved worktree lifecycle.
+- An `ENOTCACHED`/`only-if-cached` stall with newly copyable dependencies is one proven changed condition, so the same persisted lifecycle authority can recover once without another slash command. The command binds an exact error digest; the runner revalidates it under the repository lock and requires a newly published isolated tree before clearing the circuit or starting a worker. Full recovery-state HMACs replace legacy identity-only proofs through a one-time lock-protected migration.
+- Deterministic offline dependency misses now stop the worker after the first failed tool call instead of consuming all eight failure-budget slots.
+
+## [0.3.12] - 2026-08-29
+
+### Fixed
+
+- Successful `git add` and `git commit` operations may now continue to an exact complete `rev-parse HEAD` reconciliation even when their diagnostic output exceeded the capture window. Content-bearing Git reads still reject lossy output, avoiding both silent partial search results and false failure reports after a commit was already created.
+
+## [0.3.11] - 2026-08-29
+
+### Fixed
+
+- Git-backed worker tools now reject lossy stdout or stderr captures instead of treating a retained 256 KiB tail as complete. Oversized searches fail with `GIT_OUTPUT_OVERFLOW` and instruct the worker to narrow the query; commit/status checks receive the same fail-closed protection.
+
+## [0.3.10] - 2026-08-29
+
+### Fixed
+
+- `leppy_search` now reports missing requested files or directories as a non-fatal discovery result instead of consuming the worker tool-failure budget. Existing scopes are still searched when requests mix present and absent paths; traversal, Git metadata, the controlling checklist, and unauthorized paths remain denied.
+
+## [0.3.9] - 2026-08-29
+
+### Fixed
+
+- Worker prompts now enter `deployment:persona` through one opaque prompt variable, so literal template-like task or project text such as `{{ duration: 200 }}` is preserved without being reinterpreted as a Harness prompt-variable reference.
+
 ## [0.3.8] - 2026-08-29
 
 ### Fixed

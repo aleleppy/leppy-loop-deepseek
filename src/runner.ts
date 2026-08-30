@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
@@ -12,8 +12,11 @@ import type { SignedLease } from './state.js'
 import { fingerprint, redact, scrubEnvironment } from './security.js'
 import { runFile, runOpaqueShell } from './process.js'
 import { physicalRelative } from './path.js'
+import { inspectRunStateProof, persistRunStateProof } from './run-state-proof.js'
 import { abortInterruptedPublicationRebase, isAuthenticatedPublicationRebase } from './publish.js'
 import { appendLifecycleAuthorityReceipt, inspectLifecycleAuthority } from './lifecycle-authority.js'
+import { dependencyResolutionMiss, inspectWorktreeDependencies, provisionWorktreeDependencies } from './worktree-dependencies.js'
+import { windowsQuotedExecutableFailure } from './windows-command.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import type {
   ChecklistTask, LeppyLoopOptions, LifecycleAuthority, ModelCapability, RunDependencies, RunEvent,
@@ -62,6 +65,8 @@ interface RunState {
   lifecycleAuthority?: LifecycleAuthority
   failureStreak?: { taskKey: string; signature: string; count: number }
   autoRecoveryBlocked?: boolean
+  dependencyBridgeActive?: boolean
+  windowsArgvBridgeActive?: boolean
   updatedAt: string
 }
 
@@ -91,7 +96,7 @@ function recordWorkerFailure(state: RunState, task: ChecklistTask, outcome: Work
   state.failureStreak = { taskKey, signature, count }
   state.autoRecoveryBlocked = outcome.status === 'blocked'
     || outcome.status === 'unavailable'
-    || /(?:repeated deterministic tool failure|tool failure budget exhausted)/iu.test(outcome.error ?? '')
+    || /(?:repeated deterministic tool failure|tool failure budget exhausted|Windows argv compatibility failure)/iu.test(outcome.error ?? '')
     || count >= 2
 }
 function clearWorkerFailure(state: RunState): void {
@@ -286,10 +291,8 @@ function validateModelSelection(catalog: readonly ModelCapability[], model: stri
 function writeState(path: string, state: RunState): void {
   state.updatedAt = new Date().toISOString()
   atomicWriteJson(path, state)
-}
-
-function ownership(state: RunState, key: Buffer): string {
-  return createHmac('sha256', key).update(JSON.stringify({ runId: state.runId, repoRoot: state.repoRoot, checklistRelative: state.checklistRelative, branch: state.branch, worktree: state.worktree })).digest('base64url')
+  const stateDir = dirname(path)
+  persistRunStateProof(stateDir, state, createLeaseKey(stateDir))
 }
 
 async function terminateAuthenticatedLease(stateDir: string, runId: string): Promise<void> {
@@ -319,7 +322,7 @@ async function recoverState(base: string, repoRoot: string, checklistRelative: s
     if (requestedRunId && state.runId !== requestedRunId) continue
     if (state.status === 'completed' && !requestedRunId) continue
     const key = createLeaseKey(dir)
-    if (readFileSync(proof, 'utf8').trim() !== ownership(state, key)) continue
+    if (inspectRunStateProof(dir, state, key) === 'invalid') continue
     matches.push({ state, dir })
   }
   let candidates = matches
@@ -431,8 +434,10 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   const recovered = options.recoverExistingWip ? await recoverState(stateBase, repoRoot, checklistRelative, options.recoverRunId) : undefined
   if (options.recoverExistingWip && !recovered) throw new Error('authenticated run disappeared during recovery')
   if (!recovered && !initialTask) throw new Error('checklist contains no open executable rows')
+  let recoveryError: string | undefined
   if (recovered) {
     state = recovered.state
+    recoveryError = state.lastError
     state.taskAttempts ??= {}
     applyLifecycleAuthority(state, options.lifecycleAuthority)
     stateDir = recovered.dir
@@ -468,14 +473,83 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         updatedAt: clock().toISOString(),
       }
       applyLifecycleAuthority(state, options.lifecycleAuthority)
-      const key = createLeaseKey(stateDir)
+      createLeaseKey(stateDir)
       writeState(join(stateDir, 'run.json'), state)
-      writeFileSync(join(stateDir, 'ownership.hmac'), `${ownership(state, key)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
       writeFileSync(join(stateDir, 'runner.pid'), `${process.pid}\n`, 'utf8')
       appendEvent(join(stateDir, 'events.jsonl'), event(runId, 'run-start', 'setup', { branch: state.branch, worktree: state.worktree, sourceHead: state.sourceHead }))
     } catch (error) {
       releaseLock()
       throw error
+    }
+  }
+
+  try {
+    if (options.windowsArgvRecoveryDigest) {
+      const observedDigest = recoveryError ? createHash('sha256').update(recoveryError).digest('hex') : undefined
+      if (observedDigest !== options.windowsArgvRecoveryDigest || !windowsQuotedExecutableFailure(recoveryError)
+        || state.windowsArgvBridgeActive === true) {
+        throw new Error('the authenticated Windows argv recovery condition changed before lock-protected activation')
+      }
+      state.windowsArgvBridgeActive = true
+      clearWorkerFailure(state)
+      writeState(join(stateDir, 'run.json'), state)
+      appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', { windowsStructuredArgv: 'activated' }))
+    }
+    const initialDependencyState = inspectWorktreeDependencies(state.repoRoot, state.worktree)
+    if (options.dependencyHydrationRequired && initialDependencyState.status !== 'copyable' && initialDependencyState.status !== 'installable') {
+      throw new Error('the admitted dependency hydration condition changed before lock-protected publication')
+    }
+    const repairingDependencyMiss = dependencyResolutionMiss(recoveryError)
+    if (repairingDependencyMiss && !options.dependencyRecoveryDigest) {
+      throw new Error(`an authenticated dependency recovery digest and a newly published tree are required before another worker; prior dependency error: ${recoveryError!.slice(-2_048)}`)
+    }
+    if (options.dependencyRecoveryDigest) {
+      const observedDigest = recoveryError ? createHash('sha256').update(recoveryError).digest('hex') : undefined
+      if (observedDigest !== options.dependencyRecoveryDigest || !repairingDependencyMiss) {
+        throw new Error('the authenticated dependency recovery error changed before lock-protected hydration')
+      }
+    }
+    const dependencyProvision = initialDependencyState.status === 'copyable' || initialDependencyState.status === 'installable' || initialDependencyState.status === 'local'
+      ? await provisionWorktreeDependencies(state.repoRoot, state.worktree, {
+        stagingRoot: join(stateDir, 'dependency-staging'), signal,
+        ...(dependencies.installNpmDependencies ? { installNpm: dependencies.installNpmDependencies } : {}),
+      })
+      : initialDependencyState
+    if (dependencyProvision.status === 'unavailable' && (state.dependencyBridgeActive === true || dependencyResolutionMiss(recoveryError))) {
+      const prior = dependencyResolutionMiss(recoveryError) ? `; prior dependency error: ${recoveryError!.slice(-2_048)}` : ''
+      throw new Error(`dependencies are not usable, so no worker was released: ${dependencyProvision.reason}${prior}`)
+    }
+    if (repairingDependencyMiss && dependencyProvision.status !== 'copied') {
+      throw new Error(`the authenticated dependency miss remains unresolved because setup did not publish a new isolated tree; prior dependency error: ${recoveryError!.slice(-2_048)}`)
+    }
+    if (options.dependencyHydrationRequired && dependencyProvision.status !== 'copied') {
+      throw new Error('the admitted dependency hydration did not publish a new isolated dependency tree')
+    }
+    if (dependencyProvision.status === 'local' || dependencyProvision.status === 'copied') {
+      state.dependencyBridgeActive = true
+      if (repairingDependencyMiss) clearWorkerFailure(state)
+      writeState(join(stateDir, 'run.json'), state)
+      if (repairingDependencyMiss) {
+        appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', {
+          dependencyHydration: dependencyProvision.status, lockfile: dependencyProvision.lockfile,
+        }))
+      }
+    }
+  } catch (error) {
+    const detail = `pre-worker setup failed: ${redact(error instanceof Error ? error.message : String(error))}`
+    state.status = 'stalled'
+    state.lastError = detail
+    state.autoRecoveryBlocked = true
+    try {
+      writeState(join(stateDir, 'run.json'), state)
+      appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'stall', 'setup', { error: detail }))
+    } finally {
+      releaseLock()
+    }
+    return {
+      runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir,
+      completedTasks: state.completedTasks, ...(state.currentTask !== undefined ? { currentTask: state.currentTask } : {}),
+      diagnostics, detail,
     }
   }
 
@@ -823,9 +897,13 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       validateModelSelection(catalog, model.model, model.effort)
       const controllerHash = digest(readFileSync(checklistPath, 'utf8'))
       const previousHead = await head(state.worktree)
+      const dependencyBridge = inspectWorktreeDependencies(state.repoRoot, state.worktree)
       const instructions = [
         ...legacyCustomInstructions(state.worktree),
         ...await discoverInstructions(state.worktree, allowedPaths),
+        ...(dependencyBridge.status === 'local' ? [
+          `The controller copied and verified an isolated node_modules against ${dependencyBridge.lockfile}. Use repository package scripts or local tools; do not install packages. leppy_exec is structured argv: pass the executable in command and flags in args without any shell quote characters; on Windows node_modules/.bin automatically selects its .cmd shim. If a local tool is still unavailable, report blocked after the first failure instead of retrying variants.`,
+        ] : []),
         ...(task.index === gateRepairContext?.closureIndex ? [
           gateRepairContext.instruction,
           ...(gateRepairContext.additionalPaths?.length ? [`Direct human authorized these additional repair scopes: ${gateRepairContext.additionalPaths.join(', ')}`] : []),

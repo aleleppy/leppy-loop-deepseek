@@ -52,6 +52,59 @@ function terminateProcessTree(pid: number, fallback: () => void): void {
   }
 }
 
+export async function runFileTree(
+  file: string,
+  args: readonly string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; signal: AbortSignal },
+): Promise<CommandResult> {
+  if (options.signal.aborted) throw signalError(options.signal)
+  return await new Promise((resolvePromise, reject) => {
+    const child = spawn(file, [...args], {
+      cwd: options.cwd, env: options.env, windowsHide: true, shell: false,
+      detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    let outputBytes = 0
+    let localFailure: Error | undefined
+    let settled = false
+    const abortTree = (reason?: Error): void => {
+      if (reason) localFailure = reason
+      if (child.pid !== undefined) terminateProcessTree(child.pid, () => { child.kill('SIGTERM') })
+      else child.kill('SIGTERM')
+    }
+    const collect = (target: Buffer[], chunk: unknown): void => {
+      const buffer = Buffer.from(chunk as Uint8Array)
+      outputBytes += buffer.length
+      if (outputBytes > 16 * 1024 * 1024) abortTree(new Error('command output exceeded 16 MiB'))
+      else target.push(buffer)
+    }
+    child.stdout?.on('data', chunk => collect(stdout, chunk))
+    child.stderr?.on('data', chunk => collect(stderr, chunk))
+    const abort = (): void => abortTree(signalError(options.signal))
+    options.signal.addEventListener('abort', abort, { once: true })
+    const timeout = options.timeoutMs === undefined ? undefined : setTimeout(() => abortTree(new Error(`command timed out after ${options.timeoutMs}ms`)), options.timeoutMs)
+    const cleanup = (): void => {
+      options.signal.removeEventListener('abort', abort)
+      if (timeout) clearTimeout(timeout)
+    }
+    child.once('error', error => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(error)
+    })
+    child.once('close', code => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (localFailure) { reject(localFailure); return }
+      if (options.signal.aborted) { reject(signalError(options.signal)); return }
+      resolvePromise({ stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8'), exitCode: code ?? 1 })
+    })
+  })
+}
+
 export async function runOpaqueShell(command: string, cwd: string, signal: AbortSignal, env?: NodeJS.ProcessEnv): Promise<CommandResult> {
   if (signal.aborted) throw signalError(signal)
   const file = process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh'

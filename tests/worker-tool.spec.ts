@@ -31,16 +31,40 @@ function runner(root: string) {
   }
 }
 
-function registeredTools(root: string, mode: 'task' | 'publication-conflict'): string[] {
-  const variables = ['LEPPY_WORKTREE', 'LEPPY_CHECKLIST', 'LEPPY_ALLOWED_PATHS', 'LEPPY_WORKER_MODE'] as const
+interface RegisteredWorkerTool {
+  name: string
+  execute: (args: Record<string, unknown>, exec?: { signal: AbortSignal }) => Promise<unknown>
+}
+
+function registeredRuntime(
+  root: string,
+  mode: 'task' | 'publication-conflict',
+  output: { stdoutLossy?: boolean; stderrLossy?: boolean } = {},
+): { tools: string[]; definitions: RegisteredWorkerTool[]; commands: string[][]; promptVariables: Array<{ name: string; value: string }> } {
+  const variables = ['LEPPY_WORKTREE', 'LEPPY_CHECKLIST', 'LEPPY_ALLOWED_PATHS', 'LEPPY_WORKER_MODE', 'LEPPY_SYSTEM_PROMPT'] as const
   const previous = Object.fromEntries(variables.map(name => [name, process.env[name]]))
   process.env.LEPPY_WORKTREE = root
   process.env.LEPPY_CHECKLIST = 'tasks.task.md'
   process.env.LEPPY_ALLOWED_PATHS = JSON.stringify(['prisma/schemas/auth.prisma'])
   process.env.LEPPY_WORKER_MODE = mode
-  const names: string[] = []
+  process.env.LEPPY_SYSTEM_PROMPT = 'preserve literal {{ duration: 200 }}'
+  const tools: string[] = []
+  const definitions: RegisteredWorkerTool[] = []
+  const commands: string[][] = []
+  const promptVariables: Array<{ name: string; value: string }> = []
   try {
-    applyWorkerTools({ tools: { register: (definition: { name: string }) => { names.push(definition.name); return () => {} } } } as unknown as Context)
+    const stdout = { readFrom: () => ({ text: '', nextOffset: 0, lossy: output.stdoutLossy ?? false }) }
+    const stderr = { readFrom: () => ({ text: '', nextOffset: 0, lossy: output.stderrLossy ?? false }) }
+    applyWorkerTools({
+      systemPrompt: { variable: (name: string, provider: () => string) => { promptVariables.push({ name, value: provider() }); return () => {} } },
+      tools: { register: (definition: RegisteredWorkerTool) => { tools.push(definition.name); definitions.push(definition); return () => {} } },
+      subprocess: {
+        resolveExecutable: async () => 'git',
+        spawn: ({ argv }: { argv: string[] }) => { commands.push(argv); return { done: Promise.resolve({ exitCode: 1 }), collected: { stdout, stderr } } },
+      },
+      sandboxPolicy: { resolve: () => ({ mode: 'workspace-write' }) },
+      sandbox: { confine: (argv: string[]) => ({ argv }) },
+    } as unknown as Context)
   } finally {
     for (const name of variables) {
       const value = previous[name]
@@ -48,7 +72,7 @@ function registeredTools(root: string, mode: 'task' | 'publication-conflict'): s
       else process.env[name] = value
     }
   }
-  return names
+  return { tools, definitions, commands, promptVariables }
 }
 
 describe('worker commit capability', () => {
@@ -86,10 +110,82 @@ describe('worker commit capability', () => {
     await expect(commitTaskChanges(policy, 'fix: forbidden conflict commit', runner(root))).rejects.toThrow('cannot commit')
   })
 
-  it('registers only edit tools in publication conflict mode', () => {
+  it('registers the opaque worker prompt variable and only edit tools in publication conflict mode', () => {
     const root = repository()
-    expect(registeredTools(root, 'publication-conflict')).toEqual(['leppy_read', 'leppy_write', 'leppy_delete'])
-    expect(registeredTools(root, 'task')).toEqual(['leppy_read', 'leppy_search', 'leppy_edit', 'leppy_commit', 'leppy_write', 'leppy_exec'])
+    const conflict = registeredRuntime(root, 'publication-conflict')
+    const task = registeredRuntime(root, 'task')
+    expect(conflict.promptVariables).toEqual([{ name: 'leppy_prompt', value: 'preserve literal {{ duration: 200 }}' }])
+    expect(conflict.tools).toEqual(['leppy_read', 'leppy_write', 'leppy_delete'])
+    expect(task.tools).toEqual(['leppy_read', 'leppy_search', 'leppy_edit', 'leppy_commit', 'leppy_write', 'leppy_exec'])
+  })
+
+  it('normalizes quoted local executables and selects the Windows npm cmd shim before confinement', async () => {
+    const root = repository()
+    mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(join(root, 'node_modules', '.bin', 'tsc.cmd'), '@echo off\r\n')
+    const runtime = registeredRuntime(root, 'task')
+    const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    await expect(execute({ command: "'node_modules/.bin/tsc'", args: ['--noEmit'] }, { signal: new AbortController().signal })).rejects.toThrow('command failed')
+    expect(runtime.commands.at(-1)).toEqual([process.platform === 'win32' ? 'node_modules/.bin/tsc.cmd' : 'node_modules/.bin/tsc', '--noEmit'])
+  })
+
+  it('reports a missing search path as a non-fatal discovery result', async () => {
+    const root = repository()
+    const search = registeredRuntime(root, 'task').definitions.find(definition => definition.name === 'leppy_search')
+    expect(search).toBeDefined()
+    await expect(search!.execute({ pattern: 'Company', paths: ['messages'] })).resolves.toEqual({
+      text: 'No requested search path exists: messages',
+    })
+  })
+
+  it('searches only existing scopes when requested paths are mixed', async () => {
+    const root = repository()
+    const runtime = registeredRuntime(root, 'task')
+    const search = runtime.definitions.find(definition => definition.name === 'leppy_search')
+    expect(search).toBeDefined()
+    await expect(search!.execute({ pattern: 'Seed', paths: ['messages', 'prisma/schemas'] })).resolves.toEqual({
+      text: 'Skipped missing search path(s): messages\n',
+    })
+    expect(runtime.commands).toHaveLength(1)
+    const argv = runtime.commands[0]!.map(argument => argument.replaceAll('\\', '/'))
+    expect(argv).toContain('prisma/schemas')
+    expect(argv).not.toContain('messages')
+    expect(argv).not.toContain('.')
+  })
+
+  it('fails clearly when Git search output is truncated on either stream', async () => {
+    const root = repository()
+    for (const output of [{ stdoutLossy: true }, { stderrLossy: true }]) {
+      const runtime = registeredRuntime(root, 'task', output)
+      const search = runtime.definitions.find(definition => definition.name === 'leppy_search')
+      expect(search).toBeDefined()
+      await expect(search!.execute({ pattern: 'Seed', paths: ['prisma/schemas'] })).rejects.toThrow(
+        'GIT_OUTPUT_OVERFLOW: repository search exceeded the 256 KiB capture limit',
+      )
+    }
+  })
+
+  it('reconciles HEAD after a successful commit whose diagnostic output was truncated', async () => {
+    const root = repository()
+    const commitId = '0123456789abcdef0123456789abcdef01234567'
+    const commands: string[][] = []
+    const runGit = async (args: readonly string[]) => {
+      commands.push([...args])
+      if (args[0] === 'diff' && !args.includes('--cached')) {
+        return { exitCode: 0, stdout: 'prisma/schemas/auth.prisma\0', stderr: '' }
+      }
+      if (args[0] === 'commit') return { exitCode: 0, stdout: 'retained commit tail', stderr: '', lossy: true }
+      if (args[0] === 'rev-parse') return { exitCode: 0, stdout: `${commitId}\n`, stderr: '' }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    const policy: WorkerPolicy = {
+      root,
+      checklist: join(root, 'tasks.task.md'),
+      allowed: [join(root, 'prisma', 'schemas', 'auth.prisma')],
+    }
+
+    await expect(commitTaskChanges(policy, 'fix: reconcile lossy commit output', runGit)).resolves.toBe(commitId)
+    expect(commands.slice(-2).map(args => args[0])).toEqual(['commit', 'rev-parse'])
   })
 
   it('force-adds only changed ignored files inside the declared task scope', async () => {

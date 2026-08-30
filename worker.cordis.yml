@@ -31,7 +31,9 @@
 - id: agent-spine
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
-    persona: !!js process.env.LEPPY_SYSTEM_PROMPT
+    # Resolve the full worker prompt as one opaque variable value. DSH intentionally
+    # does not re-scan substituted values, so task prose may safely contain literal {{…}}.
+    persona: '{{leppy_prompt}}'
     workspaceContext: false
     skills:
       enabled: false
