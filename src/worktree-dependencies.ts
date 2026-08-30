@@ -1,13 +1,16 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { cp, lstat, mkdir, open, opendir, readlink, realpath, rename, rm, utimes, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { runFileTree } from './process.js'
+import { atomicWriteJson } from './state.js'
 
 const LOCKFILES = ['npm-shrinkwrap.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'] as const
 const MAX_DEPENDENCY_FILES = 500_000
 const MAX_DEPENDENCY_BYTES = 8 * 1024 * 1024 * 1024
+const INVALID_WORKTREE_TREE_REASON = 'worktree node_modules exists but is not a physical npm tree matching its lockfile'
+export const DEPENDENCY_REPLACEMENT_PENDING_CODE = 'LEPPY_DEPENDENCY_REPLACEMENT_PENDING'
 
 export type WorktreeDependencyInspection =
   | { status: 'local'; lockfile: string }
@@ -24,6 +27,10 @@ export interface WorktreeDependencyProvisionOptions {
   stagingRoot: string
   signal?: AbortSignal
   installNpm?: (installRoot: string, cacheRoot: string, signal?: AbortSignal) => Promise<void>
+  /** Exact-digest recovery only: atomically quarantine and replace an invalid existing target tree. */
+  replaceInvalidTarget?: boolean
+  /** Test-only hook for exercising post-publication ownership races. */
+  afterDependencyPublish?: (targetModules: string) => Promise<void>
   /** Test-only lower entry ceiling; production always uses MAX_DEPENDENCY_FILES. */
   maxDependencyFiles?: number
 }
@@ -31,6 +38,16 @@ export interface WorktreeDependencyProvisionOptions {
 interface NpmInstallPlan {
   packagePaths: string[]
   binNames: Set<string>
+}
+
+function entryExists(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
 }
 
 function sameMetadataFile(left: string, right: string, binary = false): boolean {
@@ -354,10 +371,10 @@ export function inspectWorktreeDependencies(repoRoot: string, worktree: string):
   }
 
   const targetModules = join(workerRoot, 'node_modules')
-  if (existsSync(targetModules)) {
+  if (entryExists(targetModules)) {
     return npmInstallPlan(workerRoot, targetModules, lockfile)
       ? { status: 'local', lockfile }
-      : { status: 'unavailable', reason: 'worktree node_modules exists but is not a physical npm tree matching its lockfile' }
+      : { status: 'unavailable', reason: INVALID_WORKTREE_TREE_REASON }
   }
 
   const sourcePackage = join(sourceRoot, 'package.json')
@@ -480,22 +497,222 @@ async function installNpmFromLock(installRoot: string, cacheRoot: string, signal
   }
 }
 
-async function publishDependencyTreeNoReplace(stagingModules: string, targetModules: string): Promise<void> {
+type DependencyPathType = 'directory' | 'symlink' | 'file' | 'other'
+
+interface DependencyPathIdentity {
+  dev: string
+  ino: string
+  type: DependencyPathType
+}
+
+interface DependencyReplacementTransaction {
+  version: 1
+  transactionId: string
+  phase: 'prepared' | 'quarantined' | 'publishing' | 'published'
+  workerRoot: string
+  targetModules: string
+  quarantineModules: string
+  lockfile: string
+  materializedBy?: 'trusted-copy' | 'npm-ci'
+  originalIdentity: DependencyPathIdentity
+  publishedIdentity?: DependencyPathIdentity
+}
+
+function identityRecord(value: unknown): value is DependencyPathIdentity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const candidate = value as Partial<DependencyPathIdentity>
+  return typeof candidate.dev === 'string' && /^\d+$/u.test(candidate.dev)
+    && typeof candidate.ino === 'string' && /^\d+$/u.test(candidate.ino)
+    && ['directory', 'symlink', 'file', 'other'].includes(candidate.type ?? '')
+}
+
+async function dependencyPathIdentity(path: string): Promise<DependencyPathIdentity | undefined> {
+  try {
+    const stats = await lstat(path, { bigint: true })
+    return {
+      dev: stats.dev.toString(), ino: stats.ino.toString(),
+      type: stats.isDirectory() ? 'directory' : stats.isSymbolicLink() ? 'symlink' : stats.isFile() ? 'file' : 'other',
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+function sameDependencyIdentity(left: DependencyPathIdentity | undefined, right: DependencyPathIdentity | undefined): boolean {
+  return left !== undefined && right !== undefined
+    && left.dev === right.dev && left.ino === right.ino && left.type === right.type
+}
+
+function replacementReceiptPath(stagingRoot: string): string {
+  return `${stagingRoot}-replacement.json`
+}
+
+export function dependencyReplacementTransactionPending(stagingRoot: string): boolean {
+  return entryExists(replacementReceiptPath(resolve(stagingRoot)))
+}
+
+function readReplacementTransaction(receiptPath: string, stagingRoot: string, workerRoot: string, targetModules: string): DependencyReplacementTransaction | undefined {
+  if (!entryExists(receiptPath)) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(receiptPath, 'utf8'))
+  } catch {
+    throw new Error('private dependency replacement receipt is invalid JSON')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('private dependency replacement receipt is invalid')
+  const candidate = parsed as Partial<DependencyReplacementTransaction>
+  const phases = ['prepared', 'quarantined', 'publishing', 'published']
+  const materializers = ['trusted-copy', 'npm-ci']
+  const quarantinePrefix = `${stagingRoot}-replaced-node-modules-`
+  if (candidate.version !== 1 || typeof candidate.transactionId !== 'string' || !/^[0-9a-f-]{36}$/u.test(candidate.transactionId)
+    || !phases.includes(candidate.phase ?? '') || candidate.workerRoot !== workerRoot || candidate.targetModules !== targetModules
+    || candidate.quarantineModules !== `${quarantinePrefix}${candidate.transactionId}` || typeof candidate.lockfile !== 'string'
+    || (candidate.materializedBy !== undefined && !materializers.includes(candidate.materializedBy)) || !identityRecord(candidate.originalIdentity)
+    || (candidate.publishedIdentity !== undefined && (!identityRecord(candidate.publishedIdentity) || candidate.materializedBy === undefined))) {
+    throw new Error('private dependency replacement receipt does not match the authenticated worktree')
+  }
+  return candidate as DependencyReplacementTransaction
+}
+
+async function removeOwnedDependencyPath(path: string, expected: DependencyPathIdentity, privateRemovalPath: string): Promise<void> {
+  const before = await dependencyPathIdentity(path)
+  if (!sameDependencyIdentity(before, expected)) throw new Error('dependency target identity changed before controller-owned removal')
+  if (entryExists(privateRemovalPath)) throw new Error('private dependency removal path already exists')
+  await rename(path, privateRemovalPath)
+  const moved = await dependencyPathIdentity(privateRemovalPath)
+  if (!sameDependencyIdentity(moved, expected)) {
+    if (!entryExists(path)) await rename(privateRemovalPath, path)
+    throw new Error('dependency target identity changed during controller-owned removal')
+  }
+  await rm(privateRemovalPath, { recursive: true, force: true })
+}
+
+async function publishDependencyTreeNoReplace(
+  stagingModules: string,
+  targetModules: string,
+  onTargetOwnership: (identity: DependencyPathIdentity) => void,
+): Promise<DependencyPathIdentity> {
   if (process.platform === 'win32') {
-    if (existsSync(targetModules)) throw new Error('worktree node_modules appeared before atomic hydration publish')
+    const expected = await dependencyPathIdentity(stagingModules)
+    if (!expected || expected.type !== 'directory') throw new Error('staged dependency root disappeared before publication')
+    onTargetOwnership(expected)
+    if (entryExists(targetModules)) throw new Error('worktree node_modules appeared before atomic hydration publish')
     await rename(stagingModules, targetModules)
-    return
+    const published = await dependencyPathIdentity(targetModules)
+    if (!sameDependencyIdentity(published, expected)) throw new Error('published dependency target identity changed during atomic rename')
+    return expected
   }
   await mkdir(targetModules, { recursive: false })
+  const expected = await dependencyPathIdentity(targetModules)
+  if (!expected || expected.type !== 'directory') throw new Error('exclusive dependency target identity is unavailable')
+  onTargetOwnership(expected)
   try {
     await cp(stagingModules, targetModules, {
       recursive: true, dereference: false, verbatimSymlinks: true, preserveTimestamps: true,
       force: false, errorOnExist: true,
     })
     await rm(stagingModules, { recursive: true, force: true })
+    const published = await dependencyPathIdentity(targetModules)
+    if (!sameDependencyIdentity(published, expected)) throw new Error('published dependency target identity changed during copy')
+    return expected
   } catch (error) {
     throw new Error(`exclusive dependency publication failed; partial controller-owned target was retained: ${error instanceof Error ? error.message : String(error)}`)
   }
+}
+
+interface ReplacementReconciliation {
+  result?: WorktreeDependencyProvision
+  transaction?: DependencyReplacementTransaction
+}
+
+function resetReplacementTransaction(transaction: DependencyReplacementTransaction, receiptPath: string): DependencyReplacementTransaction {
+  const reset: DependencyReplacementTransaction = { ...transaction, phase: 'quarantined' }
+  delete reset.publishedIdentity
+  atomicWriteJson(receiptPath, reset)
+  return reset
+}
+
+async function reconcileReplacementTransaction(
+  repoRoot: string,
+  workerRoot: string,
+  targetModules: string,
+  stagingRoot: string,
+  signal: AbortSignal | undefined,
+  maxFiles: number,
+): Promise<ReplacementReconciliation> {
+  const receiptPath = replacementReceiptPath(stagingRoot)
+  let transaction = readReplacementTransaction(receiptPath, stagingRoot, workerRoot, targetModules)
+  if (!transaction) return {}
+  let targetIdentity = await dependencyPathIdentity(targetModules)
+  const quarantineIdentity = await dependencyPathIdentity(transaction.quarantineModules)
+  const ownedRemovalPath = `${stagingRoot}-owned-target-${transaction.transactionId}`
+  const strandedOwnedIdentity = await dependencyPathIdentity(ownedRemovalPath)
+
+  if (strandedOwnedIdentity) {
+    if (!transaction.publishedIdentity || !sameDependencyIdentity(strandedOwnedIdentity, transaction.publishedIdentity)) {
+      return { result: { status: 'unavailable', reason: 'private dependency replacement has an unrecognized stranded target' } }
+    }
+    await removeOwnedDependencyPath(
+      ownedRemovalPath,
+      transaction.publishedIdentity,
+      `${ownedRemovalPath}-discard-${transaction.transactionId}`,
+    )
+    targetIdentity = await dependencyPathIdentity(targetModules)
+    if (targetIdentity) return { result: { status: 'unavailable', reason: 'an unowned node_modules target appeared during crash recovery' } }
+  }
+
+  if (!transaction.publishedIdentity) {
+    if (sameDependencyIdentity(targetIdentity, transaction.originalIdentity) && !quarantineIdentity) {
+      await rm(receiptPath, { force: true })
+      return {}
+    }
+    if (!targetIdentity && sameDependencyIdentity(quarantineIdentity, transaction.originalIdentity)) {
+      transaction = resetReplacementTransaction(transaction, receiptPath)
+      return { transaction }
+    }
+    return { result: { status: 'unavailable', reason: 'dependency replacement crashed before target ownership could be proven' } }
+  }
+
+  if (!targetIdentity) {
+    if (!sameDependencyIdentity(quarantineIdentity, transaction.originalIdentity)) {
+      return { result: { status: 'unavailable', reason: 'published dependency target disappeared and its quarantine cannot be authenticated' } }
+    }
+    transaction = resetReplacementTransaction(transaction, receiptPath)
+    return { transaction }
+  }
+  if (!sameDependencyIdentity(targetIdentity, transaction.publishedIdentity)) {
+    return { result: { status: 'unavailable', reason: 'published dependency target identity changed; no unowned path was deleted' } }
+  }
+
+  if (transaction.phase === 'published') {
+    const inspection = inspectWorktreeDependencies(repoRoot, workerRoot)
+    if (inspection.status === 'local' && inspection.lockfile === transaction.lockfile) {
+      if (!transaction.materializedBy) return { result: { status: 'unavailable', reason: 'published dependency transaction lacks its materializer receipt' } }
+      const plan = npmInstallPlan(workerRoot, targetModules, inspection.lockfile)
+      if (!plan) return { result: { status: 'unavailable', reason: 'published dependency receipt changed during crash recovery' } }
+      await dependencyPayloadManifest(targetModules, plan, signal, false, maxFiles)
+      if (sameDependencyIdentity(quarantineIdentity, transaction.originalIdentity)) {
+        await removeOwnedDependencyPath(
+          transaction.quarantineModules,
+          transaction.originalIdentity,
+          `${stagingRoot}-old-target-${transaction.transactionId}`,
+        ).catch(() => {})
+      }
+      await rm(receiptPath, { force: true })
+      return { result: { status: 'copied', lockfile: transaction.lockfile, materializedBy: transaction.materializedBy } }
+    }
+  }
+
+  if (!sameDependencyIdentity(quarantineIdentity, transaction.originalIdentity)) {
+    return { result: { status: 'unavailable', reason: 'partial dependency publication cannot be rolled back because quarantine identity changed' } }
+  }
+  await removeOwnedDependencyPath(targetModules, transaction.publishedIdentity, ownedRemovalPath)
+  if (await dependencyPathIdentity(targetModules)) {
+    return { result: { status: 'unavailable', reason: 'an unowned node_modules target appeared after identity-bound rollback' } }
+  }
+  transaction = resetReplacementTransaction(transaction, receiptPath)
+  return { transaction }
 }
 
 /** Materialize a validated npm tree in private staging and publish without replacing a target. */
@@ -506,35 +723,77 @@ export async function provisionWorktreeDependencies(
 ): Promise<WorktreeDependencyProvision> {
   const maxFiles = options.maxDependencyFiles ?? MAX_DEPENDENCY_FILES
   if (!Number.isSafeInteger(maxFiles) || maxFiles < 1 || maxFiles > MAX_DEPENDENCY_FILES) throw new Error('invalid dependency entry limit')
-  const inspection = inspectWorktreeDependencies(repoRoot, worktree)
-  if (inspection.status === 'local') {
-    const workerRoot = realpathSync(worktree)
-    const modulesRoot = join(workerRoot, 'node_modules')
-    const plan = npmInstallPlan(workerRoot, modulesRoot, inspection.lockfile)
-    if (!plan) throw new Error('local npm dependency receipt changed before readiness validation')
-    await dependencyPayloadManifest(modulesRoot, plan, options.signal, false, maxFiles)
-    return inspection
-  }
-  if (inspection.status === 'unavailable') return inspection
   const workerRoot = realpathSync(worktree)
   const targetModules = join(workerRoot, 'node_modules')
-  if (existsSync(targetModules)) return { status: 'unavailable', reason: 'worktree node_modules appeared before hydration' }
-
   const stagingRoot = resolve(options.stagingRoot)
   const stagingModules = join(stagingRoot, 'node_modules')
-  await rm(stagingRoot, { recursive: true, force: true })
-  await mkdir(stagingRoot, { recursive: true })
+  const receiptPath = replacementReceiptPath(stagingRoot)
+  let transaction: DependencyReplacementTransaction | undefined
+  if (options.replaceInvalidTarget) {
+    const reconciled = await reconcileReplacementTransaction(repoRoot, workerRoot, targetModules, stagingRoot, options.signal, maxFiles)
+    if (reconciled.result) return reconciled.result
+    transaction = reconciled.transaction
+  }
+  let inspection = inspectWorktreeDependencies(repoRoot, worktree)
+  let publishedIdentity: DependencyPathIdentity | undefined
+
   try {
-    if (inspection.status === 'copyable') {
-      const plan = npmInstallPlan(realpathSync(repoRoot), inspection.sourceModules, inspection.lockfile)
+    if (inspection.status === 'local') {
+      const plan = npmInstallPlan(workerRoot, targetModules, inspection.lockfile)
+      if (!plan) throw new Error('local npm dependency receipt changed before readiness validation')
+      await dependencyPayloadManifest(targetModules, plan, options.signal, false, maxFiles)
+      return inspection
+    }
+    if (inspection.status === 'unavailable' && (!options.replaceInvalidTarget || inspection.reason !== INVALID_WORKTREE_TREE_REASON)) return inspection
+    if (inspection.status === 'unavailable') {
+      const originalIdentity = await dependencyPathIdentity(targetModules)
+      if (!originalIdentity) return inspection
+      const transactionId = randomUUID()
+      const quarantineModules = `${stagingRoot}-replaced-node-modules-${transactionId}`
+      if (entryExists(quarantineModules)) return { status: 'unavailable', reason: 'private dependency replacement quarantine already exists' }
+      transaction = {
+        version: 1, transactionId, phase: 'prepared', workerRoot, targetModules, quarantineModules,
+        lockfile: existingLockfiles(workerRoot)[0]!, originalIdentity,
+      }
+      atomicWriteJson(receiptPath, transaction)
+      await rename(targetModules, quarantineModules)
+      const quarantinedIdentity = await dependencyPathIdentity(quarantineModules)
+      if (!sameDependencyIdentity(quarantinedIdentity, originalIdentity)) throw new Error('dependency quarantine identity changed during atomic rename')
+      transaction = { ...transaction, phase: 'quarantined' }
+      atomicWriteJson(receiptPath, transaction)
+      inspection = inspectWorktreeDependencies(repoRoot, worktree)
+      if (inspection.status === 'local' || inspection.status === 'unavailable') {
+        throw new Error(`quarantined dependency target cannot be materialized: ${inspection.status === 'unavailable' ? inspection.reason : 'target unexpectedly remained local'}`)
+      }
+      transaction = {
+        ...transaction,
+        materializedBy: inspection.status === 'copyable' ? 'trusted-copy' : 'npm-ci',
+      }
+      atomicWriteJson(receiptPath, transaction)
+    }
+    if (entryExists(targetModules)) return { status: 'unavailable', reason: 'worktree node_modules appeared before hydration' }
+    if (inspection.status !== 'copyable' && inspection.status !== 'installable') throw new Error('dependency inspection is not provisionable')
+    const provisionableInspection = inspection
+    if (transaction && !transaction.materializedBy) {
+      transaction = {
+        ...transaction,
+        materializedBy: provisionableInspection.status === 'copyable' ? 'trusted-copy' : 'npm-ci',
+      }
+      atomicWriteJson(receiptPath, transaction)
+    }
+
+    await rm(stagingRoot, { recursive: true, force: true })
+    await mkdir(stagingRoot, { recursive: true })
+    if (provisionableInspection.status === 'copyable') {
+      const plan = npmInstallPlan(realpathSync(repoRoot), provisionableInspection.sourceModules, provisionableInspection.lockfile)
       if (!plan) throw new Error('source npm dependency receipt changed before hydration')
-      const sourceManifest = await dependencyPayloadManifest(inspection.sourceModules, plan, options.signal, true, maxFiles)
-      await cp(inspection.sourceModules, stagingModules, {
+      const sourceManifest = await dependencyPayloadManifest(provisionableInspection.sourceModules, plan, options.signal, true, maxFiles)
+      await cp(provisionableInspection.sourceModules, stagingModules, {
         recursive: true, dereference: false, verbatimSymlinks: true, preserveTimestamps: true,
         force: false, errorOnExist: true,
         filter: source => {
           throwIfAborted(options.signal)
-          return allowedCopyPath(relative(inspection.sourceModules, source), plan.packagePaths)
+          return allowedCopyPath(relative(provisionableInspection.sourceModules, source), plan.packagePaths)
         },
       })
       throwIfAborted(options.signal)
@@ -547,30 +806,68 @@ export async function provisionWorktreeDependencies(
       const cacheRoot = join(stagingRoot, 'npm-cache')
       await mkdir(installRoot, { recursive: true })
       await cp(join(workerRoot, 'package.json'), join(installRoot, 'package.json'), { force: false, errorOnExist: true })
-      await cp(join(workerRoot, inspection.lockfile), join(installRoot, inspection.lockfile), { force: false, errorOnExist: true })
+      await cp(join(workerRoot, provisionableInspection.lockfile), join(installRoot, provisionableInspection.lockfile), { force: false, errorOnExist: true })
       if (options.installNpm) await options.installNpm(installRoot, cacheRoot, options.signal)
       else await installNpmFromLock(installRoot, cacheRoot, options.signal, maxFiles)
       throwIfAborted(options.signal)
       const installedModules = join(installRoot, 'node_modules')
       const receiptTime = new Date(Date.now() + 2_000)
       await utimes(join(installedModules, '.package-lock.json'), receiptTime, receiptTime)
-      const plan = npmInstallPlan(installRoot, installedModules, inspection.lockfile, stagingRoot)
+      const plan = npmInstallPlan(installRoot, installedModules, provisionableInspection.lockfile, stagingRoot)
       if (!plan) throw new Error('npm ci produced a dependency tree that does not match the authenticated lock')
       await dependencyPayloadManifest(installedModules, plan, options.signal, false, maxFiles)
       await rename(installedModules, stagingModules)
     }
-    if (!npmInstallPlan(workerRoot, stagingModules, inspection.lockfile, stagingRoot)) throw new Error('staged dependency tree failed npm lock receipt verification')
-    await publishDependencyTreeNoReplace(stagingModules, targetModules)
+    if (!npmInstallPlan(workerRoot, stagingModules, provisionableInspection.lockfile, stagingRoot)) throw new Error('staged dependency tree failed npm lock receipt verification')
+    publishedIdentity = await publishDependencyTreeNoReplace(stagingModules, targetModules, identity => {
+      if (!transaction) return
+      transaction = { ...transaction, phase: 'publishing', publishedIdentity: identity }
+      atomicWriteJson(receiptPath, transaction)
+    })
+    await options.afterDependencyPublish?.(targetModules)
     await rm(stagingRoot, { recursive: true, force: true })
-    const publishedPlan = npmInstallPlan(workerRoot, targetModules, inspection.lockfile)
+    const publishedPlan = npmInstallPlan(workerRoot, targetModules, provisionableInspection.lockfile)
     if (!publishedPlan) throw new Error('published dependency tree failed npm lock receipt verification')
     await dependencyPayloadManifest(targetModules, publishedPlan, options.signal, false, maxFiles)
+    if (transaction) {
+      transaction = { ...transaction, phase: 'published', publishedIdentity }
+      atomicWriteJson(receiptPath, transaction)
+      await removeOwnedDependencyPath(
+        transaction.quarantineModules,
+        transaction.originalIdentity,
+        `${stagingRoot}-old-target-${transaction.transactionId}`,
+      ).catch(() => {})
+      await rm(receiptPath, { force: true }).catch(() => {})
+    }
     return {
-      status: 'copied', lockfile: inspection.lockfile,
-      materializedBy: inspection.status === 'copyable' ? 'trusted-copy' : 'npm-ci',
+      status: 'copied', lockfile: provisionableInspection.lockfile,
+      materializedBy: provisionableInspection.status === 'copyable' ? 'trusted-copy' : 'npm-ci',
     }
   } catch (error) {
     await rm(stagingRoot, { recursive: true, force: true }).catch(() => {})
+    if (transaction) {
+      try {
+        const ownedIdentity = publishedIdentity ?? transaction.publishedIdentity
+        if (ownedIdentity && entryExists(targetModules)) {
+          await removeOwnedDependencyPath(
+            targetModules,
+            ownedIdentity,
+            `${stagingRoot}-owned-target-${transaction.transactionId}`,
+          )
+        }
+        const targetIdentity = await dependencyPathIdentity(targetModules)
+        const quarantineIdentity = await dependencyPathIdentity(transaction.quarantineModules)
+        if (!targetIdentity && sameDependencyIdentity(quarantineIdentity, transaction.originalIdentity)) {
+          transaction = resetReplacementTransaction(transaction, receiptPath)
+        } else if (sameDependencyIdentity(targetIdentity, transaction.originalIdentity) && !quarantineIdentity) {
+          await rm(receiptPath, { force: true })
+        } else {
+          throw new Error('replacement target or quarantine identity changed before rollback')
+        }
+      } catch (rollbackError) {
+        throw new Error(`dependency replacement failed and identity-bound quarantine rollback was incomplete: ${error instanceof Error ? error.message : String(error)}; rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`)
+      }
+    }
     throw error
   }
 }
@@ -581,6 +878,7 @@ export function dependencyCacheMiss(detail: string | undefined): boolean {
 
 export function dependencyResolutionMiss(detail: string | undefined): boolean {
   return dependencyCacheMiss(detail)
+    || (typeof detail === 'string' && detail.includes(DEPENDENCY_REPLACEMENT_PENDING_CODE))
     || (typeof detail === 'string' && /\bMODULE_NOT_FOUND\b/iu.test(detail) && /node_modules[\\/]/iu.test(detail))
 }
 

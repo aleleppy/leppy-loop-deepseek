@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.18] - 2026-08-30
+
+### Fixed
+
+- Exact-digest dependency recovery can now repair an invalid existing worktree `node_modules` instead of stalling forever. Under the repository lock, the runner renames only that exact target into private quarantine, materializes and validates the authenticated npm lock in isolation, publishes without replacement, and releases a worker only after a durable `published` receipt records the validated physical tree. `prepared`, `quarantined`, or `publishing` crash states are never adopted: identity-proven partial targets are moved aside and deleted while the original quarantine is preserved for the same transaction's retry. A pending receipt remains a pre-worker readiness condition even when npm setup wraps the original error; the current authenticated dependency-miss detail is preserved so the same transaction can be resumed. An unowned target race is never deleted or replaced. Without the current authenticated dependency-error digest, the existing tree remains untouched.
+
 ## [0.3.17] - 2026-08-30
 
 ### Fixed

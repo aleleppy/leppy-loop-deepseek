@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { runLeppyLoop } from '../src/runner.js'
+import { persistRunStateProof } from '../src/run-state-proof.js'
+import { DEPENDENCY_REPLACEMENT_PENDING_CODE, dependencyResolutionMiss } from '../src/worktree-dependencies.js'
 import { PublicationConflictError } from '../src/publish.js'
 import type { PublicationHooks, PullRequestRequest, RunProgress, WorkerAdapter, WorkerOutcome, WorkerRequest } from '../src/types.js'
 
@@ -964,6 +966,72 @@ describe('controller state machine', () => {
     }, { ...modelDeps, installNpmDependencies: fakeNpmInstall, worker: new FakeWorker() })
     expect(recovered.status).toBe('completed')
     expect(existsSync(join(first.worktree!, 'node_modules', 'typescript', 'package.json'))).toBe(true)
+  }, 90_000)
+
+  it('quarantines an invalid existing tree and materializes the exact lock before recovery worker startup', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'node_modules/\n')
+    writeFileSync(join(repo.root, 'package.json'), '{"name":"runner-fixture","private":true,"devDependencies":{"typescript":"5.9.3"}}\n')
+    writeFileSync(join(repo.root, 'package-lock.json'), '{"name":"runner-fixture","lockfileVersion":3,"packages":{"":{"name":"runner-fixture","devDependencies":{"typescript":"5.9.3"}},"node_modules/typescript":{"version":"5.9.3","resolved":"https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz","integrity":"sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==","bin":{"tsc":"bin/tsc"}}}}\n')
+    git(repo.root, 'add', '--', '.gitignore', 'package.json', 'package-lock.json')
+    git(repo.root, 'commit', '-m', 'chore: add package metadata')
+    await fakeNpmInstall(repo.root)
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, {
+      ...modelDeps,
+      worker: new FakeWorker([{ status: 'failed', output: '', error: "worker dependency unavailable after one tool failure; code: MODULE_NOT_FOUND; Cannot find module 'worktree/node_modules/typescript/bin/tsc'" }]),
+    })
+    expect(first.status).toBe('stalled')
+    rmSync(join(first.worktree!, 'node_modules'), { recursive: true, force: true })
+    rmSync(join(repo.root, 'node_modules'), { recursive: true, force: true })
+    mkdirSync(join(first.worktree!, 'node_modules'))
+    writeFileSync(join(first.worktree!, 'node_modules', 'invalid-tree.txt'), 'preserve until replacement succeeds\n')
+
+    const missingDigest = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, installNpmDependencies: fakeNpmInstall, worker: new FakeWorker() })
+    expect(missingDigest.status).toBe('stalled')
+    expect(missingDigest.detail).toContain('authenticated dependency recovery digest')
+    const wrappedStall = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+
+    const forbiddenWorker = new FakeWorker()
+    const failedMaterialization = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      dependencyRecoveryDigest: createHash('sha256').update(wrappedStall.lastError).digest('hex'),
+    }, {
+      ...modelDeps,
+      installNpmDependencies: async () => { throw new Error('fixture npm materialization failed') },
+      worker: forbiddenWorker,
+    })
+    expect(failedMaterialization.status).toBe('stalled')
+    expect(failedMaterialization.detail).toContain('fixture npm materialization failed')
+    expect(failedMaterialization.detail).toContain('MODULE_NOT_FOUND')
+    expect(forbiddenWorker.calls).toHaveLength(0)
+    expect(existsSync(join(first.stateDir!, 'dependency-staging-replacement.json'))).toBe(true)
+    const retryState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    retryState.lastError = 'pre-worker setup failed: simulated hard crash omitted the prior dependency detail'
+    writeFileSync(join(first.stateDir!, 'run.json'), `${JSON.stringify(retryState, null, 2)}\n`)
+    const leaseKey = Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64')
+    persistRunStateProof(first.stateDir!, retryState, leaseKey)
+
+    const markerWorker = new FakeWorker()
+    const pendingMarker = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, installNpmDependencies: fakeNpmInstall, worker: markerWorker })
+    expect(pendingMarker.status).toBe('stalled')
+    expect(pendingMarker.detail).toContain(DEPENDENCY_REPLACEMENT_PENDING_CODE)
+    expect(dependencyResolutionMiss(pendingMarker.detail)).toBe(true)
+    expect(markerWorker.calls).toHaveLength(0)
+    expect(existsSync(join(first.stateDir!, 'dependency-staging-replacement.json'))).toBe(true)
+    const markerState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      dependencyRecoveryDigest: createHash('sha256').update(markerState.lastError).digest('hex'),
+    }, { ...modelDeps, installNpmDependencies: fakeNpmInstall, worker: new FakeWorker() })
+    expect(recovered.status).toBe('completed')
+    expect(existsSync(join(first.worktree!, 'node_modules', 'invalid-tree.txt'))).toBe(false)
+    expect(existsSync(join(first.worktree!, 'node_modules', 'typescript', 'package.json'))).toBe(true)
+    expect(existsSync(join(first.stateDir!, 'dependency-staging-replacement.json'))).toBe(false)
   }, 90_000)
 
   it('never releases another worker for an unresolved dependency miss even without a legacy hydration flag', async () => {

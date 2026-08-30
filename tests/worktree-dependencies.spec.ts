@@ -1,9 +1,12 @@
 import { execFileSync } from 'node:child_process'
-import { cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { dependencyBridgeRecoveryAvailable, dependencyCacheMiss, dependencyResolutionMiss, inspectWorktreeDependencies, provisionWorktreeDependencies } from '../src/worktree-dependencies.js'
+import {
+  DEPENDENCY_REPLACEMENT_PENDING_CODE, dependencyBridgeRecoveryAvailable, dependencyCacheMiss, dependencyResolutionMiss,
+  inspectWorktreeDependencies, provisionWorktreeDependencies,
+} from '../src/worktree-dependencies.js'
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
@@ -11,6 +14,39 @@ function git(cwd: string, ...args: string[]): string {
 
 function staging(root: string): string {
   return join(root, '.git', 'leppy-dependency-stage-test')
+}
+
+function dependencyIdentity(path: string): { dev: string; ino: string; type: 'directory' | 'symlink' | 'file' | 'other' } {
+  const stats = lstatSync(path, { bigint: true })
+  return {
+    dev: stats.dev.toString(), ino: stats.ino.toString(),
+    type: stats.isDirectory() ? 'directory' : stats.isSymbolicLink() ? 'symlink' : stats.isFile() ? 'file' : 'other',
+  }
+}
+
+function writeReplacementReceipt(input: {
+  root: string
+  worktree: string
+  token: string
+  phase: 'prepared' | 'quarantined' | 'publishing' | 'published'
+  originalIdentity: ReturnType<typeof dependencyIdentity>
+  publishedIdentity?: ReturnType<typeof dependencyIdentity>
+}): string {
+  const stagingRoot = staging(input.root)
+  const receipt = `${stagingRoot}-replacement.json`
+  writeFileSync(receipt, `${JSON.stringify({
+    version: 1,
+    transactionId: input.token,
+    phase: input.phase,
+    workerRoot: realpathSync(input.worktree),
+    targetModules: join(realpathSync(input.worktree), 'node_modules'),
+    quarantineModules: `${stagingRoot}-replaced-node-modules-${input.token}`,
+    lockfile: 'package-lock.json',
+    ...(input.phase === 'prepared' ? {} : { materializedBy: 'trusted-copy' }),
+    originalIdentity: input.originalIdentity,
+    ...(input.publishedIdentity ? { publishedIdentity: input.publishedIdentity } : {}),
+  }, null, 2)}\n`)
+  return receipt
 }
 
 async function fakeNpmInstall(installRoot: string): Promise<void> {
@@ -239,13 +275,153 @@ describe('worktree dependency hydration', () => {
     expect(inspectWorktreeDependencies(rogue.root, rogue.worktree)).toMatchObject({ status: 'installable' })
   })
 
-  it('never replaces an unowned worktree node_modules', async () => {
+  it('never replaces an unowned worktree node_modules without exact recovery authority', async () => {
     const { root, worktree } = repository()
     mkdirSync(join(worktree, 'node_modules'))
     writeFileSync(join(worktree, 'node_modules', 'owned.txt'), 'keep\n')
     expect(inspectWorktreeDependencies(root, worktree)).toMatchObject({ status: 'unavailable' })
     await expect(provisionWorktreeDependencies(root, worktree, { stagingRoot: staging(root) })).resolves.toMatchObject({ status: 'unavailable' })
     expect(readFileSync(join(worktree, 'node_modules', 'owned.txt'), 'utf8')).toBe('keep\n')
+  })
+
+  it('quarantines and replaces an invalid target only under exact recovery authority', async () => {
+    const { root, worktree } = repository()
+    mkdirSync(join(worktree, 'node_modules'))
+    writeFileSync(join(worktree, 'node_modules', 'owned.txt'), 'stale\n')
+    await expect(provisionWorktreeDependencies(root, worktree, {
+      stagingRoot: staging(root), replaceInvalidTarget: true,
+    })).resolves.toMatchObject({ status: 'copied', materializedBy: 'trusted-copy' })
+    expect(existsSync(join(worktree, 'node_modules', 'owned.txt'))).toBe(false)
+    expect(inspectWorktreeDependencies(root, worktree)).toMatchObject({ status: 'local' })
+    expect(existsSync(`${staging(root)}-replacement.json`)).toBe(false)
+  })
+
+  it('preserves quarantine and resumes the same transaction after materialization failure', async () => {
+    const { root, worktree } = repository()
+    rmSync(join(root, 'node_modules'), { recursive: true, force: true })
+    mkdirSync(join(worktree, 'node_modules'))
+    writeFileSync(join(worktree, 'node_modules', 'owned.txt'), 'quarantined\n')
+    await expect(provisionWorktreeDependencies(root, worktree, {
+      stagingRoot: staging(root), replaceInvalidTarget: true,
+      installNpm: async () => { throw new Error('fixture install failed') },
+    })).rejects.toThrow('fixture install failed')
+    expect(existsSync(join(worktree, 'node_modules'))).toBe(false)
+    expect(existsSync(`${staging(root)}-replacement.json`)).toBe(true)
+
+    await expect(provisionWorktreeDependencies(root, worktree, {
+      stagingRoot: staging(root), replaceInvalidTarget: true, installNpm: fakeNpmInstall,
+    })).resolves.toMatchObject({ status: 'copied', materializedBy: 'npm-ci' })
+    expect(existsSync(join(worktree, 'node_modules', 'owned.txt'))).toBe(false)
+    expect(existsSync(`${staging(root)}-replacement.json`)).toBe(false)
+  })
+
+  it('recovers a crash after quarantine but before publication', async () => {
+    const { root, worktree } = repository()
+    const target = join(worktree, 'node_modules')
+    mkdirSync(target)
+    writeFileSync(join(target, 'owned.txt'), 'original\n')
+    const originalIdentity = dependencyIdentity(target)
+    const token = '11111111-1111-4111-8111-111111111111'
+    writeReplacementReceipt({ root, worktree, token, phase: 'prepared', originalIdentity })
+    renameSync(target, `${staging(root)}-replaced-node-modules-${token}`)
+
+    await expect(provisionWorktreeDependencies(root, worktree, {
+      stagingRoot: staging(root), replaceInvalidTarget: true,
+    })).resolves.toMatchObject({ status: 'copied' })
+    expect(inspectWorktreeDependencies(root, worktree)).toMatchObject({ status: 'local' })
+    expect(existsSync(`${staging(root)}-replacement.json`)).toBe(false)
+  })
+
+  it('rolls back an identity-proven partial publication and retries after a crash', async () => {
+    const { root, worktree } = repository()
+    const target = join(worktree, 'node_modules')
+    mkdirSync(target)
+    writeFileSync(join(target, 'owned.txt'), 'original\n')
+    const originalIdentity = dependencyIdentity(target)
+    const token = '22222222-2222-4222-8222-222222222222'
+    const quarantine = `${staging(root)}-replaced-node-modules-${token}`
+    renameSync(target, quarantine)
+    mkdirSync(target)
+    writeFileSync(join(target, 'partial.txt'), 'partial\n')
+    writeReplacementReceipt({
+      root, worktree, token, phase: 'publishing', originalIdentity,
+      publishedIdentity: dependencyIdentity(target),
+    })
+
+    await expect(provisionWorktreeDependencies(root, worktree, {
+      stagingRoot: staging(root), replaceInvalidTarget: true,
+    })).resolves.toMatchObject({ status: 'copied' })
+    expect(existsSync(join(target, 'partial.txt'))).toBe(false)
+    expect(inspectWorktreeDependencies(root, worktree)).toMatchObject({ status: 'local' })
+  })
+
+  it('never adopts a structurally valid but incomplete publishing-phase tree', async () => {
+    const { root, worktree } = repository()
+    const target = join(worktree, 'node_modules')
+    await provisionWorktreeDependencies(root, worktree, { stagingRoot: staging(root) })
+    const publishingTarget = `${target}-publishing`
+    renameSync(target, publishingTarget)
+    mkdirSync(target)
+    writeFileSync(join(target, 'owned.txt'), 'original\n')
+    const originalIdentity = dependencyIdentity(target)
+    const token = '44444444-4444-4444-8444-444444444444'
+    renameSync(target, `${staging(root)}-replaced-node-modules-${token}`)
+    renameSync(publishingTarget, target)
+    const shim = join(target, '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
+    writeFileSync(shim, 'truncated but structurally valid\n')
+    expect(inspectWorktreeDependencies(root, worktree)).toMatchObject({ status: 'local' })
+    writeReplacementReceipt({
+      root, worktree, token, phase: 'publishing', originalIdentity,
+      publishedIdentity: dependencyIdentity(target),
+    })
+
+    await expect(provisionWorktreeDependencies(root, worktree, {
+      stagingRoot: staging(root), replaceInvalidTarget: true,
+    })).resolves.toMatchObject({ status: 'copied' })
+    expect(readFileSync(shim, 'utf8')).toBe('fixture shim\n')
+  })
+
+  it('adopts an identity-proven completed publication after crash or cleanup failure', async () => {
+    const { root, worktree } = repository()
+    const target = join(worktree, 'node_modules')
+    await provisionWorktreeDependencies(root, worktree, { stagingRoot: staging(root) })
+    const completedTarget = `${target}-completed-publication`
+    renameSync(target, completedTarget)
+    mkdirSync(target)
+    writeFileSync(join(target, 'owned.txt'), 'original\n')
+    const originalIdentity = dependencyIdentity(target)
+    const token = '33333333-3333-4333-8333-333333333333'
+    renameSync(target, `${staging(root)}-replaced-node-modules-${token}`)
+    renameSync(completedTarget, target)
+    expect(inspectWorktreeDependencies(root, worktree)).toMatchObject({ status: 'local' })
+    writeReplacementReceipt({
+      root, worktree, token, phase: 'published', originalIdentity,
+      publishedIdentity: dependencyIdentity(target),
+    })
+
+    await expect(provisionWorktreeDependencies(root, worktree, {
+      stagingRoot: staging(root), replaceInvalidTarget: true,
+    })).resolves.toMatchObject({ status: 'copied', materializedBy: 'trusted-copy' })
+    expect(existsSync(`${staging(root)}-replacement.json`)).toBe(false)
+    expect(existsSync(`${staging(root)}-replaced-node-modules-${token}`)).toBe(false)
+  })
+
+  it('never deletes a target swapped after publication ownership was captured', async () => {
+    const { root, worktree } = repository()
+    const target = join(worktree, 'node_modules')
+    mkdirSync(target)
+    writeFileSync(join(target, 'owned.txt'), 'original\n')
+    await expect(provisionWorktreeDependencies(root, worktree, {
+      stagingRoot: staging(root), replaceInvalidTarget: true,
+      afterDependencyPublish: async publishedTarget => {
+        renameSync(publishedTarget, `${publishedTarget}-controller-owned`)
+        mkdirSync(publishedTarget)
+        writeFileSync(join(publishedTarget, 'racer.txt'), 'unowned\n')
+      },
+    })).rejects.toThrow('identity-bound quarantine rollback was incomplete')
+    expect(readFileSync(join(target, 'racer.txt'), 'utf8')).toBe('unowned\n')
+    expect(existsSync(`${target}-controller-owned`)).toBe(true)
+    expect(existsSync(`${staging(root)}-replacement.json`)).toBe(true)
   })
 
   it('rejects source and target node_modules roots redirected outside their checkout', async () => {
@@ -259,6 +435,10 @@ describe('worktree dependency hydration', () => {
     const target = repository()
     symlinkSync(join(target.root, 'node_modules'), join(target.worktree, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir')
     expect(inspectWorktreeDependencies(target.root, target.worktree)).toMatchObject({ status: 'unavailable' })
+    await expect(provisionWorktreeDependencies(target.root, target.worktree, {
+      stagingRoot: staging(target.root), replaceInvalidTarget: true,
+    })).resolves.toMatchObject({ status: 'copied' })
+    expect(lstatSync(join(target.worktree, 'node_modules')).isSymbolicLink()).toBe(false)
     expect(existsSync(join(target.root, 'node_modules', 'typescript'))).toBe(true)
   })
 
@@ -307,6 +487,7 @@ describe('worktree dependency hydration', () => {
     const moduleMiss = "code: MODULE_NOT_FOUND; Cannot find module 'worktree/node_modules/typescript/bin/tsc'"
     expect(dependencyCacheMiss(cacheMiss)).toBe(true)
     expect(dependencyResolutionMiss(moduleMiss)).toBe(true)
+    expect(dependencyResolutionMiss(`${DEPENDENCY_REPLACEMENT_PENDING_CODE}: pending transaction`)).toBe(true)
     expect(dependencyBridgeRecoveryAvailable({ repoRoot: root, worktree, detail: cacheMiss, dependencyBridgeActive: true })).toBe(true)
     expect(dependencyBridgeRecoveryAvailable({ repoRoot: root, worktree, detail: moduleMiss, dependencyBridgeActive: true })).toBe(true)
     await provisionWorktreeDependencies(root, worktree, { stagingRoot: staging(root) })

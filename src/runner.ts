@@ -15,7 +15,10 @@ import { physicalRelative } from './path.js'
 import { inspectRunStateProof, persistRunStateProof } from './run-state-proof.js'
 import { abortInterruptedPublicationRebase, isAuthenticatedPublicationRebase } from './publish.js'
 import { appendLifecycleAuthorityReceipt, inspectLifecycleAuthority } from './lifecycle-authority.js'
-import { dependencyResolutionMiss, inspectWorktreeDependencies, provisionWorktreeDependencies } from './worktree-dependencies.js'
+import {
+  DEPENDENCY_REPLACEMENT_PENDING_CODE, dependencyReplacementTransactionPending, dependencyResolutionMiss,
+  inspectWorktreeDependencies, provisionWorktreeDependencies,
+} from './worktree-dependencies.js'
 import { windowsQuotedExecutableFailure } from './windows-command.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import type {
@@ -509,9 +512,17 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         throw new Error('the authenticated dependency recovery error changed before lock-protected hydration')
       }
     }
-    const dependencyProvision = initialDependencyState.status === 'copyable' || initialDependencyState.status === 'installable' || initialDependencyState.status === 'local'
+    const authenticatedDependencyRepair = repairingDependencyMiss && options.dependencyRecoveryDigest !== undefined
+    const dependencyStagingRoot = join(stateDir, 'dependency-staging')
+    const pendingDependencyReplacement = dependencyReplacementTransactionPending(dependencyStagingRoot)
+    if (pendingDependencyReplacement && !authenticatedDependencyRepair) {
+      throw new Error(`${DEPENDENCY_REPLACEMENT_PENDING_CODE}: a pending dependency replacement transaction requires an authenticated resume before worker release`)
+    }
+    const dependencyProvision = initialDependencyState.status === 'copyable' || initialDependencyState.status === 'installable'
+      || initialDependencyState.status === 'local' || authenticatedDependencyRepair
       ? await provisionWorktreeDependencies(state.repoRoot, state.worktree, {
-        stagingRoot: join(stateDir, 'dependency-staging'), signal,
+        stagingRoot: dependencyStagingRoot, signal,
+        ...(authenticatedDependencyRepair ? { replaceInvalidTarget: true } : {}),
         ...(dependencies.installNpmDependencies ? { installNpm: dependencies.installNpmDependencies } : {}),
       })
       : initialDependencyState
@@ -536,7 +547,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       }
     }
   } catch (error) {
-    const detail = `pre-worker setup failed: ${redact(error instanceof Error ? error.message : String(error))}`
+    const priorDependencyError = dependencyResolutionMiss(recoveryError) ? `; prior dependency error: ${recoveryError!.slice(-2_048)}` : ''
+    const detail = redact(`pre-worker setup failed: ${error instanceof Error ? error.message : String(error)}${priorDependencyError}`)
     state.status = 'stalled'
     state.lastError = detail
     state.autoRecoveryBlocked = true
