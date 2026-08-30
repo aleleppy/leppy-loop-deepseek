@@ -5,6 +5,25 @@ import { atomicWriteJson, createLeaseKey } from './state.js'
 import { runFile } from './process.js'
 import type { LifecycleAuthority } from './types.js'
 
+const lifecycleAuthorityMutexes = new Map<string, Promise<void>>()
+
+export async function acquireLifecycleAuthorityMutex(stateDir: string): Promise<() => void> {
+  const key = resolve(stateDir)
+  const previous = lifecycleAuthorityMutexes.get(key) ?? Promise.resolve()
+  let releaseTicket!: () => void
+  const ticket = new Promise<void>(resolveTicket => { releaseTicket = resolveTicket })
+  const queued = previous.then(() => ticket)
+  lifecycleAuthorityMutexes.set(key, queued)
+  await previous
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    releaseTicket()
+    queueMicrotask(() => { if (lifecycleAuthorityMutexes.get(key) === queued) lifecycleAuthorityMutexes.delete(key) })
+  }
+}
+
 interface LifecycleAuthorityReceipt {
   schemaVersion: 1
   runId: string
@@ -31,7 +50,7 @@ export interface AuthenticatedLifecycleAuthority {
 export type LifecycleAuthorityInspection =
   | { status: 'legacy' }
   | { status: 'invalid'; reason: string }
-  | ({ status: 'valid' } & AuthenticatedLifecycleAuthority)
+  | ({ status: 'valid'; chain: readonly LifecycleAuthority[] } & AuthenticatedLifecycleAuthority)
 
 function receiptPayload(receipt: Omit<LifecycleAuthorityReceipt, 'hmac'>): string {
   return JSON.stringify(receipt)
@@ -79,6 +98,12 @@ function permitWindowMatch(left: LifecycleAuthority, right: LifecycleAuthority):
   return left.issuedAt === right.issuedAt && left.expiresAt === right.expiresAt
 }
 
+export function lifecycleAuthoritiesEqual(left: LifecycleAuthority, right: LifecycleAuthority): boolean {
+  return immutableFactsMatch(left, right) && permitWindowMatch(left, right)
+    && left.allowPublication === right.allowPublication && left.transitions === right.transitions
+    && left.revokedAt === right.revokedAt
+}
+
 function validSuccessor(previous: LifecycleAuthority, next: LifecycleAuthority): boolean {
   if (!immutableFactsMatch(previous, next) || previous.revokedAt !== undefined) return false
   const publicationDowngrade = previous.allowPublication && !next.allowPublication
@@ -93,6 +118,11 @@ function validSuccessor(previous: LifecycleAuthority, next: LifecycleAuthority):
   if (transitionDelta === 1) return !revocation
   if (transitionDelta === 0) return publicationDowngrade !== revocation
   return false
+}
+
+/** Run-state reconciliation may observe either the authenticated tail itself or one valid chain successor. */
+export function lifecycleAuthorityMatchesOrAdvances(previous: LifecycleAuthority, next: LifecycleAuthority): boolean {
+  return lifecycleAuthoritiesEqual(previous, next) || validSuccessor(previous, next)
 }
 
 function receiptNames(stateDir: string): string[] {
@@ -129,6 +159,7 @@ export function inspectLifecycleAuthority(stateDir: string, runId: string): Life
   if (names.length !== head.sequence) return invalid('lifecycle authority chain length does not match its monotonic head')
 
   let previous: AuthenticatedLifecycleAuthority | undefined
+  const chain: LifecycleAuthority[] = []
   for (let index = 0; index < names.length; index += 1) {
     const name = names[index]!
     let receipt: LifecycleAuthorityReceipt
@@ -148,9 +179,10 @@ export function inspectLifecycleAuthority(stateDir: string, runId: string): Life
       if (receipt.authority.transitions !== 1 || receipt.authority.revokedAt !== undefined) return invalid('initial lifecycle authority receipt is invalid')
     } else if (!validSuccessor(previous.authority, receipt.authority)) return invalid('lifecycle authority successor is not monotonic')
     previous = { authority: receipt.authority, sequence, digest: currentDigest }
+    chain.push({ ...receipt.authority })
   }
   if (!previous || head.sequence !== previous.sequence || head.digest !== previous.digest) return invalid('lifecycle authority head does not authenticate the current tail')
-  return { status: 'valid', ...previous }
+  return { status: 'valid', ...previous, chain }
 }
 
 export function readAuthenticatedLifecycleAuthority(stateDir: string, runId: string): AuthenticatedLifecycleAuthority | undefined {

@@ -3,9 +3,11 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import * as gitModule from '../src/git.js'
 import { runLeppyLoop } from '../src/runner.js'
 import { persistRunStateProof } from '../src/run-state-proof.js'
+import { acquireLifecycleAuthorityMutex, appendLifecycleAuthorityReceipt, lifecycleStateDir } from '../src/lifecycle-authority.js'
 import { DEPENDENCY_REPLACEMENT_PENDING_CODE, dependencyResolutionMiss } from '../src/worktree-dependencies.js'
 import { PublicationConflictError } from '../src/publish.js'
 import type { LifecycleAuthority, PublicationHooks, PullRequestRequest, RunProgress, WorkerAdapter, WorkerOutcome, WorkerRequest } from '../src/types.js'
@@ -622,6 +624,53 @@ describe('controller state machine', () => {
     expect(events).toContain('"type":"publish-done"')
   }, 90_000)
 
+  it('blocks remote mutation when publication authority downgrades after final validation', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n- [~] Gate: node version | gate=`node --version`\n')
+    const issuedAt = Date.now() - 1_000
+    const authority: LifecycleAuthority = {
+      sessionId: 'downgraded-before-push-owner', allowPublication: true, maxIterations: 64, maxRepairCycles: 3,
+      maxTransitions: 16, transitions: 1, issuedAt, expiresAt: issuedAt + 86_400_000,
+    }
+    const downgraded: LifecycleAuthority = { ...authority, allowPublication: false }
+    let publisherCalls = 0
+    let remoteMutations = 0
+    let authorizationError = ''
+
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true, lifecycleAuthority: authority },
+      {
+        ...modelDeps,
+        worker: new FakeWorker(),
+        publishPullRequest: async (request, _signal, hooks) => {
+          publisherCalls += 1
+          await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
+          const stateDir = await lifecycleStateDir(request.repoRoot, request.runId)
+          appendLifecycleAuthorityReceipt(stateDir, request.runId, authority)
+          appendLifecycleAuthorityReceipt(stateDir, request.runId, downgraded)
+          if (!hooks.authorizeRemoteMutation) throw new Error('publisher did not receive remote mutation authorization hook')
+          try {
+            await hooks.authorizeRemoteMutation(async () => {
+              remoteMutations += 1
+            })
+          } catch (error) {
+            authorizationError = error instanceof Error ? error.message : String(error)
+            throw error
+          }
+          throw new Error('remote mutation authorization unexpectedly succeeded')
+        },
+      },
+    )
+
+    expect(publisherCalls).toBe(1)
+    expect(authorizationError).toMatch(/lifecycle authority|publication/u)
+    expect(remoteMutations).toBe(0)
+    expect(result.status).toBe('stalled')
+    expect(result.pullRequestUrl).toBeUndefined()
+    const state = JSON.parse(readFileSync(join(result.stateDir!, 'run.json'), 'utf8'))
+    expect(state.status).toBe('stalled')
+    expect(state.pullRequestUrl).toBeUndefined()
+  }, 90_000)
+
   it('reconciles an authenticated existing PR without demanding a duplicate final-gate callback', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | Done: value says done\n- [~] Gate: node version | gate=`node --version`\n')
     const result = await runLeppyLoop(
@@ -1032,6 +1081,258 @@ describe('controller state machine', () => {
     expect(existsSync(join(first.worktree!, 'node_modules', 'invalid-tree.txt'))).toBe(false)
     expect(existsSync(join(first.worktree!, 'node_modules', 'typescript', 'package.json'))).toBe(true)
     expect(existsSync(join(first.stateDir!, 'dependency-staging-replacement.json'))).toBe(false)
+  }, 90_000)
+
+  it('reconciles command-persisted renewal and next transition before one runner recovery while preserving WIP', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    const oldAuthority: LifecycleAuthority = {
+      sessionId: 'renewed-run-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+      maxTransitions: 16, transitions: 1, issuedAt: 1_000, expiresAt: 86_401_000,
+    }
+    const renewedAuthority: LifecycleAuthority = {
+      ...oldAuthority, issuedAt: 90_000_000, expiresAt: 176_400_000,
+    }
+    const admittedAuthority: LifecycleAuthority = { ...renewedAuthority, transitions: 2 }
+    let workerCalls = 0
+    const observedWip: string[] = []
+    const worker: WorkerAdapter = { async run(request) {
+      workerCalls += 1
+      const valuePath = join(request.worktree, 'src', 'value.txt')
+      if (workerCalls === 1) {
+        writeFileSync(valuePath, 'preserved renewal WIP\n')
+        return { status: 'interrupted', output: '', error: 'simulated interruption before permit renewal' }
+      }
+      observedWip.push(readFileSync(valuePath, 'utf8'))
+      writeFileSync(valuePath, `${readFileSync(valuePath, 'utf8')}completed after next transition\n`)
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'test: continue after lifecycle renewal')
+      return completedOutcome('renewed authority admitted the controller next transition')
+    } }
+
+    const first = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, lifecycleAuthority: oldAuthority,
+    }, { ...modelDeps, worker })
+    expect(first.status).toBe('interrupted')
+    expect(readFileSync(join(first.worktree!, 'src', 'value.txt'), 'utf8')).toBe('preserved renewal WIP\n')
+    expect(JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8')).lifecycleAuthority).toEqual(oldAuthority)
+
+    appendLifecycleAuthorityReceipt(first.stateDir!, first.runId, oldAuthority)
+    appendLifecycleAuthorityReceipt(first.stateDir!, first.runId, renewedAuthority)
+    appendLifecycleAuthorityReceipt(first.stateDir!, first.runId, admittedAuthority)
+
+    const setupWorker = new FakeWorker()
+    await expect(runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      lifecycleAuthority: { ...admittedAuthority, sessionId: 'another-session' },
+    }, { ...modelDeps, worker: setupWorker })).rejects.toThrow('lifecycle authority does not match the authenticated run')
+    expect(setupWorker.calls).toHaveLength(0)
+    expect(readFileSync(join(first.worktree!, 'src', 'value.txt'), 'utf8')).toBe('preserved renewal WIP\n')
+
+    const completed = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      lifecycleAuthority: admittedAuthority,
+    }, { ...modelDeps, worker })
+    expect(completed.status).toBe('completed')
+    expect(completed.runId).toBe(first.runId)
+    expect(workerCalls).toBe(2)
+    expect(observedWip).toEqual(['preserved renewal WIP\n'])
+    expect(readFileSync(join(completed.worktree!, 'src', 'value.txt'), 'utf8')).toBe(
+      'preserved renewal WIP\ncompleted after next transition\n',
+    )
+    expect(JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8')).lifecycleAuthority).toEqual(admittedAuthority)
+  }, 90_000)
+
+  it('blocks worker release when authenticated revocation lands after task setup', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    const issuedAt = Date.now() - 1_000
+    const authority: LifecycleAuthority = {
+      sessionId: 'revoked-before-worker-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+      maxTransitions: 16, transitions: 1, issuedAt, expiresAt: issuedAt + 86_400_000,
+    }
+    const revoked = { ...authority, revokedAt: issuedAt + 500 }
+    const worker = new FakeWorker()
+    let revocationAppended = false
+    let observedRunId = ''
+
+    await expect(runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, lifecycleAuthority: authority,
+    }, {
+      ...modelDeps,
+      worker,
+      onProgress: async update => {
+        if (update.type !== 'task-start' || revocationAppended) return
+        revocationAppended = true
+        observedRunId = update.runId
+        const stateDir = await lifecycleStateDir(repo.root, update.runId)
+        appendLifecycleAuthorityReceipt(stateDir, update.runId, authority)
+        appendLifecycleAuthorityReceipt(stateDir, update.runId, revoked)
+      },
+    })).rejects.toThrow('direct human Leppy intent')
+
+    expect(revocationAppended).toBe(true)
+    expect(worker.calls).toHaveLength(0)
+    const stateDir = await lifecycleStateDir(repo.root, observedRunId)
+    const state = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(state).toMatchObject({ status: 'interrupted', lifecycleAuthority: revoked })
+    expect(state.lastError).toContain('direct human Leppy intent')
+    expect(git(state.worktree, 'status', '--porcelain')).toBe('')
+  }, 90_000)
+
+  it('releases lifecycle admission mutex while a worker is blocked so stop persists before abort', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    const issuedAt = Date.now() - 1_000
+    const authority: LifecycleAuthority = {
+      sessionId: 'persist-before-kill-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+      maxTransitions: 16, transitions: 1, issuedAt, expiresAt: issuedAt + 86_400_000,
+    }
+    const revoked: LifecycleAuthority = { ...authority, revokedAt: issuedAt + 500 }
+    const control = new AbortController()
+    let workerAdmissions = 0
+    let workerSettled = false
+    let workerSignal: AbortSignal | undefined
+    let admitted!: (request: WorkerRequest) => void
+    const workerAdmitted = new Promise<WorkerRequest>(resolveAdmitted => { admitted = resolveAdmitted })
+    const worker: WorkerAdapter = {
+      async run(request, signal) {
+        workerAdmissions += 1
+        workerSignal = signal
+        admitted(request)
+        return await new Promise<WorkerOutcome>(resolveOutcome => {
+          const settle = () => {
+            workerSettled = true
+            resolveOutcome({ status: 'interrupted', output: '', error: 'Stopped through direct human Leppy intent' })
+          }
+          if (signal.aborted) settle()
+          else signal.addEventListener('abort', settle, { once: true })
+        })
+      },
+    }
+    const running = runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, lifecycleAuthority: authority,
+    }, { ...modelDeps, worker, signal: control.signal })
+    const request = await workerAdmitted
+    const stateDir = await lifecycleStateDir(repo.root, request.runId)
+    const mutexStartedAt = Date.now()
+    const mutex = acquireLifecycleAuthorityMutex(stateDir)
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let releaseMutex: (() => void) | undefined
+    try {
+      releaseMutex = await Promise.race([
+        mutex,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => { reject(new Error('lifecycle admission mutex remained held by blocked worker')) }, 750)
+        }),
+      ])
+    } catch (error) {
+      control.abort(new Error('Stopped through direct human Leppy intent'))
+      const lateRelease = await mutex
+      lateRelease()
+      await running.catch(() => undefined)
+      throw error
+    } finally {
+      if (timeout) clearTimeout(timeout)
+    }
+
+    const mutexElapsedMs = Date.now() - mutexStartedAt
+    try {
+      appendLifecycleAuthorityReceipt(stateDir, request.runId, authority)
+      appendLifecycleAuthorityReceipt(stateDir, request.runId, revoked)
+    } finally {
+      releaseMutex!()
+    }
+    control.abort(new Error('Stopped through direct human Leppy intent'))
+    await expect(running).rejects.toThrow('direct human Leppy intent')
+
+    expect(mutexElapsedMs).toBeLessThan(1_000)
+    expect(workerAdmissions).toBe(1)
+    expect(workerSignal?.aborted).toBe(true)
+    expect(workerSettled).toBe(true)
+    const state = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(state).toMatchObject({ status: 'interrupted', lifecycleAuthority: revoked })
+    expect(state.lastError).toContain('direct human Leppy intent')
+  }, 90_000)
+
+  it('rereads locked-fresh progress when two exact recoveries observed the same pre-completion state', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, {
+      ...modelDeps,
+      worker: new FakeWorker([{ status: 'timeout', output: '', error: 'seed recoverable run' }]),
+    })
+    expect(first.status).toBe('stalled')
+
+    let releaseWorker!: () => void
+    let workerEntered!: () => void
+    const workerGate = new Promise<void>(resolve => { releaseWorker = resolve })
+    const entered = new Promise<void>(resolve => { workerEntered = resolve })
+    let workerCalls = 0
+    const worker: WorkerAdapter = { async run(request) {
+      workerCalls += 1
+      const valuePath = join(request.worktree, 'src', 'value.txt')
+      writeFileSync(valuePath, 'first recovery preserved WIP\n')
+      workerEntered()
+      await workerGate
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'test: complete first queued recovery')
+      return completedOutcome('first queued recovery completed the authenticated task')
+    } }
+    const firstProgress: RunProgress[] = []
+    const secondProgress: RunProgress[] = []
+    const firstRecovery = runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker, onProgress: update => { firstProgress.push(update) } })
+    await entered
+
+    const realBranch = gitModule.branch
+    let branchObserved!: () => void
+    let releaseBranch!: () => void
+    const observedPreLock = new Promise<void>(resolve => { branchObserved = resolve })
+    const branchGate = new Promise<void>(resolve => { releaseBranch = resolve })
+    let claimed = false
+    const branchSpy = vi.spyOn(gitModule, 'branch').mockImplementation(async cwd => {
+      if (!claimed) {
+        claimed = true
+        branchObserved()
+        await branchGate
+      }
+      return realBranch(cwd)
+    })
+    let secondRecovery: Promise<Awaited<ReturnType<typeof runLeppyLoop>>> | undefined
+    try {
+      secondRecovery = runLeppyLoop({
+        tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      }, { ...modelDeps, worker, onProgress: update => { secondProgress.push(update) } })
+      void secondRecovery.catch(() => undefined)
+      await Promise.race([
+        observedPreLock,
+        new Promise<never>((_resolve, reject) => setTimeout(() => { reject(new Error('second recovery did not reach pre-lock branch validation')) }, 20_000)),
+      ])
+
+      releaseWorker()
+      const completedFirst = await firstRecovery
+      expect(completedFirst.status).toBe('completed')
+      const stateAfterFirst = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+      const headAfterFirst = git(first.worktree!, 'rev-parse', 'HEAD')
+      expect(stateAfterFirst).toMatchObject({ status: 'completed', completedTasks: 1 })
+      expect(readFileSync(join(first.worktree!, 'src', 'value.txt'), 'utf8')).toBe('first recovery preserved WIP\n')
+
+      releaseBranch()
+      const completedSecond = await secondRecovery
+      expect(completedSecond.status).toBe('completed')
+      expect(completedSecond.runId).toBe(first.runId)
+      expect(workerCalls).toBe(1)
+      expect(secondProgress.filter(update => update.type === 'task-start')).toHaveLength(0)
+      expect(firstProgress.filter(update => update.type === 'task-start')).toHaveLength(1)
+      expect(git(first.worktree!, 'rev-parse', 'HEAD')).toBe(headAfterFirst)
+      expect(readFileSync(join(first.worktree!, 'src', 'value.txt'), 'utf8')).toBe('first recovery preserved WIP\n')
+      expect(JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))).toMatchObject({
+        status: 'completed', completedTasks: 1, attempt: stateAfterFirst.attempt, taskAttempts: stateAfterFirst.taskAttempts,
+      })
+    } finally {
+      releaseWorker()
+      releaseBranch()
+      branchSpy.mockRestore()
+      if (secondRecovery) await secondRecovery.catch(() => undefined)
+    }
   }, 90_000)
 
   it('quarantines an authenticated untracked npm cache stall before resuming preserved task WIP', async () => {

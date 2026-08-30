@@ -387,7 +387,9 @@ export async function publishPullRequest(request: PullRequestRequest, signal: Ab
 
   if (target.remoteBranchHead !== validation.validatedHead) {
     const push = ['push', `--force-with-lease=refs/heads/${request.branch}:${target.remoteBranchHead ?? ''}`, target.pushUrl, `HEAD:refs/heads/${request.branch}`]
-    await execute('git', push, { cwd: request.worktree, signal, timeoutMs: 5 * 60_000 })
+    const mutate = () => execute('git', push, { cwd: request.worktree, signal, timeoutMs: 5 * 60_000 })
+    if (hooks.authorizeRemoteMutation) await hooks.authorizeRemoteMutation(mutate)
+    else await mutate()
   }
   const pushed = await execute('git', ['ls-remote', '--heads', target.pushUrl, `refs/heads/${request.branch}`], { cwd: request.worktree, signal, timeoutMs: 60_000 })
   if (remoteHead(pushed.stdout, request.branch) !== validation.validatedHead) throw new Error('remote Leppy branch does not match the validated HEAD after push')
@@ -396,7 +398,8 @@ export async function publishPullRequest(request: PullRequestRequest, signal: Ab
   const relisted = await execute('gh', pullRequestListArguments(target.repository, request.branch), { cwd: request.worktree, signal, timeoutMs: 60_000 })
   const raced = parseExistingPullRequest(relisted.stdout, target.repository, request.branch, validation.validatedHead)
   if (raced && await canReconcileExistingPullRequest(request, raced, target.remote, target.base, target.fetchUrl, signal, execute)) return { url: raced.url, validationReceipt: validation.receipt }
-  const created = await execute('gh', pullRequestCreateArguments(target.repository, target.base, request.branch), { cwd: request.worktree, signal, timeoutMs: 120_000, allowFailure: true })
+  const create = () => execute('gh', pullRequestCreateArguments(target.repository, target.base, request.branch), { cwd: request.worktree, signal, timeoutMs: 120_000, allowFailure: true })
+  const created = hooks.authorizeRemoteMutation ? await hooks.authorizeRemoteMutation(create) : await create()
   const url = created.exitCode === 0 ? parseCreatedPullRequestUrl(created.stdout, target.repository) : undefined
   if (url) return { url, validationReceipt: validation.receipt }
   const afterCreate = await execute('gh', pullRequestListArguments(target.repository, request.branch), { cwd: request.worktree, signal, timeoutMs: 60_000 })

@@ -86,6 +86,91 @@ describe('append-only lifecycle authority receipts', () => {
     expect(inspectLifecycleAuthority(dir, 'run-a')).toMatchObject({ status: 'invalid', reason: expect.stringContaining('head') })
   })
 
+  it('accepts a direct-human renewal with the exact same TTL and transition delta zero', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({
+      issuedAt: 90_000_000, expiresAt: 176_400_000,
+    }))
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({
+      sequence: 2,
+      authority: { transitions: 1, issuedAt: 90_000_000, expiresAt: 176_400_000, allowPublication: false },
+    })
+  })
+
+  it('accepts a same-TTL renewal combined with a monotonic publication downgrade', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: true }))
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({
+      allowPublication: false, issuedAt: 90_000_000, expiresAt: 176_400_000,
+    }))
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({
+      sequence: 2,
+      authority: { transitions: 1, issuedAt: 90_000_000, expiresAt: 176_400_000, allowPublication: false },
+    })
+  })
+
+  it('accepts the next transition only against the renewed permit window', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    const renewed = authority({ issuedAt: 90_000_000, expiresAt: 176_400_000 })
+    appendLifecycleAuthorityReceipt(dir, 'run-a', renewed)
+    appendLifecycleAuthorityReceipt(dir, 'run-a', { ...renewed, transitions: 2 })
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({
+      sequence: 3,
+      authority: { transitions: 2, issuedAt: 90_000_000, expiresAt: 176_400_000 },
+    })
+  })
+
+  it.each([
+    ['widens', 90_000_000, 176_400_001],
+    ['shortens', 90_000_000, 176_399_999],
+    ['moves issuedAt backward', 999, 86_401_001],
+    ['moves expiresAt backward', 1_001, 86_400_999],
+  ] as const)('rejects a renewal that %s', (_label, issuedAt, expiresAt) => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ issuedAt, expiresAt }))).toThrow('not monotonic')
+  })
+
+  it('rejects a renewal that consumes a transition simultaneously', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({
+      transitions: 2, issuedAt: 90_000_000, expiresAt: 176_400_000,
+    }))).toThrow('not monotonic')
+  })
+
+  it('rejects a publication upgrade hidden inside a renewal', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: false }))
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({
+      allowPublication: true, issuedAt: 90_000_000, expiresAt: 176_400_000,
+    }))).toThrow('not monotonic')
+  })
+
+  it.each([
+    ['sessionId', { sessionId: 'session-b' }],
+    ['maxIterations', { maxIterations: 65 }],
+    ['maxRepairCycles', { maxRepairCycles: 4 }],
+    ['maxTransitions', { maxTransitions: 17 }],
+  ] as const)('rejects a renewal that mutates immutable %s', (_label, mutation) => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({
+      ...mutation, issuedAt: 90_000_000, expiresAt: 176_400_000,
+    }))).toThrow('immutable facts changed')
+  })
+
+  it('rejects renewal after direct-human revocation', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ revokedAt: 2_000 }))
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({
+      issuedAt: 90_000_000, expiresAt: 176_400_000,
+    }))).toThrow('revoked by direct human stop')
+  })
+
   it('records a bounded direct-human TTL renewal and then admits the next transition', () => {
     const dir = stateDir()
     appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: true, transitions: 1 }))

@@ -219,6 +219,7 @@ export interface PublicationValidation {
 export interface PublicationHooks {
   repairConflict: (conflict: PublicationConflict) => Promise<void>
   validateBeforePush: (targetCommit: string) => Promise<PublicationValidation>
+  authorizeRemoteMutation?: <T>(mutation: () => Promise<T>) => Promise<T>
   recordRemoteHead?: (head: string | undefined) => Promise<void>
 }
 

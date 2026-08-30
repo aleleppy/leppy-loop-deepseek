@@ -14,7 +14,10 @@ import { runFile, runOpaqueShell } from './process.js'
 import { physicalRelative } from './path.js'
 import { inspectRunStateProof, persistRunStateProof } from './run-state-proof.js'
 import { abortInterruptedPublicationRebase, isAuthenticatedPublicationRebase } from './publish.js'
-import { appendLifecycleAuthorityReceipt, inspectLifecycleAuthority } from './lifecycle-authority.js'
+import {
+  acquireLifecycleAuthorityMutex, appendLifecycleAuthorityReceipt, inspectLifecycleAuthority,
+  lifecycleAuthoritiesEqual, lifecycleAuthorityMatchesOrAdvances,
+} from './lifecycle-authority.js'
 import {
   DEPENDENCY_REPLACEMENT_PENDING_CODE, dependencyReplacementTransactionPending, dependencyResolutionMiss,
   inspectWorktreeDependencies, provisionWorktreeDependencies,
@@ -174,16 +177,21 @@ function applyLifecycleAuthority(state: RunState, next: LifecycleAuthority | und
   if (next.expiresAt <= next.issuedAt || next.maxIterations < 1 || next.maxRepairCycles < 1 || next.maxTransitions < 1
     || (next.revokedAt !== undefined && next.revokedAt < next.issuedAt)) throw new Error('invalid lifecycle authority bounds')
   const current = state.lifecycleAuthority
-  if (current && (current.sessionId !== next.sessionId
-    || (current.allowPublication !== next.allowPublication && !(current.allowPublication && !next.allowPublication))
-    || current.maxIterations !== next.maxIterations
-    || current.maxRepairCycles !== next.maxRepairCycles
-    || current.maxTransitions !== next.maxTransitions
-    || current.issuedAt !== next.issuedAt
-    || current.expiresAt !== next.expiresAt
-    || current.revokedAt !== next.revokedAt
-    || next.transitions < current.transitions)) throw new Error('lifecycle authority does not match the authenticated run')
+  if (current && !lifecycleAuthorityMatchesOrAdvances(current, next)) {
+    throw new Error('lifecycle authority does not match the authenticated run')
+  }
   state.lifecycleAuthority = { ...next }
+}
+
+function reconcileDurableLifecycleAuthority(state: RunState, stateDir: string): void {
+  const durable = inspectLifecycleAuthority(stateDir, state.runId)
+  if (durable.status === 'invalid') throw new Error(`existing lifecycle authority is invalid: ${durable.reason}`)
+  if (durable.status !== 'valid') return
+  const current = state.lifecycleAuthority
+  if (current && !durable.chain.some(authority => lifecycleAuthoritiesEqual(current, authority))) {
+    throw new Error('durable lifecycle authority chain does not contain the authenticated run state')
+  }
+  state.lifecycleAuthority = { ...durable.authority }
 }
 
 function assertCompletedWorkerReport(outcome: WorkerOutcome, label: string): void {
@@ -444,12 +452,17 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   let npmCacheQuarantined = false
   if (recovered) {
     state = recovered.state
-    recoveryError = state.lastError
-    state.taskAttempts ??= {}
-    applyLifecycleAuthority(state, options.lifecycleAuthority)
     stateDir = recovered.dir
-    releaseLock = await acquireLock(commonDir, state.runId)
+    const recoveredRunId = state.runId
+    releaseLock = await acquireLock(commonDir, recoveredRunId)
     try {
+      const lockedRecovery = await recoverState(stateBase, repoRoot, checklistRelative, recoveredRunId)
+      if (!lockedRecovery || lockedRecovery.dir !== stateDir) throw new Error('authenticated run changed while waiting for its repository lock')
+      state = lockedRecovery.state
+      recoveryError = state.lastError
+      state.taskAttempts ??= {}
+      reconcileDurableLifecycleAuthority(state, stateDir)
+      applyLifecycleAuthority(state, options.lifecycleAuthority)
       await terminateAuthenticatedLease(stateDir, state.runId)
       const previousStatus = state.status
       state.status = 'running'
@@ -613,6 +626,56 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     releaseLock()
     throw error
   }
+  const actionAuthority = (allowPublicationDowngrade: boolean): LifecycleAuthority | undefined => {
+    const durable = inspectLifecycleAuthority(stateDir, state.runId)
+    if (durable.status === 'invalid') throw new Error(`existing lifecycle authority is invalid: ${durable.reason}`)
+    const current = state.lifecycleAuthority
+    if (durable.status !== 'valid') {
+      if (current?.revokedAt !== undefined) throw new Error(DIRECT_HUMAN_STOP_REASON)
+      return current
+    }
+    if (!current || !durable.chain.some(authority => lifecycleAuthoritiesEqual(current, authority))) {
+      throw new Error('durable lifecycle authority chain does not contain the live run state')
+    }
+    if (lifecycleAuthoritiesEqual(current, durable.authority)) {
+      if (current.revokedAt !== undefined) throw new Error(DIRECT_HUMAN_STOP_REASON)
+      return current
+    }
+    if (durable.authority.revokedAt !== undefined) throw new Error(DIRECT_HUMAN_STOP_REASON)
+    if (allowPublicationDowngrade && current.allowPublication && !durable.authority.allowPublication) {
+      state.lifecycleAuthority = { ...durable.authority }
+      writeState(join(stateDir, 'run.json'), state)
+      return state.lifecycleAuthority
+    }
+    throw new Error('lifecycle authority advanced before privileged action admission')
+  }
+  const runAuthorizedWorker = async (request: WorkerRequest): Promise<WorkerOutcome> => {
+    const release = await acquireLifecycleAuthorityMutex(stateDir)
+    let admitted: Promise<WorkerOutcome>
+    try {
+      actionAuthority(false)
+      admitted = dependencies.worker!.run(request, signal)
+    } finally {
+      // Stop persists revocation before aborting the job, so never hold admission authority while awaiting the worker.
+      release()
+    }
+    return await admitted
+  }
+  const runAuthorizedRemoteMutation = async <T>(mutation: () => Promise<T>): Promise<T> => {
+    const release = await acquireLifecycleAuthorityMutex(stateDir)
+    try {
+      const authority = actionAuthority(false)
+      if (authority && !authority.allowPublication) throw new Error('authenticated lifecycle authority does not permit publication')
+      return await mutation()
+    } finally { release() }
+  }
+  const publicationAuthorized = async (): Promise<boolean> => {
+    const release = await acquireLifecycleAuthorityMutex(stateDir)
+    try {
+      const authority = actionAuthority(true)
+      return options.openPullRequest && authority?.allowPublication !== false
+    } finally { release() }
+  }
   let activeProgress: { task: ChecklistTask; totalTasks: number; attempt: number; taskAttempt: number; startedAtMs: number } | undefined
   let retryGateAuthorized = Boolean(options.retryGate || options.repairGate)
   let repairCyclesRemaining = options.repairGate ? options.repairCycles : 0
@@ -706,7 +769,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     appendEvent(eventsPath, event(state.runId, 'recovery-start', 'publish', { publicationConflict: true, cycle: publicationRepairsUsed, paths: allowedPaths }, task, state.attempt))
     await dependencies.onProgress?.(taskProgress(state, task, state.completedTasks, 'task-start', 0, undefined, state.attempt, taskAttempt))
     const startedAt = clock().getTime()
-    const outcome = await dependencies.worker!.run(request, signal)
+    const outcome = await runAuthorizedWorker(request)
     if (signal.aborted) throw abortReason(signal)
     if (digest(readFileSync(checklistPath, 'utf8')) !== rebaseStepChecklistDigest) throw new Error('publication repair worker altered the controlling checklist')
     if (outcome.status !== 'completed') throw new Error(`publication conflict worker ${outcome.status}: ${outcome.error ?? 'no error detail'}`)
@@ -810,7 +873,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       const task = selectTask(parsed, options.taskMatch)
       if (!task) {
         delete state.currentTask
-        if (options.openPullRequest && !state.pullRequestUrl) {
+        if (options.openPullRequest && !state.pullRequestUrl && await publicationAuthorized()) {
           if (!dependencies.publishPullRequest) throw new Error('pull request publication is unavailable in this composition')
           appendEvent(eventsPath, event(state.runId, 'publish-start', 'publish', { branch: state.branch, syncBranch: state.syncBranch, publicationTarget: options.publicationTarget ?? state.syncBranch }))
           try {
@@ -824,6 +887,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             const published = await dependencies.publishPullRequest(publicationRequest, signal, {
               repairConflict: repairPublicationConflict,
               validateBeforePush: validatePublicationBase,
+              authorizeRemoteMutation: runAuthorizedRemoteMutation,
               recordRemoteHead: async remoteHead => {
                 if (remoteHead) state.publicationRemoteHead = remoteHead
                 else delete state.publicationRemoteHead
@@ -978,7 +1042,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       })
       appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: model.model, effort: model.effort ?? null, paths: allowedPaths }, task, state.attempt))
       if (signal.aborted) throw abortReason(signal)
-      let outcome = await dependencies.worker.run(request, signal)
+      let outcome = await runAuthorizedWorker(request)
       let outcomeAttempt = state.attempt
       let retryUsed = false
       let verifyingNoCommit = false
@@ -1004,7 +1068,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             taskIndex: task.index, attempt: outcomeAttempt, key: createLeaseKey(stateDir),
           })
           appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'availability' }, task, outcomeAttempt))
-          outcome = await dependencies.worker.run(retryRequest, signal)
+          outcome = await runAuthorizedWorker(retryRequest)
           retryUsed = true
         }
       }
@@ -1038,7 +1102,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         })
         appendEvent(eventsPath, event(state.runId, 'start', 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'no-commit' }, task, outcomeAttempt))
         verifyingNoCommit = true
-        outcome = await dependencies.worker.run(retryRequest, signal)
+        outcome = await runAuthorizedWorker(retryRequest)
         retryUsed = true
         if (signal.aborted) throw abortReason(signal)
         if (digest(readFileSync(checklistPath, 'utf8')) !== controllerHash) throw new Error('worker altered the controlling checklist')
@@ -1116,7 +1180,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         state.status = 'failed'
       }
     }
-    if (state.status === 'running') state.status = signal.aborted ? 'interrupted' : 'failed'
+    if (state.status === 'running') state.status = signal.aborted || message.includes(DIRECT_HUMAN_STOP_REASON) ? 'interrupted' : 'failed'
     state.lastError = message
     writeState(join(stateDir, 'run.json'), state)
     appendEvent(eventsPath, event(state.runId, 'run-end', 'complete', { status: state.status, error: message }))

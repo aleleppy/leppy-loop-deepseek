@@ -15,7 +15,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { inspectAuthenticatedControllers, migrateRunStateSecurityProof, selectControllerForStatus } from './controller-auth.js'
 import type { AuthenticatedController } from './controller-auth.js'
 import { resolveRepoRoot } from './git.js'
-import { appendLifecycleAuthorityReceipt, lifecycleStateDir } from './lifecycle-authority.js'
+import { acquireLifecycleAuthorityMutex, appendLifecycleAuthorityReceipt, lifecycleStateDir } from './lifecycle-authority.js'
 import { harnessRunDependencies } from './harness-runtime.js'
 import { HumanGrantStore } from './human-grant.js'
 import type { RecoveryAuthority } from './human-grant.js'
@@ -230,8 +230,14 @@ function validateTechnicalArguments(
 }
 
 async function persistLifecycleAuthority(runtime: LeppyLoopRuntime, repoRoot: string, runId: string, authority: LifecycleAuthority): Promise<void> {
-  if (runtime.hooks.persistAuthority) await runtime.hooks.persistAuthority(repoRoot, runId, authority)
-  else appendLifecycleAuthorityReceipt(await lifecycleStateDir(repoRoot, runId), runId, authority)
+  if (runtime.hooks.persistAuthority) {
+    await runtime.hooks.persistAuthority(repoRoot, runId, authority)
+    return
+  }
+  const stateDir = await lifecycleStateDir(repoRoot, runId)
+  const release = await acquireLifecycleAuthorityMutex(stateDir)
+  try { appendLifecycleAuthorityReceipt(stateDir, runId, authority) }
+  finally { release() }
 }
 
 function lifecycleAuthority(grant: ReturnType<HumanGrantStore['reserve']>['grant']): LifecycleAuthority {

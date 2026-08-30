@@ -282,6 +282,92 @@ describe('pull request publication orchestration', () => {
     expect(git(root, 'ls-remote', '--heads', 'origin', 'refs/heads/feature')).toContain(git(root, 'rev-parse', 'HEAD'))
   }, 30_000)
 
+  it('routes git push and gh pr create mutations through remote authorization', async () => {
+    const { root, request, priorTarget } = deletedBaseRepository()
+    let authorizationDepth = 0
+    let authorizationCalls = 0
+    const mutations: string[] = []
+    const execute: typeof runFile = async (file, args, options) => {
+      if (file === 'git' && args[0] === 'remote') return { stdout: `${TEST_GITHUB_REMOTE}\n`, stderr: '', exitCode: 0 }
+      if (file === 'gh' && args[1] === 'list') return { stdout: '[]', stderr: '', exitCode: 0 }
+      if (file === 'git' && args[0] === 'push') {
+        expect(authorizationDepth).toBe(1)
+        mutations.push('git push')
+      }
+      if (file === 'gh' && args[1] === 'create') {
+        expect(authorizationDepth).toBe(1)
+        mutations.push('gh pr create')
+        return { stdout: 'https://github.com/aleleppy/elysium-ts/pull/60\n', stderr: '', exitCode: 0 }
+      }
+      return await runPublicationFile(file, args, options)
+    }
+    const result = await publishPullRequest({
+      ...request, syncBranch: 'origin/main', originalSyncBranch: 'origin/plugins', priorTargetCommit: priorTarget,
+    }, new AbortController().signal, {
+      repairConflict: async () => { throw new Error('unexpected conflict') },
+      validateBeforePush: async () => ({ receipt: 'authorized-mutations', validatedHead: git(root, 'rev-parse', 'HEAD') }),
+      authorizeRemoteMutation: async mutation => {
+        authorizationCalls += 1
+        authorizationDepth += 1
+        try { return await mutation() } finally { authorizationDepth -= 1 }
+      },
+    }, execute)
+    expect(result.url).toBe('https://github.com/aleleppy/elysium-ts/pull/60')
+    expect(authorizationCalls).toBe(2)
+    expect(mutations).toEqual(['git push', 'gh pr create'])
+  }, 60_000)
+
+  it('does not execute git push when remote mutation authorization rejects it', async () => {
+    const { root, request, priorTarget } = deletedBaseRepository()
+    let authorizationCalls = 0
+    const mutations: string[] = []
+    const execute: typeof runFile = async (file, args, options) => {
+      if (file === 'git' && args[0] === 'remote') return { stdout: `${TEST_GITHUB_REMOTE}\n`, stderr: '', exitCode: 0 }
+      if (file === 'gh' && args[1] === 'list') return { stdout: '[]', stderr: '', exitCode: 0 }
+      if (file === 'git' && args[0] === 'push') mutations.push('git push')
+      if (file === 'gh' && args[1] === 'create') mutations.push('gh pr create')
+      return await runPublicationFile(file, args, options)
+    }
+    await expect(publishPullRequest({
+      ...request, syncBranch: 'origin/main', originalSyncBranch: 'origin/plugins', priorTargetCommit: priorTarget,
+    }, new AbortController().signal, {
+      repairConflict: async () => { throw new Error('unexpected conflict') },
+      validateBeforePush: async () => ({ receipt: 'push-rejected', validatedHead: git(root, 'rev-parse', 'HEAD') }),
+      authorizeRemoteMutation: async () => {
+        authorizationCalls += 1
+        throw new Error('remote push authorization rejected')
+      },
+    }, execute)).rejects.toThrow('remote push authorization rejected')
+    expect(authorizationCalls).toBe(1)
+    expect(mutations).toEqual([])
+  }, 60_000)
+
+  it('does not execute gh pr create when its remote mutation authorization rejects it', async () => {
+    const { root, request, priorTarget } = deletedBaseRepository()
+    let authorizationCalls = 0
+    const mutations: string[] = []
+    const execute: typeof runFile = async (file, args, options) => {
+      if (file === 'git' && args[0] === 'remote') return { stdout: `${TEST_GITHUB_REMOTE}\n`, stderr: '', exitCode: 0 }
+      if (file === 'gh' && args[1] === 'list') return { stdout: '[]', stderr: '', exitCode: 0 }
+      if (file === 'git' && args[0] === 'push') mutations.push('git push')
+      if (file === 'gh' && args[1] === 'create') mutations.push('gh pr create')
+      return await runPublicationFile(file, args, options)
+    }
+    await expect(publishPullRequest({
+      ...request, syncBranch: 'origin/main', originalSyncBranch: 'origin/plugins', priorTargetCommit: priorTarget,
+    }, new AbortController().signal, {
+      repairConflict: async () => { throw new Error('unexpected conflict') },
+      validateBeforePush: async () => ({ receipt: 'create-rejected', validatedHead: git(root, 'rev-parse', 'HEAD') }),
+      authorizeRemoteMutation: async mutation => {
+        authorizationCalls += 1
+        if (authorizationCalls === 2) throw new Error('pull request creation authorization rejected')
+        return await mutation()
+      },
+    }, execute)).rejects.toThrow('pull request creation authorization rejected')
+    expect(authorizationCalls).toBe(2)
+    expect(mutations).toEqual(['git push'])
+  }, 60_000)
+
   it('refuses a publication retarget whose authenticated prior target is not incorporated', async () => {
     const { root, request } = deletedBaseRepository()
     const unrelated = git(root, 'rev-parse', 'feature')

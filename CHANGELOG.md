@@ -2,6 +2,14 @@
 
 All notable changes are documented here.
 
+## [0.3.22] - 2026-08-30
+
+### Fixed
+
+- Recovery now reconciles an authenticated `run.json` lifecycle identity through the complete HMAC-validated authority chain while holding the repository lock. This covers the real command handoff where direct-human renewal and the next admitted transition are both durable before the controller job reads the older run state. After waiting for the lock, recovery rereads and reauthenticates the exact current run state so a queued controller cannot overwrite newer progress with a pre-lock snapshot. That locked-fresh state must appear exactly in the validated chain; only then is it advanced to the authenticated tail and matched against the controller options, preserving WIP and releasing no worker on mismatch.
+- Privileged actions now share a lifecycle-authority mutex with direct-human receipt persistence. Every worker release revalidates the exact authenticated tail, and every `git push`/`gh pr create` mutation is revalidated while holding that mutex; revocation aborts and publication downgrade removes publication authority instead of racing stale controller options.
+- Regression coverage now includes a 31-case renewal/authority matrix, an end-to-end runner case for old run state → renewal receipt → transition receipt → one recovery, queued-recovery freshness, post-inspection revoke/downgrade races, and the npm-cache quarantine crash/reappearance suite.
+
 ## [0.3.21] - 2026-08-30
 
 ### Fixed
