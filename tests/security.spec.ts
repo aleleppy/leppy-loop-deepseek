@@ -29,6 +29,18 @@ describe('security boundary', () => {
     expect(() => validateArgv(command, args, process.cwd(), process.cwd())).toThrow()
   })
 
+  it('denies verification package scripts and interpreter frontends while allowing direct validation binaries', () => {
+    const root = mkdtempSync(join(tmpdir(), 'leppy-security-verification-'))
+    for (const [command, args] of [
+      ['npm', ['test']], ['npm.cmd', ['run', 'test:e2e']], ['pnpm', ['test']], ['pnpm.exe', ['run', 'lint']],
+      ['node', ['scripts/check.mjs']], ['python3', ['scripts/check.py']], ['bun', ['test.ts']],
+    ] as const) {
+      expect(() => validateArgv(command, args, root, root, undefined, 'verification')).toThrow(/verification command frontend denied/u)
+    }
+    expect(() => validateArgv('vitest', ['run', 'tests/focused.spec.ts'], root, root, undefined, 'verification')).not.toThrow()
+    expect(() => validateArgv('playwright.cmd', ['test', 'tests/e2e.spec.ts'], root, root, undefined, 'verification')).not.toThrow()
+  })
+
   it('allows local tests, real repo-local PowerShell files and only read-only Git verbs', () => {
     const root = mkdtempSync(join(tmpdir(), 'leppy-security-'))
     mkdirSync(join(root, 'scripts'))

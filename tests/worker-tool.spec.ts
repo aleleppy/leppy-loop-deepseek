@@ -38,7 +38,7 @@ interface RegisteredWorkerTool {
 
 function registeredRuntime(
   root: string,
-  mode: 'task' | 'publication-conflict',
+  mode: 'task' | 'verification' | 'publication-conflict',
   output: { stdoutLossy?: boolean; stderrLossy?: boolean; workspaceRoot?: string; resolvedCommand?: string } = {},
 ): {
   tools: string[]
@@ -128,7 +128,45 @@ describe('worker commit capability', () => {
     await expect(commitTaskChanges(policy, 'fix: forbidden conflict commit', runner(root))).rejects.toThrow('cannot commit')
   })
 
-  it('registers the opaque worker prompt variable and only edit tools in publication conflict mode', () => {
+  it('accepts verification mode with read, search and exec but no durable mutation capability', async () => {
+    const root = repository()
+    const policy: WorkerPolicy = {
+      root,
+      checklist: join(root, 'tasks.task.md'),
+      allowed: [join(root, 'prisma', 'schemas', 'auth.prisma')],
+      mode: 'verification',
+    }
+    const verification = registeredRuntime(root, 'verification')
+    expect(verification.promptVariables).toEqual([{ name: 'leppy_prompt', value: 'preserve literal {{ duration: 200 }}' }])
+    expect(verification.tools).toEqual(['leppy_read', 'leppy_search', 'leppy_exec'])
+    for (const denied of ['leppy_write', 'leppy_edit', 'leppy_commit', 'leppy_delete']) expect(verification.tools).not.toContain(denied)
+    await expect(commitTaskChanges(policy, 'test: forbidden verification commit', runner(root))).rejects.toThrow('verification workers cannot commit')
+  })
+
+  it('denies verification package scripts and interpreter frontends before resolution but admits a direct local binary', async () => {
+    const root = repository()
+    mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'), 'fixture\n')
+    const runtime = registeredRuntime(root, 'verification')
+    const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    for (const invocation of [
+      { command: 'npm.cmd', args: ['test'] },
+      { command: 'pnpm', args: ['run', 'test:e2e'] },
+      { command: 'node', args: ['scripts/check.mjs'] },
+      { command: 'python3', args: ['scripts/check.py'] },
+    ]) {
+      await expect(execute(invocation, { signal: new AbortController().signal })).rejects.toThrow(/verification command frontend denied/u)
+    }
+    expect(runtime.resolutions).toHaveLength(0)
+    expect(runtime.commands).toHaveLength(0)
+
+    await expect(execute({ command: 'tsc', args: ['--noEmit'] }, { signal: new AbortController().signal })).rejects.toThrow('command failed')
+    const expected = join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
+    expect(runtime.resolutions).toHaveLength(1)
+    expect(runtime.commands).toEqual([[expected, '--noEmit']])
+  })
+
+  it('preserves task and publication conflict capability boundaries', () => {
     const root = repository()
     const conflict = registeredRuntime(root, 'publication-conflict')
     const task = registeredRuntime(root, 'task')
@@ -276,6 +314,7 @@ describe('worker commit capability', () => {
       root,
       checklist: join(root, 'tasks.task.md'),
       allowed: [join(root, 'prisma', 'schemas', 'auth.prisma')],
+      mode: 'task',
     }
 
     await expect(commitTaskChanges(policy, 'fix: reconcile lossy commit output', runGit)).resolves.toBe(commitId)
@@ -292,6 +331,7 @@ describe('worker commit capability', () => {
       root,
       checklist: join(root, 'tasks.task.md'),
       allowed: [join(root, 'prisma', 'schemas'), join(root, 'prisma', 'migrations')],
+      mode: 'task',
     }
 
     const commit = await commitTaskChanges(policy, 'feat: persist auth state', runner(root))

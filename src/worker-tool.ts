@@ -28,7 +28,7 @@ function loadPolicy(): WorkerPolicy {
   const allowed = JSON.parse(requiredEnv('LEPPY_ALLOWED_PATHS')) as unknown
   if (!Array.isArray(allowed) || !allowed.every(item => typeof item === 'string')) throw new Error('LEPPY_ALLOWED_PATHS must be a string array')
   const mode = process.env.LEPPY_WORKER_MODE ?? 'task'
-  if (!['task', 'publication-conflict'].includes(mode)) throw new Error('LEPPY_WORKER_MODE is invalid')
+  if (!['task', 'verification', 'publication-conflict'].includes(mode)) throw new Error('LEPPY_WORKER_MODE is invalid')
   return { root, checklist, allowed: allowed.map(item => resolve(root, item)), mode: mode as WorkerMode, ...(process.env.LEPPY_GATE_FINGERPRINT ? { gateFingerprint: process.env.LEPPY_GATE_FINGERPRINT } : {}) }
 }
 
@@ -145,7 +145,7 @@ function requireCompleteGitOutput(result: GitResult, operation: string): GitResu
 
 /** Validate and commit exactly the changed paths inside one worker's declared scope. */
 export async function commitTaskChanges(policy: WorkerPolicy, message: string, runGit: GitRunner): Promise<string> {
-  if (policy.mode === 'publication-conflict') throw new Error('publication conflict workers cannot commit')
+  if (policy.mode !== 'task') throw new Error(`${policy.mode} workers cannot commit`)
   if (!isConventional(message)) throw new Error('commit message must be conventional')
   const relativeScopes = policy.allowed.map(path => relative(policy.root, path))
   const probes = (await Promise.all([
@@ -206,7 +206,7 @@ export function apply(ctx: Context): void {
       return { text: missingNotice + result.stdout }
     },
   }))
-  if (policy.mode !== 'publication-conflict') ctx.tools.register(defineTool({
+  if (policy.mode === 'task') ctx.tools.register(defineTool({
     name: 'leppy_edit',
     description: 'Replace exact UTF-8 text inside one writable task path. Prefer this over rewriting whole files or constructing patches.',
     parameters: {
@@ -227,7 +227,7 @@ export function apply(ctx: Context): void {
       return { replacements: args.replaceAll ? matches : 1 }
     },
   }))
-  if (policy.mode !== 'publication-conflict') ctx.tools.register(defineTool({
+  if (policy.mode === 'task') ctx.tools.register(defineTool({
     name: 'leppy_commit',
     description: 'Create the task conventional commit through a narrow Git-metadata capability after validating every changed path against this task scope.',
     parameters: { message: { type: 'string', required: true } },
@@ -237,7 +237,7 @@ export function apply(ctx: Context): void {
       return { commit }
     },
   }))
-  ctx.tools.register(defineTool({
+  if (policy.mode !== 'verification') ctx.tools.register(defineTool({
     name: 'leppy_write',
     description: 'Replace one UTF-8 file inside the current task path scope. Parent directories are created.',
     parameters: { path: { type: 'string', required: true }, content: { type: 'string', required: true } },
@@ -263,7 +263,9 @@ export function apply(ctx: Context): void {
   }))
   if (policy.mode !== 'publication-conflict') ctx.tools.register(defineTool({
     name: 'leppy_exec',
-    description: 'Run an exact local argv without a shell. Bare commands resolve local-first from the authenticated root node_modules/.bin; Windows shims select .cmd automatically. Keep command and args separate. Package managers permit only explicit run/test scripts; npx/dlx/corepack and alternate package frontends, install, cache overrides, remote, publication and dynamic-eval commands are denied.',
+    description: policy.mode === 'verification'
+      ? 'Run one direct already-materialized validation binary in the disposable verification worktree. Package managers, repository scripts, shells, interpreter frontends, remote clients, publication and dynamic evaluation are denied.'
+      : 'Run an exact local argv without a shell. Bare commands resolve local-first from the authenticated root node_modules/.bin; Windows shims select .cmd automatically. Keep command and args separate. Package managers permit only explicit run/test scripts; npx/dlx/corepack and alternate package frontends, install, cache overrides, remote, publication and dynamic-eval commands are denied.',
     parameters: {
       command: { type: 'string', required: true },
       args: { type: 'array', items: { type: 'string' }, required: true },
@@ -276,10 +278,18 @@ export function apply(ctx: Context): void {
     async execute(args, exec) {
       const cwd = resolveExecCwd(policy, args.cwd)
       const normalized = normalizeExecCommand(args.command, cwd)
-      validateArgv(normalized, args.args, cwd, policy.root, policy.gateFingerprint)
+      validateArgv(normalized, args.args, cwd, policy.root, policy.gateFingerprint, policy.mode)
       const environment = workerExecEnvironment(policy)
       const command = await ctx.subprocess.resolveExecutable(explicitRepoExecutable(policy, cwd, normalized), environment, exec.signal)
-      validateArgv(command, args.args, cwd, policy.root)
+      if (policy.mode === 'verification') {
+        if (isAbsolute(normalized) || /[\\/]/u.test(normalized)) throw new Error('verification requires a bare authenticated local validation binary')
+        const localBin = resolve(policy.root, 'node_modules', '.bin')
+        const resolvedRelative = relative(localBin, command)
+        if (resolvedRelative === '..' || resolvedRelative.startsWith(`..${sep}`) || isAbsolute(resolvedRelative)) {
+          throw new Error('verification executable did not resolve from authenticated root node_modules/.bin')
+        }
+      }
+      validateArgv(command, args.args, cwd, policy.root, undefined, policy.mode)
       const execution = ctx.sandboxPolicy.resolve(exec.agent?.session ? { session: exec.agent.session } : {})
       if (execution.mode !== 'workspace-write') throw new Error(`worker requires workspace-write, got ${execution.mode}`)
       if (realpathSync(execution.workspaceRoot) !== policy.root) throw new Error('worker sandbox root does not match the authenticated worktree')

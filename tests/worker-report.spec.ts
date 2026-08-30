@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseWorkerReport } from '../src/worker-report.js'
+import { parseWorkerReport, renderWorkerOutcomeContract } from '../src/worker-report.js'
 
 const completed = 'LEPPY_OUTCOME: {"status":"completed","summary":"implemented safely","validation":{"status":"passed","evidence":"pnpm test passed 12 tests"}}'
 
@@ -8,6 +8,17 @@ describe('worker outcome protocol', () => {
     expect(parseWorkerReport(`Implemented.\n${completed}`)).toMatchObject({
       status: 'completed', validation: { status: 'passed' },
     })
+  })
+
+  it('requires passed focused validation before verification can report completed', () => {
+    const contract = renderWorkerOutcomeContract('verification').join('\n')
+    expect(contract).toContain('existing committed task satisfies the Done contract')
+    expect(contract).toContain('focused validation passed without changing HEAD or the worktree')
+    expect(parseWorkerReport(completed)).toMatchObject({ status: 'completed', validation: { status: 'passed' } })
+    for (const validation of ['failed', 'not-run']) {
+      expect(() => parseWorkerReport(`LEPPY_OUTCOME: {"status":"completed","summary":"verification finished","validation":{"status":"${validation}","evidence":"focused verification did not pass"}}`))
+        .toThrow('completed worker outcome requires passed validation evidence')
+    }
   })
 
   it('rejects missing, malformed and internally inconsistent dispositions', () => {

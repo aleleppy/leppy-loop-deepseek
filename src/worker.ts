@@ -252,24 +252,29 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
 
 function workerPrompt(request: WorkerRequest): string {
   const publicationConflict = request.mode === 'publication-conflict'
+  const verification = request.mode === 'verification'
   const kind = request.task.kind === 'closure' ? 'phase closure' : 'ordinary task'
   return [
-    `You are one ephemeral Leppy Loop worker for a ${publicationConflict ? 'publication conflict resolution' : kind}.`,
+    `You are one ephemeral Leppy Loop worker for ${publicationConflict ? 'a publication conflict resolution' : verification ? 'an isolated committed-task verification' : `a ${kind}`}.`,
     `Execute only this line: ${request.task.raw}`,
     request.task.metadata.done ? `Done contract: ${request.task.metadata.done}` : 'Closure contract: inspect the completed phase and correct only defects inside scope.',
-    `Writable repo-relative paths: ${request.allowedPaths.map(path => JSON.stringify(path)).join(', ')}`,
+    `${verification ? 'Relevant' : 'Writable'} repo-relative paths: ${request.allowedPaths.map(path => JSON.stringify(path)).join(', ')}`,
     `Runtime platform: ${process.platform}.`,
     publicationConflict
       ? 'Use only the provided leppy_read, leppy_write, and leppy_delete tools. Every allowed path is exact; no directory descendants are authorized.'
-      : 'Use only the provided leppy_read, leppy_write, leppy_edit, leppy_search, leppy_exec, and leppy_commit tools. Use leppy_search instead of rg/grep/find, leppy_edit instead of patches, and never invoke a shell command string. leppy_exec resolves bare local binaries from the authenticated root node_modules/.bin; invoke playwright, vitest, tsc, or similar directly. Package-manager commands are limited to explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, dependency installation, cache overrides, or an in-worktree package-manager cache.',
+      : verification
+        ? 'Use only the provided leppy_read, leppy_search, and leppy_exec tools. This is verification-only: no write, edit, commit, or delete capability exists. Run the narrow focused validation required by the Done contract against the existing committed HEAD. Invoke already-materialized direct validation binaries such as playwright, vitest, or tsc; package managers, repository scripts, shells, and language interpreter frontends are denied.'
+        : 'Use only the provided leppy_read, leppy_write, leppy_edit, leppy_search, leppy_exec, and leppy_commit tools. Use leppy_search instead of rg/grep/find, leppy_edit instead of patches, and never invoke a shell command string. leppy_exec resolves bare local binaries from the authenticated root node_modules/.bin; invoke playwright, vitest, tsc, or similar directly. Package-manager commands are limited to explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, dependency installation, cache overrides, or an in-worktree package-manager cache.',
     'Never read or edit the controlling checklist. Never push, publish, deploy, mutate PRs, fetch, merge, rebase, or manage worktrees. Never use git apply, restore, reset, clean, add, commit, or checkout through leppy_exec.',
     publicationConflict
       ? 'Resolve the exact files and finish without staging or committing. The authenticated controller exclusively owns the Git index and rebase continuation.'
-      : request.task.kind === 'task'
-        ? 'Finish with exactly one conventional commit through leppy_commit and a clean working tree.'
-        : 'If correction is needed, make at most one conventional commit and leave a clean tree. If no correction is needed, make no commit.',
+      : verification
+        ? 'Do not change HEAD or any worktree file. Report completed only if focused validation passes and the existing commit satisfies the Done contract; report failed for a real validation failure and blocked with validation not-run when the environment still cannot execute it.'
+        : request.task.kind === 'task'
+          ? 'Finish with exactly one conventional commit through leppy_commit and a clean working tree.'
+          : 'If correction is needed, make at most one conventional commit and leave a clean tree. If no correction is needed, make no commit.',
     ...request.instructions,
     'Applicable project instructions have already been injected above. Do not try to re-read CLAUDE.md, AGENTS.md, or instruction files unless an explicit writable path also authorizes them.',
-    ...renderWorkerOutcomeContract(publicationConflict ? 'publication-conflict' : request.task.kind === 'closure' ? 'closure' : 'task'),
+    ...renderWorkerOutcomeContract(publicationConflict ? 'publication-conflict' : verification ? 'verification' : request.task.kind === 'closure' ? 'closure' : 'task'),
   ].join('\n')
 }

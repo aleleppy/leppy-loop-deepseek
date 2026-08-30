@@ -1,11 +1,25 @@
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+const harnessState = vi.hoisted(() => ({ prompts: [] as string[] }))
+vi.mock('@deepseek-ai/dsh-sdk-client', () => ({
+  DeepSeekHarness: class {
+    async run(prompt: string): Promise<{ finalResponse: string }> {
+      harnessState.prompts.push(prompt)
+      return {
+        finalResponse: 'LEPPY_OUTCOME: {"status":"completed","summary":"verified existing commit","validation":{"status":"passed","evidence":"focused validation passed"}}',
+      }
+    }
+    async close(): Promise<void> { return undefined }
+  },
+}))
+
 import { HarnessWorkerAdapter, WorkerToolFailureCircuitBreaker, workerFailureFromNotification, workerStatusForFailure } from '../src/worker.js'
 import type { WorkerRequest } from '../src/types.js'
 
-function request(stateDir: string): WorkerRequest {
+function request(stateDir: string, mode?: WorkerRequest['mode']): WorkerRequest {
   return {
     runId: 'cancel-test',
     task: {
@@ -22,6 +36,7 @@ function request(stateDir: string): WorkerRequest {
     worktree: stateDir,
     checklistPath: 'tasks.task.md',
     allowedPaths: ['src/value.ts'],
+    ...(mode ? { mode } : {}),
     model: 'unused',
     provider: 'unused',
     timeoutMs: 30_000,
@@ -42,6 +57,21 @@ describe('Harness worker cancellation', () => {
     control.abort(new Error('request canceled'))
     releaseCredential({ envName: 'UNUSED_API_KEY', value: 'unused-key' })
     await expect(running).rejects.toThrow('request canceled')
+  })
+
+  it('prompts verification as isolated validation with no durable mutation', async () => {
+    harnessState.prompts.length = 0
+    const stateDir = mkdtempSync(join(tmpdir(), 'leppy-worker-verification-'))
+    const adapter = new HarnessWorkerAdapter({ credential: async () => ({}) })
+    await expect(adapter.run(request(stateDir, 'verification'), new AbortController().signal)).resolves.toMatchObject({
+      status: 'completed', report: { validation: { status: 'passed' } },
+    })
+    const prompt = harnessState.prompts.at(-1)
+    expect(prompt).toContain('ephemeral Leppy Loop worker for an isolated committed-task verification')
+    expect(prompt).toContain('This is verification-only: no write, edit, commit, or delete capability exists.')
+    expect(prompt).toContain('package managers, repository scripts, shells, and language interpreter frontends are denied')
+    expect(prompt).toContain('Do not change HEAD or any worktree file.')
+    expect(prompt).toContain('existing committed HEAD')
   })
 
   it('classifies terminal SDK overload notifications as unavailable', () => {

@@ -17,6 +17,7 @@ const PACKAGE_SCRIPT_COMMANDS: Readonly<Record<string, ReadonlySet<string>>> = {
   yarn: new Set(['run', 'test']),
   bun: new Set(['run', 'test']),
 }
+const VERIFICATION_INTERPRETERS = new Set([...SHELLS, 'node', 'deno', 'bun', 'python', 'python3', 'py', 'ruby', 'perl'])
 const PACKAGE_CACHE_FLAGS = /^(?:--cache|--cache-dir|--cache-folder|--store-dir|--state-dir)(?:=|$)/u
 const PACKAGE_OPTIONS_WITH_VALUES = new Set([
   '--prefix', '--workspace', '-w', '--userconfig', '--globalconfig', '--registry', '--cache', '--loglevel',
@@ -64,7 +65,7 @@ function packageCommandWords(args: readonly string[]): string[] {
   return words
 }
 
-export function validateArgv(command: string, args: readonly string[], cwd: string, repoRoot: string, gateFingerprint?: string): void {
+export function validateArgv(command: string, args: readonly string[], cwd: string, repoRoot: string, gateFingerprint?: string, mode: 'task' | 'verification' | 'publication-conflict' = 'task'): void {
   if (command.trim() === '' || command.includes('\0') || args.some(arg => arg.includes('\0'))) throw new Error('empty or NUL-containing argv denied')
   const executable = basename(command)
   const lowerArgs = args.map(arg => arg.toLowerCase())
@@ -87,6 +88,9 @@ export function validateArgv(command: string, args: readonly string[], cwd: stri
     }
   }
   if (KNOWN_REMOTE_CLIENTS.has(executable) || executable === 'gh') throw new Error(`remote client denied: ${executable}`)
+  if (mode === 'verification' && (PACKAGE_MANAGERS.has(executable) || PACKAGE_FRONTENDS.has(executable) || VERIFICATION_INTERPRETERS.has(executable))) {
+    throw new Error(`verification command frontend denied: ${executable}; invoke an already-materialized direct validation binary`)
+  }
   if (executable === 'git') {
     const verb = lowerArgs.find(arg => !arg.startsWith('-'))
     if (!verb) throw new Error('git invocation without a verb denied')

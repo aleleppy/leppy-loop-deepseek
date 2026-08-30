@@ -167,6 +167,11 @@ async function proveEntirelyUntracked(worktree: string): Promise<void> {
   if (tracked || staged || unstaged) throw new Error('.npm-cache contains tracked or staged work and cannot be quarantined')
   const status = await git(worktree, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--', '.npm-cache'])
   const entries = status.split('\0').filter(Boolean)
+  if (entries.length === 0) {
+    const ignored = await runFile('git', ['check-ignore', '-q', '--', '.npm-cache'], { cwd: worktree, env: scrubEnvironment(process.env), allowFailure: true })
+    if (ignored.exitCode !== 0) throw new Error('.npm-cache is not one wholly untracked or ignored artifact directory')
+    return
+  }
   if (entries.length !== 1 || !entries[0]!.startsWith('?? ')) throw new Error('.npm-cache is not one wholly untracked artifact directory')
   const path = entries[0]!.slice(3).replaceAll('\\', '/').replace(/\/$/u, '')
   if (path !== '.npm-cache') throw new Error(`unexpected untracked cache path: ${path}`)

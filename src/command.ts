@@ -104,6 +104,7 @@ export interface LeppyLoopControlResult {
   currentTask?: number
   attempt?: number
   task?: string
+  pendingValidation?: string
   branch?: string
 }
 
@@ -420,6 +421,7 @@ export async function executeLeppyLoopControl(
           completedTasks: selected.completedTasks, attempt: selected.attempt, branch: selected.branch,
           ...(selected.currentTask === undefined ? {} : { currentTask: selected.currentTask }),
           ...(selected.openTask ? { task: selected.openTask.text } : {}),
+          ...(selected.pendingTaskValidation ? { pendingValidation: `${selected.pendingTaskValidation.commitHead}:${selected.pendingTaskValidation.phase}:attempts=${selected.pendingTaskValidation.verifierAttempts}` } : {}),
         } : {}),
       }
     }
@@ -437,6 +439,7 @@ export async function executeLeppyLoopControl(
       ...(durableDetail ? { detail: durableDetail } : {}),
       ...(selected.currentTask === undefined ? {} : { currentTask: selected.currentTask }),
       ...(selected.openTask ? { task: selected.openTask.text } : {}),
+      ...(selected.pendingTaskValidation ? { pendingValidation: `${selected.pendingTaskValidation.commitHead}:${selected.pendingTaskValidation.phase}:attempts=${selected.pendingTaskValidation.verifierAttempts}` } : {}),
     } : { operation: 'status', status: 'not-found' }
   }
 
@@ -564,6 +567,7 @@ The Host authenticated and bound the lifecycle to these exact controller facts:
 - open row: ${controller.openTask?.text ?? 'none'}
 - durable detail: ${controller.detail ?? 'none'}
 - automatic recovery blocked: ${controller.autoRecoveryBlocked === true ? 'yes; do not loop without changed conditions or direct human intervention' : 'no'}
+- committed task pending isolated validation: ${controller.pendingTaskValidation ? `${controller.pendingTaskValidation.commitHead} (${controller.pendingTaskValidation.phase}, verifier attempts ${controller.pendingTaskValidation.verifierAttempts})` : 'none'}
 - recorded PR: ${controller.pullRequestUrl ?? 'none'}
 ` : '\nNo authenticated controller exists yet. Resolve one tracked checklist and its authoritative Git base, then start exactly one new run.\n'
   return `${LIFECYCLE_PROMPT}
@@ -628,6 +632,7 @@ export async function executeLeppyLoopCommand(
         ...(value.currentTask === undefined ? [] : [`currentTask=${value.currentTask}`]),
         ...(value.attempt === undefined ? [] : [`attempt=${value.attempt}`]),
         ...(value.task ? [`task=${value.task}`] : []),
+        ...(value.pendingValidation ? [`pendingValidation=${value.pendingValidation}`] : []),
         ...(value.detail ? [`detail=${value.detail}`] : []),
       ]
       return { kind: 'success', text: `Leppy Loop ${value.status}. ${facts.join(' | ')}` }

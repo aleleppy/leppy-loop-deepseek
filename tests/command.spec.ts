@@ -17,7 +17,7 @@ import type { AuthenticatedController } from '../src/controller-auth.js'
 import { HumanGrantStore } from '../src/human-grant.js'
 import { parseLeppyLoopCommandInput, tokenizeLeppyLoopCommandInput } from '../src/options.js'
 import type { LeppyLoopRuntime } from '../src/command.js'
-import type { LeppyLoopOptions, LifecycleAuthority, RunProgress, RunResult } from '../src/types.js'
+import type { LeppyLoopOptions, LifecycleAuthority, PendingTaskValidation, RunProgress, RunResult } from '../src/types.js'
 
 const cwd = process.cwd()
 
@@ -58,6 +58,23 @@ function controller(overrides: Partial<AuthenticatedController> = {}): Authentic
       index: 11, line: 29, phase: 'Phase 6', mark: ' ', kind: 'task', text: 'P6.1 update documentation', raw: '- [ ] P6.1',
       metadata: { paths: ['README.md'], done: 'documentation matches release' },
     },
+    ...overrides,
+  }
+}
+
+function pendingValidation(overrides: Partial<PendingTaskValidation> = {}): PendingTaskValidation {
+  return {
+    schemaVersion: 1,
+    taskKey: 'a'.repeat(64),
+    taskIndex: 11,
+    baseHead: '1'.repeat(40),
+    commitHead: '2'.repeat(40),
+    checklistDigest: 'b'.repeat(64),
+    ignoredPathsDigest: 'd'.repeat(64),
+    failureSignature: 'c'.repeat(64),
+    createdAttempt: 15,
+    verifierAttempts: 2,
+    phase: 'pending',
     ...overrides,
   }
 }
@@ -201,6 +218,45 @@ describe('simple human slash surface', () => {
     expect(prompt).toContain('currentTask: 11')
     expect(prompt).toContain('attempt: 15')
     expect(prompt).toContain('examples/feature.task.md')
+  })
+
+  it('surfaces pending committed verification in lifecycle prompt and human status', async () => {
+    const pending = pendingValidation()
+    const durable = controller({ pendingTaskValidation: pending, autoRecoveryBlocked: true })
+    const messages: unknown[] = []
+    const owner = agent('pending-verification-owner', message => { messages.push(message) })
+    const rt = runtime({ inspectControllers: async () => [durable] })
+
+    await expect(executeLeppyLoopCommand(context(), invocation(owner, 'continuar'), rt)).resolves.toMatchObject({ kind: 'success' })
+    const prompt = JSON.stringify(messages[0])
+    expect(prompt).toContain(pending.commitHead)
+    expect(prompt).toContain('pending')
+    expect(prompt).toContain('verifier attempts 2')
+
+    const status = await executeLeppyLoopCommand(context(), invocation(agent('pending-status-owner'), 'status'), runtime({
+      inspectControllers: async () => [durable],
+    }))
+    expect(status).toMatchObject({ kind: 'success' })
+    expect(status.text).toContain(pending.commitHead)
+    expect(status.text).toMatch(/pending|validation/iu)
+  })
+
+  it('pending-state visibility does not bypass a truly unchanged open recovery circuit', async () => {
+    const owner = agent('unchanged-circuit-owner')
+    const unchanged = controller({
+      autoRecoveryBlocked: true,
+      detail: 'unchanged worker failure',
+      updatedAt: new Date(Date.now() - 1_000).toISOString(),
+      lifecycleAuthority: {
+        sessionId: 'unchanged-circuit-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 2, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const rt = runtime({ inspectControllers: async () => [unchanged] })
+    await expect(executeLeppyLoopCommand(context(), invocation(owner, 'status'), rt)).resolves.toMatchObject({ kind: 'success' })
+    await expect(executeLeppyLoopControl(context(), rt, owner, {
+      operation: 'continue', runId: unchanged.runId, tasks: unchanged.checklistRelative, syncBranch: unchanged.syncBranch,
+    })).rejects.toThrow('fresh direct human /leppy-loop authorization is required')
   })
 
   it('/leppy-loop publicar authorizes the newest completed controller without reopening work', async () => {

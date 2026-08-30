@@ -19,6 +19,13 @@ function completedOutcome(output = 'done'): WorkerOutcome {
   }
 }
 
+function blockedNotRunOutcome(detail: string): WorkerOutcome {
+  return {
+    status: 'blocked', output: detail, error: detail,
+    report: { status: 'blocked', summary: detail, validation: { status: 'not-run', evidence: detail } },
+  }
+}
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
@@ -191,6 +198,398 @@ describe('controller state machine', () => {
     expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
     expect(git(result.worktree!, 'log', '-1', '--pretty=%s')).toBe('feat: partial task result')
     expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
+  }, 90_000)
+
+  it('verifies a blocked committed candidate in a disposable root and adopts it exactly once', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    const calls: WorkerRequest[] = []
+    let durableRoot = ''
+    let verificationRoot = ''
+    const worker: WorkerAdapter = { async run(request) {
+      calls.push(request)
+      if (request.mode === 'verification') {
+        verificationRoot = request.worktree
+        expect(request.allowedPaths).toEqual([])
+        expect(request.worktree).not.toBe(durableRoot)
+        expect(request.worktree).toBe(join(request.stateDir, 'verification-worktree'))
+        expect(git(request.worktree, 'branch', '--show-current')).toBe('')
+        return completedOutcome('independent focused validation passed')
+      }
+      durableRoot = request.worktree
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'candidate\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: committed candidate')
+      return blockedNotRunOutcome('validator unavailable after implementation commit')
+    } }
+
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(calls.map(call => call.mode ?? 'task')).toEqual(['task', 'verification'])
+    expect(existsSync(verificationRoot)).toBe(false)
+    expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [x] Change')
+    expect(readFileSync(join(result.worktree!, 'src', 'value.txt'), 'utf8')).toBe('candidate\n')
+    expect(git(result.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('1')
+    const adoptedHead = git(result.worktree!, 'rev-parse', 'HEAD')
+    const state = JSON.parse(readFileSync(join(result.stateDir!, 'run.json'), 'utf8'))
+    expect(state).not.toHaveProperty('activeTaskAttempt')
+    expect(state).not.toHaveProperty('pendingTaskValidation')
+    expect((readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8').match(/"type":"done"/gu) ?? [])).toHaveLength(1)
+
+    const forbidden = new FakeWorker()
+    const repeated = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: result.runId,
+    }, { ...modelDeps, worker: forbidden })
+    expect(repeated).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(forbidden.calls).toHaveLength(0)
+    expect(git(result.worktree!, 'rev-parse', 'HEAD')).toBe(adoptedHead)
+    expect((readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8').match(/"type":"done"/gu) ?? [])).toHaveLength(1)
+  }, 90_000)
+
+  it('rejects verifier tracked mutation while keeping the committed candidate and checklist pending', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    let candidateHead = ''
+    const worker: WorkerAdapter = { async run(request) {
+      if (request.mode === 'verification') {
+        writeFileSync(join(request.worktree, 'src', 'value.txt'), 'verifier tampered tracked candidate\n')
+        return completedOutcome('forged passing verification')
+      }
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'candidate awaiting verification\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: committed candidate for verifier mutation')
+      candidateHead = git(request.worktree, 'rev-parse', 'HEAD')
+      return blockedNotRunOutcome('task worker could not run focused validation')
+    } }
+
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, runId: () => 'vermutate001', worker },
+    )).rejects.toThrow('verification worker changed tracked or untracked candidate files')
+
+    const stateDir = join(repo.root, '.git', 'leppy-loop', 'runs', 'vermutate001')
+    const state = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(state).toMatchObject({
+      status: 'failed', completedTasks: 0,
+      pendingTaskValidation: { phase: 'pending', commitHead: candidateHead, ignoredPathsDigest: expect.stringMatching(/^[0-9a-f]{64}$/u) },
+    })
+    expect(git(state.worktree, 'rev-parse', 'HEAD')).toBe(candidateHead)
+    expect(readFileSync(join(state.worktree, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
+    expect(existsSync(join(stateDir, 'verification-worktree'))).toBe(false)
+    expect(readFileSync(join(stateDir, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
+  }, 90_000)
+
+  it('denies pending adoption when an ordinary task creates an ignored out-of-scope artifact', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
+    let candidateHead = ''
+    const worker: WorkerAdapter = { async run(request) {
+      mkdirSync(join(request.worktree, 'ignored-worker-output'), { recursive: true })
+      writeFileSync(join(request.worktree, 'ignored-worker-output', 'report.json'), '{"forged":true}\n')
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'candidate plus ignored artifact\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: candidate with ignored side effect')
+      candidateHead = git(request.worktree, 'rev-parse', 'HEAD')
+      return blockedNotRunOutcome('focused validator unavailable')
+    } }
+
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, runId: () => 'ignoredpath01', worker },
+    )).rejects.toThrow('worker changed ignored paths outside authenticated task state')
+
+    const stateDir = join(repo.root, '.git', 'leppy-loop', 'runs', 'ignoredpath01')
+    const state = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(state).toMatchObject({
+      status: 'failed', completedTasks: 0,
+      activeTaskAttempt: { ignoredPathsDigest: expect.stringMatching(/^[0-9a-f]{64}$/u) },
+    })
+    expect(state).not.toHaveProperty('pendingTaskValidation')
+    expect(git(state.worktree, 'rev-parse', 'HEAD')).toBe(candidateHead)
+    expect(readFileSync(join(state.worktree, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
+    expect(readFileSync(join(state.worktree, 'ignored-worker-output', 'report.json'), 'utf8')).toBe('{"forged":true}\n')
+  }, 90_000)
+
+  it('automatically quarantines task-generated ignored npm cache while preserving bytes in private state', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
+    writeFileSync(join(repo.root, '.gitignore'), '.npm-cache/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore task npm cache')
+    const worker: WorkerAdapter = { async run(request) {
+      mkdirSync(join(request.worktree, '.npm-cache', '_logs'), { recursive: true })
+      writeFileSync(join(request.worktree, '.npm-cache', '_logs', 'task.log'), 'task-generated cache bytes\n')
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'completed without cache pollution\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: complete task before cache quarantine')
+      return completedOutcome('implementation committed')
+    } }
+
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(existsSync(join(result.worktree!, '.npm-cache'))).toBe(false)
+    expect(git(result.worktree!, 'status', '--porcelain')).toBe('')
+    const receipt = JSON.parse(readFileSync(join(result.stateDir!, 'worker-npm-cache-recovery.json'), 'utf8'))
+    expect(receipt).toMatchObject({ runId: result.runId, phase: 'quarantined', basis: 'baseline-absent' })
+    expect(readFileSync(join(receipt.quarantine, '_logs', 'task.log'), 'utf8')).toBe('task-generated cache bytes\n')
+    expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).toContain('"automatic":true')
+  }, 90_000)
+
+  it('deletes verifier ignored cache mutations with the disposable root and leaves durable worktree unchanged', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    writeFileSync(join(repo.root, '.gitignore'), '.npm-cache/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore local cache')
+    let durableRoot = ''
+    let verificationRoot = ''
+    const worker: WorkerAdapter = { async run(request) {
+      if (request.mode === 'verification') {
+        verificationRoot = request.worktree
+        mkdirSync(join(request.worktree, '.npm-cache', '_logs'), { recursive: true })
+        writeFileSync(join(request.worktree, '.npm-cache', '_logs', 'verifier.log'), 'disposable verifier cache\n')
+        expect(git(request.worktree, 'status', '--porcelain')).toBe('')
+        return completedOutcome('validation passed despite disposable cache')
+      }
+      durableRoot = request.worktree
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'isolated-candidate\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: isolated candidate')
+      return blockedNotRunOutcome('focused validator was unavailable in task worker')
+    } }
+
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result.status).toBe('completed')
+    expect(result.worktree).toBe(durableRoot)
+    expect(existsSync(verificationRoot)).toBe(false)
+    expect(existsSync(join(durableRoot, '.npm-cache'))).toBe(false)
+    expect(readFileSync(join(durableRoot, 'src', 'value.txt'), 'utf8')).toBe('isolated-candidate\n')
+    expect(git(durableRoot, 'status', '--porcelain')).toBe('')
+    expect(git(repo.root, 'worktree', 'list', '--porcelain').match(/^worktree /gmu)).toHaveLength(2)
+  }, 90_000)
+
+  it('keeps the candidate pending and opens recovery circuit when isolated verification blocks', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    const calls: WorkerRequest[] = []
+    let candidateHead = ''
+    const worker: WorkerAdapter = { async run(request) {
+      calls.push(request)
+      if (request.mode === 'verification') return blockedNotRunOutcome('independent verifier unavailable')
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'pending-candidate\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: pending candidate')
+      candidateHead = git(request.worktree, 'rev-parse', 'HEAD')
+      return blockedNotRunOutcome('task worker could not run validation')
+    } }
+
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result).toMatchObject({ status: 'stalled', completedTasks: 0, currentTask: 0 })
+    expect(calls.map(call => call.mode ?? 'task')).toEqual(['task', 'verification'])
+    expect(git(result.worktree!, 'rev-parse', 'HEAD')).toBe(candidateHead)
+    expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
+    expect(existsSync(join(result.stateDir!, 'verification-worktree'))).toBe(false)
+    const state = JSON.parse(readFileSync(join(result.stateDir!, 'run.json'), 'utf8'))
+    expect(state).toMatchObject({
+      status: 'stalled', autoRecoveryBlocked: true, failureStreak: { count: 1 },
+      pendingTaskValidation: { phase: 'pending', commitHead: candidateHead, verifierAttempts: 1 },
+    })
+    expect(state).not.toHaveProperty('activeTaskAttempt')
+    expect(state.lastError).toContain('independent verifier unavailable')
+    expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
+  }, 90_000)
+
+  it('promotes an active committed attempt on exact recovery and verifies before any task worker', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    const control = new AbortController()
+    let firstRequest: WorkerRequest | undefined
+    const interruptedWorker: WorkerAdapter = { async run(request) {
+      firstRequest = request
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'committed-before-interrupt\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: committed before interruption')
+      control.abort(new Error('simulated interruption after committed task'))
+      return { status: 'interrupted', output: '', error: 'simulated interruption after committed task' }
+    } }
+
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, worker: interruptedWorker, signal: control.signal },
+    )).rejects.toThrow('simulated interruption after committed task')
+    expect(firstRequest).toBeDefined()
+    const stateDir = firstRequest!.stateDir
+    const interruptedState = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(interruptedState).toMatchObject({
+      status: 'interrupted', activeTaskAttempt: { taskIndex: 0, baseHead: expect.any(String), attempt: 1 },
+    })
+    expect(interruptedState).not.toHaveProperty('pendingTaskValidation')
+    expect(readFileSync(join(firstRequest!.worktree, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
+    expect(git(firstRequest!.worktree, 'rev-list', '--count', 'main..HEAD')).toBe('1')
+
+    const recoveryCalls: WorkerRequest[] = []
+    const verificationWorker: WorkerAdapter = { async run(request) {
+      recoveryCalls.push(request)
+      expect(request.mode).toBe('verification')
+      return completedOutcome('recovered candidate independently validated')
+    } }
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: firstRequest!.runId,
+    }, { ...modelDeps, worker: verificationWorker })
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(recoveryCalls).toHaveLength(1)
+    expect(recoveryCalls[0]!.mode).toBe('verification')
+    expect(existsSync(join(stateDir, 'verification-worktree'))).toBe(false)
+    const recoveredState = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(recoveredState).not.toHaveProperty('activeTaskAttempt')
+    expect(recoveredState).not.toHaveProperty('pendingTaskValidation')
+    expect(readFileSync(join(recovered.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [x] Change')
+  }, 90_000)
+
+  it('finishes a validated recovery exactly once when checklist bytes were already written and separately staged', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    const worker: WorkerAdapter = { async run(request) {
+      if (request.mode === 'verification') return blockedNotRunOutcome('pause before controller adoption')
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'validated candidate\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: validated candidate before staged adoption')
+      return blockedNotRunOutcome('task validator unavailable')
+    } }
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    const statePath = join(first.stateDir!, 'run.json')
+    const state = JSON.parse(readFileSync(statePath, 'utf8'))
+    expect(state.pendingTaskValidation).toMatchObject({ phase: 'pending', ignoredPathsDigest: expect.stringMatching(/^[0-9a-f]{64}$/u) })
+
+    const completedChecklist = readFileSync(join(first.worktree!, 'tasks.task.md'), 'utf8').replace('- [ ] Change', '- [x] Change')
+    writeFileSync(join(first.worktree!, 'tasks.task.md'), completedChecklist)
+    git(first.worktree!, 'add', '--', 'tasks.task.md')
+    expect(git(first.worktree!, 'diff', '--cached', '--name-only')).toBe('tasks.task.md')
+    state.pendingTaskValidation = {
+      ...state.pendingTaskValidation,
+      phase: 'validated', verifierAttempts: 1,
+      validatedChecklistDigest: createHash('sha256').update(completedChecklist).digest('hex'),
+      validationEvidenceDigest: '6'.repeat(64),
+    }
+    delete state.stateProof
+    writeFileSync(statePath, `${JSON.stringify(state)}\n`)
+    const key = Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64')
+    persistRunStateProof(first.stateDir!, state, key)
+
+    const forbidden = new FakeWorker()
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker: forbidden })
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(forbidden.calls).toHaveLength(0)
+    expect(git(recovered.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('1')
+    expect(git(recovered.worktree!, 'status', '--porcelain')).toBe('')
+    expect(readFileSync(join(recovered.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [x] Change')
+    const adoptedHead = git(recovered.worktree!, 'rev-parse', 'HEAD')
+    expect((readFileSync(join(first.stateDir!, 'events.jsonl'), 'utf8').match(/"type":"done"/gu) ?? [])).toHaveLength(1)
+
+    const repeated = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker: forbidden })
+    expect(repeated).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(forbidden.calls).toHaveLength(0)
+    expect(git(repeated.worktree!, 'rev-parse', 'HEAD')).toBe(adoptedHead)
+    expect((readFileSync(join(first.stateDir!, 'events.jsonl'), 'utf8').match(/"type":"done"/gu) ?? [])).toHaveLength(1)
+  }, 90_000)
+
+  it('reconciles an exact detached verifier registration whose target disappeared and resumes verification', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    const seedWorker: WorkerAdapter = { async run(request) {
+      if (request.mode === 'verification') return blockedNotRunOutcome('seed pending verifier state')
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'candidate before verifier registration crash\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: candidate before verifier registration crash')
+      return blockedNotRunOutcome('task validator unavailable')
+    } }
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker: seedWorker })
+    const pending = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8')).pendingTaskValidation
+    expect(pending).toMatchObject({ phase: 'pending', commitHead: expect.stringMatching(/^[0-9a-f]{40}$/u) })
+    const verificationRoot = join(first.stateDir!, 'verification-worktree')
+    git(repo.root, 'worktree', 'add', '--detach', verificationRoot, pending.commitHead)
+    expect(git(repo.root, 'worktree', 'list', '--porcelain')).toContain(verificationRoot.replaceAll('\\', '/'))
+    rmSync(verificationRoot, { recursive: true, force: true })
+    expect(existsSync(verificationRoot)).toBe(false)
+
+    const calls: WorkerRequest[] = []
+    const verifier: WorkerAdapter = { async run(request) {
+      calls.push(request)
+      expect(request.mode).toBe('verification')
+      expect(request.worktree).toBe(verificationRoot)
+      return completedOutcome('verification resumed after exact registration reconciliation')
+    } }
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker: verifier })
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.mode).toBe('verification')
+    expect(existsSync(verificationRoot)).toBe(false)
+    expect(git(repo.root, 'worktree', 'list', '--porcelain')).not.toContain(verificationRoot.replaceAll('\\', '/'))
+  }, 90_000)
+
+  it('removes an exact unregistered partial verifier target before resuming verification', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    const seedWorker: WorkerAdapter = { async run(request) {
+      if (request.mode === 'verification') return blockedNotRunOutcome('seed pending verifier state')
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'candidate before unregistered verifier crash\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: candidate before unregistered verifier crash')
+      return blockedNotRunOutcome('task validator unavailable')
+    } }
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker: seedWorker })
+    const verificationRoot = join(first.stateDir!, 'verification-worktree')
+    mkdirSync(verificationRoot)
+    writeFileSync(join(verificationRoot, 'partial.tmp'), 'interrupted git worktree add\n')
+    expect(git(repo.root, 'worktree', 'list', '--porcelain')).not.toContain(verificationRoot.replaceAll('\\', '/'))
+
+    const verifier: WorkerAdapter = { async run(request) {
+      expect(request.mode).toBe('verification')
+      expect(request.worktree).toBe(verificationRoot)
+      expect(existsSync(join(request.worktree, 'partial.tmp'))).toBe(false)
+      return completedOutcome('verification resumed after exact partial-target reconciliation')
+    } }
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker: verifier })
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(existsSync(verificationRoot)).toBe(false)
+  }, 90_000)
+
+  it('refuses pending candidate HEAD or checklist tampering before releasing any worker', async () => {
+    const seedPending = async (label: string): Promise<{ repo: ReturnType<typeof repository>; result: Awaited<ReturnType<typeof runLeppyLoop>> }> => {
+      const repo = repository(`- [ ] Change \`src/value.txt\` | paths=src/value.txt | Done: ${label} focused validation passes\n`)
+      let calls = 0
+      const worker: WorkerAdapter = { async run(request) {
+        calls += 1
+        if (request.mode === 'verification') return blockedNotRunOutcome(`${label} verifier blocked`)
+        writeFileSync(join(request.worktree, 'src', 'value.txt'), `${label}-candidate\n`)
+        git(request.worktree, 'add', '--', 'src/value.txt')
+        git(request.worktree, 'commit', '-m', `feat: ${label} candidate`)
+        return blockedNotRunOutcome(`${label} task validator unavailable`)
+      } }
+      const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+      expect(calls).toBe(2)
+      expect(JSON.parse(readFileSync(join(result.stateDir!, 'run.json'), 'utf8'))).toMatchObject({
+        pendingTaskValidation: { phase: 'pending', commitHead: git(result.worktree!, 'rev-parse', 'HEAD') },
+      })
+      return { repo, result }
+    }
+
+    const headCase = await seedPending('head-tamper')
+    git(headCase.result.worktree!, 'commit', '--allow-empty', '-m', 'chore: tamper pending candidate head')
+    const headWorker = new FakeWorker()
+    await expect(runLeppyLoop({
+      tasks: headCase.repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: headCase.result.runId,
+    }, { ...modelDeps, worker: headWorker })).rejects.toThrow('pending committed-task HEAD changed before verification')
+    expect(headWorker.calls).toHaveLength(0)
+
+    const checklistCase = await seedPending('checklist-tamper')
+    writeFileSync(join(checklistCase.result.worktree!, 'tasks.task.md'), '- [ ] Replaced pending task `src/value.txt` | paths=src/value.txt | Done: different contract\n')
+    const checklistWorker = new FakeWorker()
+    await expect(runLeppyLoop({
+      tasks: checklistCase.repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: checklistCase.result.runId,
+    }, { ...modelDeps, worker: checklistWorker })).rejects.toThrow('authenticated pending task identity no longer matches the controlling checklist')
+    expect(checklistWorker.calls).toHaveLength(0)
   }, 90_000)
 
   it('rejects a clean closure that omits the structured completion report', async () => {
@@ -1058,6 +1457,7 @@ describe('controller state machine', () => {
     expect(existsSync(join(first.stateDir!, 'dependency-staging-replacement.json'))).toBe(true)
     const retryState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
     retryState.lastError = 'pre-worker setup failed: simulated hard crash omitted the prior dependency detail'
+    delete retryState.stateProof
     writeFileSync(join(first.stateDir!, 'run.json'), `${JSON.stringify(retryState, null, 2)}\n`)
     const leaseKey = Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64')
     persistRunStateProof(first.stateDir!, retryState, leaseKey)
@@ -1367,7 +1767,10 @@ describe('controller state machine', () => {
       tasks: repo.tasks, syncBranch: 'main', fetch: false, lifecycleAuthority: authority(1),
     }, { ...modelDeps, worker })
     expect(first.status).toBe('stalled')
-    expect(existsSync(join(first.worktree!, '.npm-cache'))).toBe(true)
+    expect(existsSync(join(first.worktree!, '.npm-cache'))).toBe(false)
+    const automaticReceipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-npm-cache-recovery.json'), 'utf8'))
+    expect(automaticReceipt).toMatchObject({ runId: first.runId, phase: 'quarantined', basis: 'baseline-absent' })
+    expect(readFileSync(join(automaticReceipt.quarantine, '_logs', 'attempt.log'), 'utf8')).toBe('preserved cache bytes\n')
     const firstState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
 
     const recovered = await runLeppyLoop({
@@ -1409,6 +1812,7 @@ describe('controller state machine', () => {
     expect(interrupted.status).toBe('interrupted')
     const completedState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
     delete completedState.currentTask
+    delete completedState.stateProof
     writeFileSync(join(first.stateDir!, 'run.json'), `${JSON.stringify(completedState, null, 2)}\n`)
     persistRunStateProof(
       first.stateDir!, completedState,
@@ -1445,6 +1849,9 @@ describe('controller state machine', () => {
       },
     } })
     const firstState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    const automaticReceipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-npm-cache-recovery.json'), 'utf8'))
+    expect(existsSync(join(first.worktree!, '.npm-cache'))).toBe(false)
+    expect(readFileSync(join(automaticReceipt.quarantine, '_logs', 'attempt.log'), 'utf8')).toBe('preserve me\n')
     const forbiddenWorker = new FakeWorker()
     const refused = await runLeppyLoop({
       tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true,
@@ -1454,7 +1861,8 @@ describe('controller state machine', () => {
     expect(refused.status).toBe('stalled')
     expect(refused.detail).toContain('exact authenticated existing run')
     expect(forbiddenWorker.calls).toHaveLength(0)
-    expect(readFileSync(join(first.worktree!, '.npm-cache', '_logs', 'attempt.log'), 'utf8')).toBe('preserve me\n')
+    expect(existsSync(join(first.worktree!, '.npm-cache'))).toBe(false)
+    expect(readFileSync(join(automaticReceipt.quarantine, '_logs', 'attempt.log'), 'utf8')).toBe('preserve me\n')
   }, 90_000)
 
   it('never releases another worker for an unresolved dependency miss even without a legacy hydration flag', async () => {

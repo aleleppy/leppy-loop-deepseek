@@ -47,12 +47,14 @@ export function parseWorkerReport(output: string): WorkerReport {
   return report
 }
 
-export function renderWorkerOutcomeContract(kind: 'task' | 'closure' | 'publication-conflict'): string[] {
+export function renderWorkerOutcomeContract(kind: 'task' | 'closure' | 'verification' | 'publication-conflict'): string[] {
   const completion = kind === 'task'
     ? 'completed is allowed only after exactly one conventional commit and concrete validation passed.'
     : kind === 'closure'
       ? 'completed is allowed only when the phase is verified clean or one corrective commit was created and concrete validation passed.'
-      : 'completed is allowed only after every exact conflict path is resolved and concrete validation passed.'
+      : kind === 'verification'
+        ? 'completed is allowed only when the existing committed task satisfies the Done contract and concrete focused validation passed without changing HEAD or the worktree.'
+        : 'completed is allowed only after every exact conflict path is resolved and concrete validation passed.'
   return [
     `Finish with exactly one final line: ${WORKER_OUTCOME_PREFIX} {"status":"completed|blocked|failed","summary":"concrete disposition","validation":{"status":"passed|failed|not-run","evidence":"command/result or concrete inspection"}}`,
     completion,

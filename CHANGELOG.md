@@ -2,6 +2,15 @@
 
 All notable changes are documented here.
 
+## [0.3.23] - 2026-08-30
+
+### Fixed
+
+- Material task progress is authenticated before worker admission and survives blocked validation, interruption, and Host loss. A clean exact-scope single commit whose validation did not fail becomes `pendingTaskValidation` instead of being classified as unchanged or sent to another writable implementation worker. Task, checklist, base/candidate HEAD, ignored-byte digest, attempt, failure signature, verifier count, and adoption phase are covered by the run-state HMAC and revalidated under the repository lock.
+- Pending commits are validated by a dedicated isolated worker mode with read/search/exec but no write/edit/commit/delete tools. Verification denies package managers, repository scripts, shells and interpreter frontends; only an authenticated bare binary from root `node_modules/.bin` may execute. It runs in a detached disposable worktree pinned to the candidate, then proves unchanged detached HEAD, index, tracked/untracked tree and unchanged durable WIP before trusting a passed report. Dependencies and ignored validator artifacts disappear with that worktree. Genuine validation failure never enters this path; unavailable or repeated verification remains fail-closed.
+- Successful verification embeds a validated adoption receipt atomically inside `run.json` before the controller marks the checklist. Recovery reconciles crashes before write, after checklist write/stage, and after amend, accepting only the exact checklist-only rewrite and recording completion once. Missing-directory Git worktree registrations and exact private partial targets created before Git registration are reconciled without global prune. Legacy proof migration publishes the required marker, a full sanitized target proof, and embedded state in a resumable order so no crash can downgrade modern state back to legacy authentication. Durable task ignored paths and bytes are HMAC-bound, while a newly generated physical `.npm-cache` is automatically moved with its bytes into the existing authenticated private quarantine transaction. Human status exposes the pending commit, phase, and verifier-attempt count.
+- Regression coverage now includes committed blocked/not-run verification, verifier tracked and ignored mutation, package/interpreter denial, interrupted-after-commit recovery, ignored out-of-scope task effects, automatic ignored cache quarantine, active/pending/state-proof tamper, atomic embedded proof without `ownership.hmac`, checklist pre-amend crash states, missing verification-worktree registration, exact candidate/checklist tamper, and unchanged-circuit denial.
+
 ## [0.3.22] - 2026-08-30
 
 ### Fixed

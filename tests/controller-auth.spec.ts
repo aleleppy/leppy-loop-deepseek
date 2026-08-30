@@ -1,13 +1,15 @@
-import { createHmac } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { parseChecklist, selectTask } from '../src/checklist.js'
 import { inspectAuthenticatedControllers, migrateRunStateSecurityProof } from '../src/controller-auth.js'
 import { appendLifecycleAuthorityReceipt } from '../src/lifecycle-authority.js'
+import { ensureRunStateProofRequired, persistRunStateProof } from '../src/run-state-proof.js'
 import { createLeaseKey } from '../src/state.js'
-import type { LifecycleAuthority } from '../src/types.js'
+import type { ActiveTaskAttempt, LifecycleAuthority, PendingTaskValidation } from '../src/types.js'
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
@@ -48,6 +50,51 @@ function repository(withAuthority: boolean): { root: string; stateDir: string; r
   return { root, stateDir, runId }
 }
 
+type Fixture = ReturnType<typeof repository>
+type MutableRunState = Record<string, unknown> & {
+  runId: string
+  currentTask?: number
+  activeTaskAttempt?: ActiveTaskAttempt
+  pendingTaskValidation?: PendingTaskValidation
+}
+
+function taskFacts(root: string): { taskKey: string; checklistDigest: string } {
+  const path = join(root, 'tasks.task.md')
+  const source = readFileSync(path, 'utf8')
+  const task = selectTask(parseChecklist(source, path))!
+  return {
+    taskKey: createHash('sha256').update(JSON.stringify({ index: task.index, phase: task.phase, kind: task.kind, raw: task.raw })).digest('hex'),
+    checklistDigest: createHash('sha256').update(source).digest('hex'),
+  }
+}
+
+function authenticateState(fixture: Fixture, mutate: (state: MutableRunState) => void): MutableRunState {
+  const statePath = join(fixture.stateDir, 'run.json')
+  const state = JSON.parse(readFileSync(statePath, 'utf8')) as MutableRunState
+  mutate(state)
+  writeFileSync(statePath, `${JSON.stringify(state)}\n`)
+  persistRunStateProof(fixture.stateDir, state as never, createLeaseKey(fixture.stateDir))
+  return state
+}
+
+function pendingValidation(fixture: Fixture, overrides: Partial<PendingTaskValidation> = {}): PendingTaskValidation {
+  const facts = taskFacts(fixture.root)
+  return {
+    schemaVersion: 1,
+    taskKey: facts.taskKey,
+    taskIndex: 0,
+    baseHead: git(fixture.root, 'rev-parse', 'HEAD'),
+    commitHead: git(fixture.root, 'rev-parse', 'HEAD'),
+    checklistDigest: facts.checklistDigest,
+    ignoredPathsDigest: createHash('sha256').update('[]').digest('hex'),
+    failureSignature: 'f'.repeat(64),
+    createdAttempt: 1,
+    verifierAttempts: 0,
+    phase: 'pending',
+    ...overrides,
+  }
+}
+
 describe('authenticated controller lifecycle authority integrity', () => {
   it('accepts a valid modern receipt chain and genuine legacy state', async () => {
     const modern = repository(true)
@@ -59,7 +106,7 @@ describe('authenticated controller lifecycle authority integrity', () => {
   it('migrates legacy ownership once and rejects later recovery-state tampering', async () => {
     const legacy = repository(false)
     const statePath = join(legacy.stateDir, 'run.json')
-    const legacyState = JSON.parse(readFileSync(statePath, 'utf8')) as { lastError?: string; autoRecoveryBlocked?: boolean; dependencyBridgeActive?: boolean; windowsArgvBridgeActive?: boolean }
+    const legacyState = JSON.parse(readFileSync(statePath, 'utf8')) as { stateProof?: { value?: string }; lastError?: string; autoRecoveryBlocked?: boolean; dependencyBridgeActive?: boolean; windowsArgvBridgeActive?: boolean }
     legacyState.lastError = 'forged legacy failure'
     legacyState.autoRecoveryBlocked = true
     legacyState.dependencyBridgeActive = true
@@ -73,6 +120,8 @@ describe('authenticated controller lifecycle authority integrity', () => {
     expect(migrated.autoRecoveryBlocked).toBeUndefined()
     expect(migrated.dependencyBridgeActive).toBeUndefined()
     expect(migrated.windowsArgvBridgeActive).toBeUndefined()
+    expect(migrated.stateProof?.value).toMatch(/^[A-Za-z0-9_-]{43}$/u)
+    unlinkSync(join(legacy.stateDir, 'ownership.hmac'))
     await expect(inspectAuthenticatedControllers(legacy.root)).resolves.toHaveLength(1)
 
     migrated.lastError = 'npm error code ENOTCACHED; cache mode is only-if-cached'
@@ -80,6 +129,41 @@ describe('authenticated controller lifecycle authority integrity', () => {
     migrated.windowsArgvBridgeActive = true
     writeFileSync(statePath, `${JSON.stringify(migrated)}\n`)
     await expect(inspectAuthenticatedControllers(legacy.root)).resolves.toHaveLength(0)
+  })
+
+  it('resumes both proof-migration crash phases and cannot downgrade to legacy ownership', async () => {
+    const beforeTargetProof = repository(false)
+    const firstPath = join(beforeTargetProof.stateDir, 'run.json')
+    const firstKey = createLeaseKey(beforeTargetProof.stateDir)
+    ensureRunStateProofRequired(beforeTargetProof.stateDir, beforeTargetProof.runId, firstKey)
+    const attackerState = JSON.parse(readFileSync(firstPath, 'utf8')) as MutableRunState
+    attackerState.autoRecoveryBlocked = true
+    attackerState.pendingTaskValidation = pendingValidation(beforeTargetProof)
+    writeFileSync(firstPath, `${JSON.stringify(attackerState)}\n`)
+    await migrateRunStateSecurityProof(beforeTargetProof.root, beforeTargetProof.runId)
+    const firstMigrated = JSON.parse(readFileSync(firstPath, 'utf8')) as MutableRunState & { stateProof?: { value?: string } }
+    expect(firstMigrated.autoRecoveryBlocked).toBeUndefined()
+    expect(firstMigrated.pendingTaskValidation).toBeUndefined()
+    expect(firstMigrated.stateProof?.value).toMatch(/^[A-Za-z0-9_-]{43}$/u)
+
+    const afterTargetProof = repository(false)
+    const secondPath = join(afterTargetProof.stateDir, 'run.json')
+    const secondKey = createLeaseKey(afterTargetProof.stateDir)
+    const interruptedState = JSON.parse(readFileSync(secondPath, 'utf8')) as MutableRunState
+    interruptedState.lastError = 'legacy failure cleared by migration'
+    writeFileSync(secondPath, `${JSON.stringify(interruptedState)}\n`)
+    const preparedTarget = { ...interruptedState }
+    delete preparedTarget.lastError
+    persistRunStateProof(afterTargetProof.stateDir, preparedTarget as never, secondKey)
+    await migrateRunStateSecurityProof(afterTargetProof.root, afterTargetProof.runId)
+    const secondMigrated = JSON.parse(readFileSync(secondPath, 'utf8')) as MutableRunState & { stateProof?: { value?: string } }
+    expect(secondMigrated.stateProof?.value).toMatch(/^[A-Za-z0-9_-]{43}$/u)
+
+    delete secondMigrated.stateProof
+    secondMigrated.autoRecoveryBlocked = true
+    writeFileSync(secondPath, `${JSON.stringify(secondMigrated)}\n`)
+    unlinkSync(join(afterTargetProof.stateDir, 'run-state-auth-required.hmac'))
+    await expect(inspectAuthenticatedControllers(afterTargetProof.root)).resolves.toHaveLength(0)
   })
 
   it('quarantines a modern controller after receipt corruption or head deletion', async () => {
@@ -100,5 +184,90 @@ describe('authenticated controller lifecycle authority integrity', () => {
     rmSync(join(modern.stateDir, 'lifecycle-authority'), { recursive: true, force: true })
     unlinkSync(join(modern.stateDir, 'lifecycle-authority-head.json'))
     await expect(inspectAuthenticatedControllers(modern.root)).resolves.toHaveLength(0)
+  })
+
+  it('rejects malformed or mutually exclusive active-attempt and pending-validation state even with a fresh HMAC', async () => {
+    const malformed = repository(false)
+    const facts = taskFacts(malformed.root)
+    authenticateState(malformed, state => {
+      state.activeTaskAttempt = {
+        schemaVersion: 1, taskKey: facts.taskKey, taskIndex: 0, baseHead: git(malformed.root, 'rev-parse', 'HEAD'),
+        checklistDigest: facts.checklistDigest, ignoredPathsDigest: createHash('sha256').update('[]').digest('hex'), attempt: 0,
+      }
+    })
+    await expect(inspectAuthenticatedControllers(malformed.root)).resolves.toHaveLength(0)
+
+    const malformedPending = repository(false)
+    authenticateState(malformedPending, state => {
+      state.pendingTaskValidation = { ...pendingValidation(malformedPending), phase: 'validated' }
+    })
+    await expect(inspectAuthenticatedControllers(malformedPending.root)).resolves.toHaveLength(0)
+
+    const exclusive = repository(false)
+    const pending = pendingValidation(exclusive)
+    authenticateState(exclusive, state => {
+      state.activeTaskAttempt = {
+        schemaVersion: 1, taskKey: pending.taskKey, taskIndex: pending.taskIndex, baseHead: pending.baseHead,
+        checklistDigest: pending.checklistDigest, ignoredPathsDigest: pending.ignoredPathsDigest, attempt: 1,
+      }
+      state.pendingTaskValidation = pending
+    })
+    await expect(inspectAuthenticatedControllers(exclusive.root)).resolves.toHaveLength(0)
+  })
+
+  it('binds pending committed validation to exact commit, task identity, and checklist bytes', async () => {
+    const valid = repository(false)
+    const baseHead = git(valid.root, 'rev-parse', 'HEAD')
+    writeFileSync(join(valid.root, 'src', 'value.txt'), 'committed pending result\n')
+    git(valid.root, 'add', 'src/value.txt')
+    git(valid.root, 'commit', '-m', 'feat: pending committed result')
+    const pending = pendingValidation(valid, { baseHead })
+    authenticateState(valid, state => { state.pendingTaskValidation = pending })
+    await expect(inspectAuthenticatedControllers(valid.root)).resolves.toMatchObject([{
+      runId: valid.runId,
+      pendingTaskValidation: pending,
+      openTask: { index: 0 },
+    }])
+
+    for (const mutation of [
+      { commitHead: '9'.repeat(40) },
+      { taskKey: '8'.repeat(64) },
+      { taskIndex: 1 },
+      { checklistDigest: '7'.repeat(64) },
+    ] satisfies Array<Partial<PendingTaskValidation>>) {
+      const mismatched = repository(false)
+      authenticateState(mismatched, state => { state.pendingTaskValidation = pendingValidation(mismatched, mutation) })
+      await expect(inspectAuthenticatedControllers(mismatched.root)).resolves.toHaveLength(0)
+    }
+  })
+
+  it('exposes a validated pending commit after controller adoption changed HEAD and checklist bytes', async () => {
+    const fixture = repository(false)
+    const original = pendingValidation(fixture)
+    writeFileSync(join(fixture.root, 'src', 'value.txt'), 'committed worker result\n')
+    git(fixture.root, 'add', 'src/value.txt')
+    git(fixture.root, 'commit', '-m', 'feat: committed task result')
+    const commitHead = git(fixture.root, 'rev-parse', 'HEAD')
+    writeFileSync(join(fixture.root, 'tasks.task.md'), '- [x] Alpha `src/value.txt` | Done: alpha\n')
+    git(fixture.root, 'add', 'tasks.task.md')
+    git(fixture.root, 'commit', '-m', 'chore: adopt validated task')
+    const adoptedChecklistDigest = createHash('sha256').update(readFileSync(join(fixture.root, 'tasks.task.md'), 'utf8')).digest('hex')
+    const validated: PendingTaskValidation = {
+      ...original,
+      commitHead,
+      phase: 'validated',
+      verifierAttempts: 1,
+      validatedChecklistDigest: adoptedChecklistDigest,
+      validationEvidenceDigest: '6'.repeat(64),
+    }
+    authenticateState(fixture, state => { state.pendingTaskValidation = validated })
+
+    const controllers = await inspectAuthenticatedControllers(fixture.root)
+    expect(controllers).toMatchObject([{
+      runId: fixture.runId,
+      pendingTaskValidation: validated,
+    }])
+    expect(controllers[0]?.openTask).toBeUndefined()
+    expect(git(fixture.root, 'rev-parse', 'HEAD')).not.toBe(commitHead)
   })
 })

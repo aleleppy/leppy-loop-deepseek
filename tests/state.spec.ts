@@ -1,8 +1,11 @@
-import { existsSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { createEmbeddedRunStateProof, inspectRunStateProof, persistRunStateProof } from '../src/run-state-proof.js'
+import type { RunStateProofInput } from '../src/run-state-proof.js'
 import { acquireLock, createLeaseKey, signLease, verifyLease } from '../src/state.js'
+import type { ActiveTaskAttempt, PendingTaskValidation } from '../src/types.js'
 
 describe('authenticated leases', () => {
   it('accepts an intact lease and rejects tampering/PID reuse identity changes', () => {
@@ -11,6 +14,85 @@ describe('authenticated leases', () => {
     const lease = signLease({ schemaVersion: 1, runId: 'r', taskIndex: 2, attempt: 1, pid: 42, processStart: 'start-a', heartbeat: new Date().toISOString() }, key)
     expect(verifyLease(lease, key)).toBe(true)
     expect(verifyLease({ ...lease, payload: { ...lease.payload, processStart: 'start-b' } }, key)).toBe(false)
+  })
+})
+
+function proofState(overrides: Partial<RunStateProofInput> = {}): RunStateProofInput {
+  return {
+    schemaVersion: 1,
+    runId: 'proof-run',
+    status: 'stalled',
+    repoRoot: 'C:\\repo',
+    checklistRelative: 'tasks.task.md',
+    sourceHead: '1'.repeat(40),
+    branch: 'leppy-loop/proof',
+    worktree: 'C:\\repo-proof',
+    syncBranch: 'main',
+    currentTask: 3,
+    attempt: 8,
+    taskAttempts: {},
+    completedTasks: 2,
+    gateAttempts: {},
+    updatedAt: '2026-08-30T00:00:00.000Z',
+    ...overrides,
+  }
+}
+
+const activeTaskAttempt: ActiveTaskAttempt = {
+  schemaVersion: 1,
+  taskKey: 'a'.repeat(64),
+  taskIndex: 3,
+  baseHead: '2'.repeat(40),
+  checklistDigest: 'b'.repeat(64),
+  ignoredPathsDigest: 'd'.repeat(64),
+  attempt: 8,
+}
+
+const pendingTaskValidation: PendingTaskValidation = {
+  schemaVersion: 1,
+  taskKey: 'a'.repeat(64),
+  taskIndex: 3,
+  baseHead: '2'.repeat(40),
+  commitHead: '3'.repeat(40),
+  checklistDigest: 'b'.repeat(64),
+  ignoredPathsDigest: 'd'.repeat(64),
+  failureSignature: 'c'.repeat(64),
+  createdAttempt: 8,
+  verifierAttempts: 1,
+  phase: 'pending',
+}
+
+describe('authenticated run state proof', () => {
+  it.each([
+    ['activeTaskAttempt', { activeTaskAttempt }],
+    ['pendingTaskValidation', { pendingTaskValidation }],
+  ] as const)('round-trips and rejects tampering of %s', (_label, fields) => {
+    const dir = mkdtempSync(join(tmpdir(), 'leppy-run-proof-'))
+    const key = createLeaseKey(dir)
+    const state = proofState(fields)
+    persistRunStateProof(dir, state, key)
+    expect(inspectRunStateProof(dir, state, key)).toBe('current')
+
+    const tampered = 'activeTaskAttempt' in fields
+      ? proofState({ activeTaskAttempt: { ...fields.activeTaskAttempt, attempt: fields.activeTaskAttempt.attempt + 1 } })
+      : proofState({ pendingTaskValidation: { ...fields.pendingTaskValidation, commitHead: '4'.repeat(40) } })
+    expect(inspectRunStateProof(dir, tampered, key)).toBe('invalid')
+  })
+
+  it('authenticates one embedded run.json generation without ownership.hmac and rejects stale-proof tampering', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'leppy-run-embedded-proof-'))
+    const key = createLeaseKey(dir)
+    const state = proofState({ activeTaskAttempt })
+    const generation = { ...state, stateProof: createEmbeddedRunStateProof(state, key) }
+    writeFileSync(join(dir, 'run.json'), `${JSON.stringify(generation)}\n`)
+
+    expect(existsSync(join(dir, 'ownership.hmac'))).toBe(false)
+    const loaded = JSON.parse(readFileSync(join(dir, 'run.json'), 'utf8')) as typeof generation
+    expect(inspectRunStateProof(dir, loaded, key)).toBe('current')
+
+    loaded.completedTasks += 1
+    writeFileSync(join(dir, 'run.json'), `${JSON.stringify(loaded)}\n`)
+    expect(inspectRunStateProof(dir, loaded, key)).toBe('invalid')
   })
 })
 

@@ -11,7 +11,7 @@ export type Phase = 'setup' | 'worker' | 'closure' | 'gate' | 'human' | 'recover
 export type TaskKind = 'task' | 'closure' | 'gate' | 'human'
 export type ChecklistMark = ' ' | 'x' | '?' | '~'
 export type WorkerPolicy = 'adaptive' | 'selected' | 'terra-high' | 'sol-low'
-export type WorkerMode = 'task' | 'publication-conflict'
+export type WorkerMode = 'task' | 'verification' | 'publication-conflict'
 
 export interface TaskMetadata {
   done?: string
@@ -60,6 +60,32 @@ export interface ChecklistLintOptions {
   defaultModel?: string
   defaultEffort?: string
   phaseGateCommand?: string
+}
+
+export interface ActiveTaskAttempt {
+  schemaVersion: 1
+  taskKey: string
+  taskIndex: number
+  baseHead: string
+  checklistDigest: string
+  ignoredPathsDigest: string
+  attempt: number
+}
+
+export interface PendingTaskValidation {
+  schemaVersion: 1
+  taskKey: string
+  taskIndex: number
+  baseHead: string
+  commitHead: string
+  checklistDigest: string
+  ignoredPathsDigest: string
+  failureSignature: string
+  createdAttempt: number
+  verifierAttempts: number
+  phase: 'pending' | 'validated'
+  validatedChecklistDigest?: string
+  validationEvidenceDigest?: string
 }
 
 export interface LifecycleAuthority {
