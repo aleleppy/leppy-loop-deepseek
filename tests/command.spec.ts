@@ -532,6 +532,32 @@ describe('grant-validated background controller tool', () => {
     expect(received?.dependencyRecoveryDigest).toMatch(/^[0-9a-f]{64}$/u)
   })
 
+  it('forwards the authenticated dependency digest even when the unlocked hydration probe is unavailable', async () => {
+    const owner = agent('unlocked-probe-owner')
+    const stalled = controller({
+      autoRecoveryBlocked: true,
+      detail: "pre-worker setup failed: an authenticated dependency recovery digest and a newly published tree are required before another worker; prior dependency error: worker dependency unavailable after one tool failure; code: MODULE_NOT_FOUND; Cannot find module 'worktree/node_modules/typescript/bin/tsc'",
+      lifecycleAuthority: {
+        sessionId: 'unlocked-probe-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 5, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const jobs = new FakeJobs()
+    let received: LeppyLoopOptions | undefined
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      run: async options => { received = options; return { ...completed, runId: stalled.runId } },
+    })
+
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })).resolves.toMatchObject({ status: 'running', runId: stalled.runId })
+    await jobs.starts[0]!.hooks.done
+    expect(received?.dependencyHydrationRequired).toBeUndefined()
+    expect(received?.dependencyRecoveryDigest).toMatch(/^[0-9a-f]{64}$/u)
+    expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ transitions: 6 })
+  })
+
   it('reuses persisted authority once for the authenticated Windows quoted-executable failure', async () => {
     const owner = agent('windows-argv-owner')
     const stalled = controller({

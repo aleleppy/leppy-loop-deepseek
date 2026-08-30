@@ -948,10 +948,19 @@ describe('controller state machine', () => {
     rmSync(join(first.worktree!, 'node_modules'), { recursive: true, force: true })
     rmSync(join(repo.root, 'node_modules'), { recursive: true, force: true })
 
+    const forbiddenWorker = new FakeWorker()
+    const missingDigest = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, installNpmDependencies: fakeNpmInstall, worker: forbiddenWorker })
+    expect(missingDigest.status).toBe('stalled')
+    expect(missingDigest.detail).toContain('authenticated dependency recovery digest')
+    expect(forbiddenWorker.calls).toHaveLength(0)
+    const wrappedStall = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+
     const recovered = await runLeppyLoop({
       tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
       dependencyHydrationRequired: true,
-      dependencyRecoveryDigest: createHash('sha256').update(stalled.lastError).digest('hex'),
+      dependencyRecoveryDigest: createHash('sha256').update(wrappedStall.lastError).digest('hex'),
     }, { ...modelDeps, installNpmDependencies: fakeNpmInstall, worker: new FakeWorker() })
     expect(recovered.status).toBe('completed')
     expect(existsSync(join(first.worktree!, 'node_modules', 'typescript', 'package.json'))).toBe(true)

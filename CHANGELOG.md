@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.17] - 2026-08-30
+
+### Fixed
+
+- Persisted lifecycle recovery now forwards the authenticated digest for a recognized `ENOTCACHED` or `MODULE_NOT_FOUND` dependency miss even when the unlocked filesystem hydration probe cannot yet prove a copyable/installable tree. The repository-locked runner remains the authority: it revalidates that exact wrapped error digest, materializes and publishes a new isolated tree, and still releases no worker for `local` or unavailable dependencies. This removes the recovery deadlock where provisioning required a digest that command admission withheld until after provisioning was already possible.
+
 ## [0.3.16] - 2026-08-29
 
 ### Fixed

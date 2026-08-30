@@ -21,7 +21,7 @@ import { HumanGrantStore } from './human-grant.js'
 import type { RecoveryAuthority } from './human-grant.js'
 import { runLeppyLoop } from './runner.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
-import { dependencyBridgeRecoveryAvailable, dependencyHydrationAvailable } from './worktree-dependencies.js'
+import { dependencyHydrationAvailable, dependencyResolutionMiss } from './worktree-dependencies.js'
 import { windowsQuotedExecutableFailure } from './windows-command.js'
 import type { LeppyLoopOptions, LifecycleAuthority, RunDependencies, RunProgress, RunResult, WorkerPolicy } from './types.js'
 
@@ -475,7 +475,7 @@ export async function executeLeppyLoopControl(
 
   const livePermits = runtime.grants.permits(agent, repoRoot).filter(permit => permit.runId === runId)
   const dependencyHydration = args.operation === 'continue' && controller !== undefined && dependencyHydrationAvailable(controller)
-  const dependencyRepair = dependencyHydration && controller !== undefined && dependencyBridgeRecoveryAvailable(controller)
+  const dependencyRepair = args.operation === 'continue' && controller !== undefined && dependencyResolutionMiss(controller.detail)
   const windowsArgvRepair = args.operation === 'continue' && controller?.autoRecoveryBlocked === true
     && controller.windowsArgvBridgeActive !== true && windowsQuotedExecutableFailure(controller.detail)
   if (args.operation === 'continue' && controller?.autoRecoveryBlocked === true
