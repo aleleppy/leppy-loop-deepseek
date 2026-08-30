@@ -62,6 +62,12 @@ export interface ChecklistLintOptions {
   phaseGateCommand?: string
 }
 
+export interface IgnoredArtifactTransactionRef {
+  schemaVersion: 1
+  transactionId: string
+  baselineDigest: string
+}
+
 export interface ActiveTaskAttempt {
   schemaVersion: 1
   taskKey: string
@@ -70,6 +76,7 @@ export interface ActiveTaskAttempt {
   checklistDigest: string
   ignoredPathsDigest: string
   attempt: number
+  ignoredArtifactTransaction?: IgnoredArtifactTransactionRef
 }
 
 export interface PendingTaskValidation {

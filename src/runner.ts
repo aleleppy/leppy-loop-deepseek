@@ -27,6 +27,7 @@ import { windowsQuotedExecutableFailure } from './windows-command.js'
 import {
   quarantineWorkerNpmCache, recordWorkerNpmCacheBaseline, workerNpmCacheRecovery, workerNpmCacheTransactionPresent,
 } from './worker-artifacts.js'
+import { recordWorkerIgnoredPathBaseline, reconcileWorkerIgnoredPaths } from './ignored-artifacts.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import type {
   ActiveTaskAttempt, ChecklistTask, LeppyLoopOptions, LifecycleAuthority, ModelCapability, PendingTaskValidation, RunDependencies, RunEvent,
@@ -1034,11 +1035,35 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         || pendingIdentity.taskKey !== selectedTaskKey || pendingIdentity.checklistDigest !== selectedChecklistDigest)) {
         throw new Error('authenticated pending task identity no longer matches the controlling checklist')
       }
+      const reconcileIgnoredAttempt = async (active: ActiveTaskAttempt): Promise<string> => {
+        const reconciled = await reconcileWorkerIgnoredPaths({
+          worktree: state.worktree, stateDir, runId: state.runId,
+          taskKey: active.taskKey, taskIndex: active.taskIndex, attempt: active.attempt,
+          expectedBaselineDigest: active.ignoredPathsDigest,
+          ...(active.ignoredArtifactTransaction ? { expectedTransaction: active.ignoredArtifactTransaction } : {}),
+          key: createLeaseKey(stateDir),
+          onTransactionPrepared: async transaction => {
+            const current = state.activeTaskAttempt
+            if (!current || current.taskKey !== active.taskKey || current.taskIndex !== active.taskIndex
+              || current.attempt !== active.attempt || current.ignoredPathsDigest !== active.ignoredPathsDigest) {
+              throw new Error('worker ignored transaction lost its authenticated active attempt')
+            }
+            current.ignoredArtifactTransaction = transaction
+            writeState(join(stateDir, 'run.json'), state)
+          },
+        })
+        if (reconciled.paths.length > 0) {
+          appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
+            workerArtifact: 'ignored-paths', paths: reconciled.paths,
+            quarantine: reconciled.quarantine ?? null, basis: reconciled.basis,
+            resumed: reconciled.resumed, automatic: true,
+          }, task, active.attempt))
+        }
+        return reconciled.digest
+      }
       if (state.activeTaskAttempt) {
         const active = state.activeTaskAttempt
-        if (await ignoredPathDigest(state.worktree, signal) !== active.ignoredPathsDigest) {
-          throw new Error('ignored worktree artifacts changed during the authenticated active task attempt')
-        }
+        const reconciledIgnoredDigest = await reconcileIgnoredAttempt(active)
         const liveHead = await head(state.worktree)
         if (liveHead === active.baseHead) {
           delete state.activeTaskAttempt
@@ -1048,7 +1073,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           state.pendingTaskValidation = {
             schemaVersion: 1, taskKey: active.taskKey, taskIndex: active.taskIndex,
             baseHead: active.baseHead, commitHead: liveHead, checklistDigest: active.checklistDigest,
-            ignoredPathsDigest: active.ignoredPathsDigest,
+            ignoredPathsDigest: reconciledIgnoredDigest,
             failureSignature: digest(`recovered-active-attempt\0${active.attempt}\0${liveHead}`),
             createdAttempt: active.attempt, verifierAttempts: 0, phase: 'pending',
           }
@@ -1246,6 +1271,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         }, task, attempt))
       }
       let outcomeAttempt = state.attempt
+      let durableIgnoredDigest = state.pendingTaskValidation?.ignoredPathsDigest
       let retryUsed = state.pendingTaskValidation !== undefined
       let verifyingNoCommit = false
       let outcome: WorkerOutcome
@@ -1253,10 +1279,15 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         outcome = await runCommittedVerification(state.pendingTaskValidation, outcomeAttempt)
       } else {
         if (task.kind === 'task') {
+          const ignoredBaseline = await recordWorkerIgnoredPathBaseline({
+            worktree: state.worktree, stateDir, runId: state.runId,
+            taskKey: selectedTaskKey, taskIndex: task.index, attempt: state.attempt,
+            key: createLeaseKey(stateDir),
+          })
           state.activeTaskAttempt = {
             schemaVersion: 1, taskKey: selectedTaskKey, taskIndex: task.index,
             baseHead: previousHead, checklistDigest: controllerHash,
-            ignoredPathsDigest: await ignoredPathDigest(state.worktree, signal), attempt: state.attempt,
+            ignoredPathsDigest: ignoredBaseline.digest, attempt: state.attempt,
           }
           writeState(join(stateDir, 'run.json'), state)
         }
@@ -1268,9 +1299,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         if (signal.aborted) throw abortReason(signal)
         outcome = await runAuthorizedWorker(request)
         await reconcileGeneratedWorkerCache(state.attempt, workerCacheBaseline.cacheState === 'absent', outcome)
-        if (state.activeTaskAttempt && await ignoredPathDigest(state.worktree) !== state.activeTaskAttempt.ignoredPathsDigest) {
-          throw new Error('worker changed ignored paths outside authenticated task state')
-        }
+        if (state.activeTaskAttempt) durableIgnoredDigest = await reconcileIgnoredAttempt(state.activeTaskAttempt)
       }
       if (!retryUsed && outcome.status === 'unavailable'
         && !(task.kind === 'task' && await commitCount(state.worktree, previousHead) === 1
@@ -1283,7 +1312,18 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           if (signal.aborted) throw abortReason(signal)
           outcomeAttempt += 1
           state.attempt = outcomeAttempt
-          if (state.activeTaskAttempt) state.activeTaskAttempt = { ...state.activeTaskAttempt, attempt: outcomeAttempt }
+          if (state.activeTaskAttempt) {
+            const retryIgnoredBaseline = await recordWorkerIgnoredPathBaseline({
+              worktree: state.worktree, stateDir, runId: state.runId,
+              taskKey: state.activeTaskAttempt.taskKey, taskIndex: state.activeTaskAttempt.taskIndex,
+              attempt: outcomeAttempt, key: createLeaseKey(stateDir),
+            })
+            state.activeTaskAttempt = {
+              ...state.activeTaskAttempt, attempt: outcomeAttempt,
+              ignoredPathsDigest: retryIgnoredBaseline.digest,
+            }
+            delete state.activeTaskAttempt.ignoredArtifactTransaction
+          }
           writeState(join(stateDir, 'run.json'), state)
           const retryRequest: WorkerRequest = {
             ...request,
@@ -1299,9 +1339,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'availability' }, task, outcomeAttempt))
           outcome = await runAuthorizedWorker(retryRequest)
           await reconcileGeneratedWorkerCache(outcomeAttempt, retryCacheBaseline.cacheState === 'absent', outcome)
-          if (state.activeTaskAttempt && await ignoredPathDigest(state.worktree) !== state.activeTaskAttempt.ignoredPathsDigest) {
-            throw new Error('availability retry changed ignored paths outside authenticated task state')
-          }
+          if (state.activeTaskAttempt) durableIgnoredDigest = await reconcileIgnoredAttempt(state.activeTaskAttempt)
           retryUsed = true
         }
       }
@@ -1317,7 +1355,18 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         if (signal.aborted) throw abortReason(signal)
         outcomeAttempt += 1
         state.attempt = outcomeAttempt
-        if (state.activeTaskAttempt) state.activeTaskAttempt = { ...state.activeTaskAttempt, attempt: outcomeAttempt }
+        if (state.activeTaskAttempt) {
+          const retryIgnoredBaseline = await recordWorkerIgnoredPathBaseline({
+            worktree: state.worktree, stateDir, runId: state.runId,
+            taskKey: state.activeTaskAttempt.taskKey, taskIndex: state.activeTaskAttempt.taskIndex,
+            attempt: outcomeAttempt, key: createLeaseKey(stateDir),
+          })
+          state.activeTaskAttempt = {
+            ...state.activeTaskAttempt, attempt: outcomeAttempt,
+            ignoredPathsDigest: retryIgnoredBaseline.digest,
+          }
+          delete state.activeTaskAttempt.ignoredArtifactTransaction
+        }
         writeState(join(stateDir, 'run.json'), state)
         const retryRequest: WorkerRequest = {
           ...request,
@@ -1338,9 +1387,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         verifyingNoCommit = true
         outcome = await runAuthorizedWorker(retryRequest)
         await reconcileGeneratedWorkerCache(outcomeAttempt, retryCacheBaseline.cacheState === 'absent', outcome)
-        if (state.activeTaskAttempt && await ignoredPathDigest(state.worktree) !== state.activeTaskAttempt.ignoredPathsDigest) {
-          throw new Error('no-commit retry changed ignored paths outside authenticated task state')
-        }
+        if (state.activeTaskAttempt) durableIgnoredDigest = await reconcileIgnoredAttempt(state.activeTaskAttempt)
         retryUsed = true
         if (signal.aborted) throw abortReason(signal)
         if (digest(readFileSync(checklistPath, 'utf8')) !== controllerHash) throw new Error('worker altered the controlling checklist')
@@ -1354,13 +1401,15 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       if (materialCandidate) {
         const active = state.activeTaskAttempt
         if (!active || active.baseHead !== previousHead || active.taskKey !== selectedTaskKey
-          || active.checklistDigest !== controllerHash) throw new Error('material worker commit lacks its authenticated active attempt')
+          || active.checklistDigest !== controllerHash || !durableIgnoredDigest) {
+          throw new Error('material worker commit lacks its authenticated active attempt')
+        }
         await assertTaskCommit(state.worktree, previousHead, state.branch)
         await assertTaskCommitScope(state.worktree, previousHead, checklistRelative, allowedPaths, signal)
         const pending: PendingTaskValidation = {
           schemaVersion: 1, taskKey: active.taskKey, taskIndex: active.taskIndex,
           baseHead: active.baseHead, commitHead: await head(state.worktree), checklistDigest: active.checklistDigest,
-          ignoredPathsDigest: active.ignoredPathsDigest,
+          ignoredPathsDigest: durableIgnoredDigest,
           failureSignature: workerFailureSignature(outcome), createdAttempt: active.attempt,
           verifierAttempts: 0, phase: 'pending',
         }

@@ -90,6 +90,15 @@ function validFailureStreak(value: unknown): boolean {
     && typeof streak.count === 'number' && Number.isSafeInteger(streak.count) && streak.count > 0
 }
 
+function validIgnoredArtifactTransaction(value: ActiveTaskAttempt['ignoredArtifactTransaction'] | unknown): boolean {
+  if (value === undefined) return true
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const transaction = value as NonNullable<ActiveTaskAttempt['ignoredArtifactTransaction']>
+  return transaction.schemaVersion === 1 && typeof transaction.transactionId === 'string'
+    && /^[0-9a-f-]{36}$/u.test(transaction.transactionId)
+    && typeof transaction.baselineDigest === 'string' && /^[0-9a-f]{64}$/u.test(transaction.baselineDigest)
+}
+
 function validActiveTaskAttempt(value: unknown): value is ActiveTaskAttempt | undefined {
   if (value === undefined) return true
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -100,6 +109,9 @@ function validActiveTaskAttempt(value: unknown): value is ActiveTaskAttempt | un
     && typeof attempt.checklistDigest === 'string' && /^[0-9a-f]{64}$/u.test(attempt.checklistDigest)
     && typeof attempt.ignoredPathsDigest === 'string' && /^[0-9a-f]{64}$/u.test(attempt.ignoredPathsDigest)
     && Number.isSafeInteger(attempt.attempt) && attempt.attempt! > 0
+    && validIgnoredArtifactTransaction(attempt.ignoredArtifactTransaction)
+    && (attempt.ignoredArtifactTransaction === undefined
+      || attempt.ignoredArtifactTransaction.baselineDigest === attempt.ignoredPathsDigest)
 }
 
 function validPendingTaskValidation(value: unknown): value is PendingTaskValidation | undefined {

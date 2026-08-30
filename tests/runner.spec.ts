@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import * as gitModule from '../src/git.js'
+import { parseChecklist, selectTask } from '../src/checklist.js'
 import { runLeppyLoop } from '../src/runner.js'
 import { persistRunStateProof } from '../src/run-state-proof.js'
 import { acquireLifecycleAuthorityMutex, appendLifecycleAuthorityReceipt, lifecycleStateDir } from '../src/lifecycle-authority.js'
@@ -277,13 +278,17 @@ describe('controller state machine', () => {
     expect(readFileSync(join(stateDir, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
   }, 90_000)
 
-  it('denies pending adoption when an ordinary task creates an ignored out-of-scope artifact', async () => {
+  it('quarantines a baseline-absent ignored side effect before verifying and adopting the candidate', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
     writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
     git(repo.root, 'add', '--', '.gitignore')
     git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
     let candidateHead = ''
     const worker: WorkerAdapter = { async run(request) {
+      if (request.mode === 'verification') {
+        expect(existsSync(join(request.worktree, 'ignored-worker-output', 'report.json'))).toBe(false)
+        return completedOutcome('focused validation passed without quarantined output')
+      }
       mkdirSync(join(request.worktree, 'ignored-worker-output'), { recursive: true })
       writeFileSync(join(request.worktree, 'ignored-worker-output', 'report.json'), '{"forged":true}\n')
       writeFileSync(join(request.worktree, 'src', 'value.txt'), 'candidate plus ignored artifact\n')
@@ -293,21 +298,65 @@ describe('controller state machine', () => {
       return blockedNotRunOutcome('focused validator unavailable')
     } }
 
-    await expect(runLeppyLoop(
+    const result = await runLeppyLoop(
       { tasks: repo.tasks, syncBranch: 'main', fetch: false },
       { ...modelDeps, runId: () => 'ignoredpath01', worker },
-    )).rejects.toThrow('worker changed ignored paths outside authenticated task state')
-
+    )
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
     const stateDir = join(repo.root, '.git', 'leppy-loop', 'runs', 'ignoredpath01')
     const state = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
-    expect(state).toMatchObject({
-      status: 'failed', completedTasks: 0,
-      activeTaskAttempt: { ignoredPathsDigest: expect.stringMatching(/^[0-9a-f]{64}$/u) },
-    })
+    expect(state).not.toHaveProperty('activeTaskAttempt')
     expect(state).not.toHaveProperty('pendingTaskValidation')
-    expect(git(state.worktree, 'rev-parse', 'HEAD')).toBe(candidateHead)
-    expect(readFileSync(join(state.worktree, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
-    expect(readFileSync(join(state.worktree, 'ignored-worker-output', 'report.json'), 'utf8')).toBe('{"forged":true}\n')
+    expect(git(state.worktree, 'rev-parse', 'HEAD')).not.toBe(candidateHead)
+    expect(existsSync(join(state.worktree, 'ignored-worker-output', 'report.json'))).toBe(false)
+    const receipt = JSON.parse(readFileSync(join(stateDir, 'worker-ignored-path-recovery', '0-1.json'), 'utf8'))
+    expect(receipt).toMatchObject({ phase: 'quarantined', baselineDigest: expect.stringMatching(/^[0-9a-f]{64}$/u) })
+    expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'report.json'), 'utf8')).toBe('{"forged":true}\n')
+  }, 90_000)
+
+  it('recovers a legacy active attempt when its authenticated digest proves an empty ignored baseline', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
+    const first = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, runId: () => 'legacyignored01', worker: new FakeWorker([blockedNotRunOutcome('seed legacy active state')]) },
+    )
+    const statePath = join(first.stateDir!, 'run.json')
+    const state = JSON.parse(readFileSync(statePath, 'utf8'))
+    const checklistSource = readFileSync(join(first.worktree!, 'tasks.task.md'), 'utf8')
+    const task = selectTask(parseChecklist(checklistSource, join(first.worktree!, 'tasks.task.md')))!
+    state.activeTaskAttempt = {
+      schemaVersion: 1,
+      taskKey: createHash('sha256').update(JSON.stringify({ index: task.index, phase: task.phase, kind: task.kind, raw: task.raw })).digest('hex'),
+      taskIndex: task.index,
+      baseHead: git(first.worktree!, 'rev-parse', 'HEAD'),
+      checklistDigest: createHash('sha256').update(checklistSource).digest('hex'),
+      ignoredPathsDigest: createHash('sha256').update(JSON.stringify([])).digest('hex'),
+      attempt: state.attempt,
+    }
+    delete state.stateProof
+    writeFileSync(statePath, `${JSON.stringify(state)}\n`)
+    persistRunStateProof(first.stateDir!, state, Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64'))
+    rmSync(join(first.stateDir!, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    mkdirSync(join(first.worktree!, 'ignored-worker-output'), { recursive: true })
+    writeFileSync(join(first.worktree!, 'ignored-worker-output', 'attempt-12.log'), 'legacy worker output\n')
+
+    const worker: WorkerAdapter = { async run(request) {
+      expect(existsSync(join(request.worktree, 'ignored-worker-output', 'attempt-12.log'))).toBe(false)
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'completed after legacy ignored recovery\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'fix: complete after ignored recovery')
+      return completedOutcome('implementation committed after safe quarantine')
+    } }
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker })
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    const receipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`), 'utf8'))
+    expect(receipt).toMatchObject({ phase: 'quarantined' })
+    expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'attempt-12.log'), 'utf8')).toBe('legacy worker output\n')
   }, 90_000)
 
   it('automatically quarantines task-generated ignored npm cache while preserving bytes in private state', async () => {
@@ -849,6 +898,34 @@ describe('controller state machine', () => {
     expect(git(result.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('1')
   }, 90_000)
 
+  it('records a fresh ignored baseline before a no-commit retry', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
+    let calls = 0
+    const worker: WorkerAdapter = { async run(request) {
+      calls += 1
+      if (calls === 1) {
+        mkdirSync(join(request.worktree, 'ignored-worker-output'), { recursive: true })
+        writeFileSync(join(request.worktree, 'ignored-worker-output', 'first.log'), 'first attempt\n')
+        return completedOutcome('done without a commit')
+      }
+      expect(existsSync(join(request.worktree, 'ignored-worker-output', 'first.log'))).toBe(false)
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'done after retry\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'fix: finish after no-commit retry')
+      return completedOutcome('done with commit')
+    } }
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...adaptiveDeps, worker })
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(calls).toBe(2)
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-1.json'))).toBe(true)
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-2.json'))).toBe(true)
+    const receipt = JSON.parse(readFileSync(join(result.stateDir!, 'worker-ignored-path-recovery', '0-1.json'), 'utf8'))
+    expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'first.log'), 'utf8')).toBe('first attempt\n')
+  }, 90_000)
+
   it('closes an independently verified already-satisfied task without manufacturing a worker commit', async () => {
     const repo = repository('- [ ] Verify `src/value.txt` | Done: value already says before\n')
     const worker = new FakeWorker([
@@ -1223,6 +1300,37 @@ describe('controller state machine', () => {
     const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, fallbackModel: 'fallback' }, { ...modelDeps, worker })
     expect(result.status).toBe('completed')
     expect(worker.calls.map(call => call.model)).toEqual(['fake-model', 'fallback'])
+  }, 90_000)
+
+  it('records a fresh ignored baseline before an availability retry', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
+    let calls = 0
+    const worker: WorkerAdapter = { async run(request) {
+      calls += 1
+      if (calls === 1) {
+        mkdirSync(join(request.worktree, 'ignored-worker-output'), { recursive: true })
+        writeFileSync(join(request.worktree, 'ignored-worker-output', 'unavailable.log'), 'first model unavailable\n')
+        return { status: 'unavailable', output: '', error: '429' }
+      }
+      expect(existsSync(join(request.worktree, 'ignored-worker-output', 'unavailable.log'))).toBe(false)
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'done after availability retry\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'fix: finish after availability retry')
+      return completedOutcome('done with fallback commit')
+    } }
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false, fallbackModel: 'fallback' },
+      { ...modelDeps, worker },
+    )
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(calls).toBe(2)
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-1.json'))).toBe(true)
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-2.json'))).toBe(true)
+    const receipt = JSON.parse(readFileSync(join(result.stateDir!, 'worker-ignored-path-recovery', '0-1.json'), 'utf8'))
+    expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'unavailable.log'), 'utf8')).toBe('first model unavailable\n')
   }, 90_000)
 
   it('dry-run selects one literal line without starting a worker or creating a worktree', async () => {

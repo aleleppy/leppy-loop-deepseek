@@ -197,6 +197,20 @@ describe('authenticated controller lifecycle authority integrity', () => {
     })
     await expect(inspectAuthenticatedControllers(malformed.root)).resolves.toHaveLength(0)
 
+    const malformedTransaction = repository(false)
+    const transactionFacts = taskFacts(malformedTransaction.root)
+    authenticateState(malformedTransaction, state => {
+      state.activeTaskAttempt = {
+        schemaVersion: 1, taskKey: transactionFacts.taskKey, taskIndex: 0,
+        baseHead: git(malformedTransaction.root, 'rev-parse', 'HEAD'), checklistDigest: transactionFacts.checklistDigest,
+        ignoredPathsDigest: createHash('sha256').update('[]').digest('hex'), attempt: 1,
+        ignoredArtifactTransaction: {
+          schemaVersion: 1, transactionId: '12345678-1234-4234-8234-123456789abc', baselineDigest: 'f'.repeat(64),
+        },
+      }
+    })
+    await expect(inspectAuthenticatedControllers(malformedTransaction.root)).resolves.toHaveLength(0)
+
     const malformedPending = repository(false)
     authenticateState(malformedPending, state => {
       state.pendingTaskValidation = { ...pendingValidation(malformedPending), phase: 'validated' }

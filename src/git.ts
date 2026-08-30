@@ -151,7 +151,12 @@ export async function verificationStatus(cwd: string, signal?: AbortSignal): Pro
   ], { cwd, signal })).stdout
 }
 
-export async function ignoredPathDigest(cwd: string, signal?: AbortSignal): Promise<string> {
+export interface IgnoredPathSnapshot {
+  entries: readonly string[]
+  digest: string
+}
+
+export async function ignoredPathSnapshot(cwd: string, signal?: AbortSignal): Promise<IgnoredPathSnapshot> {
   const output = (await runFile('git', [
     'ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', '.',
     ':(exclude,glob)**/node_modules/**', ':(exclude,glob).npm-cache/**', ':(exclude,glob)**/.npm-cache/**',
@@ -168,7 +173,11 @@ export async function ignoredPathDigest(cwd: string, signal?: AbortSignal): Prom
     if (totalBytes > 512 * 1024 * 1024) throw new Error('ignored artifact baseline exceeds 512 MiB')
     return `${path}\0file\0${stat.size}\0${createHash('sha256').update(readFileSync(absolute)).digest('hex')}`
   })
-  return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
+  return { entries, digest: createHash('sha256').update(JSON.stringify(entries)).digest('hex') }
+}
+
+export async function ignoredPathDigest(cwd: string, signal?: AbortSignal): Promise<string> {
+  return (await ignoredPathSnapshot(cwd, signal)).digest
 }
 
 export async function commitCount(cwd: string, fromExclusive: string): Promise<number> {

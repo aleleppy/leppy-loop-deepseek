@@ -2,6 +2,14 @@
 
 All notable changes are documented here.
 
+## [0.3.24] - 2026-08-30
+
+### Fixed
+
+- Every ordinary worker dispatch now records an immutable HMAC-authenticated ignored-path baseline bound to run, task and attempt before persisting active-attempt authority. Post-worker reconciliation classifies the complete delta before mutation: unchanged pre-existing ignored WIP is preserved, changed/replaced/deleted WIP fails closed with zero moves, a baseline path promoted into the authorized tracked commit is accepted, and only baseline-absent regular-file leaves may enter private quarantine. Legacy active attempts can synthesize a baseline only when their authenticated digest is the canonical empty-set digest.
+- Ignored-artifact quarantine uses a signed deterministic transaction receipt whose reference is embedded in authenticated active state before the first rename. Recovery revalidates the physical private root, parent identity, source fingerprint, link count, same-device constraint, and all source/destination states before any move; symlink/junction escape, hardlinks, special files, cross-device state, tracked promotion after preparation, source reappearance, missing/tampered receipts and ambiguous partial states all fail closed. Prepared and partially moved crashes resume the exact transaction and preserve artifact bytes.
+- Availability and clean no-commit retries now record a fresh baseline for the new attempt and clear the preceding transaction reference. Regression coverage includes the production legacy-empty active recovery, candidate adoption after safe quarantine, pre-existing ignored WIP, retry baselines, tracked promotion, prepared/per-entry crashes, receipt deletion/tamper, multi-entry all-or-nothing replay, source reappearance, junction escape and hardlink rejection.
+
 ## [0.3.23] - 2026-08-30
 
 ### Fixed

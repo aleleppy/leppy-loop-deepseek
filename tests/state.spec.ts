@@ -46,6 +46,9 @@ const activeTaskAttempt: ActiveTaskAttempt = {
   checklistDigest: 'b'.repeat(64),
   ignoredPathsDigest: 'd'.repeat(64),
   attempt: 8,
+  ignoredArtifactTransaction: {
+    schemaVersion: 1, transactionId: '12345678-1234-4234-8234-123456789abc', baselineDigest: 'd'.repeat(64),
+  },
 }
 
 const pendingTaskValidation: PendingTaskValidation = {
