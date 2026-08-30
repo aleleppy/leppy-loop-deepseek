@@ -9,6 +9,19 @@ const KNOWN_REMOTE_CLIENTS = new Set(['curl', 'wget', 'ssh', 'scp', 'rsync', 'ft
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'fish', 'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'])
 const POWERSHELLS = new Set(['powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'])
 const READ_ONLY_GIT = new Set(['status', 'rev-parse', 'ls-files', 'merge-base', 'name-rev', 'describe'])
+const PACKAGE_MANAGERS = new Set(['npm', 'pnpm', 'yarn', 'bun'])
+const PACKAGE_FRONTENDS = new Set(['corepack', 'pnpx', 'yarnpkg'])
+const PACKAGE_SCRIPT_COMMANDS: Readonly<Record<string, ReadonlySet<string>>> = {
+  npm: new Set(['run', 'run-script', 'test', 't', 'tst']),
+  pnpm: new Set(['run', 'run-script', 'test', 't']),
+  yarn: new Set(['run', 'test']),
+  bun: new Set(['run', 'test']),
+}
+const PACKAGE_CACHE_FLAGS = /^(?:--cache|--cache-dir|--cache-folder|--store-dir|--state-dir)(?:=|$)/u
+const PACKAGE_OPTIONS_WITH_VALUES = new Set([
+  '--prefix', '--workspace', '-w', '--userconfig', '--globalconfig', '--registry', '--cache', '--loglevel',
+  '--dir', '-c', '--cwd', '--filter', '--config', '--use-yarnrc',
+])
 
 export function redact<T>(value: T, knownSecrets: readonly string[] = []): T {
   const visit = (current: unknown, key?: string): unknown => {
@@ -37,7 +50,18 @@ export function fingerprint(command: string): string {
 }
 
 function basename(command: string): string {
-  return command.replaceAll('\\', '/').split('/').at(-1)!.toLowerCase()
+  return command.replaceAll('\\', '/').split('/').at(-1)!.toLowerCase().replace(/\.(?:cmd|bat|exe|com)$/u, '')
+}
+
+function packageCommandWords(args: readonly string[]): string[] {
+  const words: string[] = []
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!
+    if (argument === '--') break
+    if (PACKAGE_OPTIONS_WITH_VALUES.has(argument)) { index += 1; continue }
+    if (!argument.startsWith('-')) words.push(argument)
+  }
+  return words
 }
 
 export function validateArgv(command: string, args: readonly string[], cwd: string, repoRoot: string, gateFingerprint?: string): void {
@@ -71,9 +95,15 @@ export function validateArgv(command: string, args: readonly string[], cwd: stri
     if (lowerArgs.some(arg => arg === '--output' || arg.startsWith('--output='))) throw new Error(`git ${verb} output redirection denied`)
     if (lowerArgs.some(arg => ['--no-index', '--ext-diff'].includes(arg))) throw new Error(`git ${verb} external path or executable hooks denied`)
   }
-  if (['npm', 'pnpm', 'yarn', 'bun'].includes(executable)) {
-    const verb = lowerArgs.find(arg => !arg.startsWith('-'))
-    if (verb && ['publish', 'login', 'adduser', 'whoami', 'deploy'].includes(verb)) throw new Error(`${executable} ${verb} denied`)
+  if (executable === 'npx' || executable === 'bunx' || PACKAGE_FRONTENDS.has(executable)) {
+    throw new Error(`${executable} package frontend denied; invoke an already-materialized local binary directly`)
+  }
+  if (PACKAGE_MANAGERS.has(executable)) {
+    const command = packageCommandWords(lowerArgs)[0]
+    if (lowerArgs.some(arg => PACKAGE_CACHE_FLAGS.test(arg))) throw new Error(`${executable} project-local cache overrides denied`)
+    if (!command || !PACKAGE_SCRIPT_COMMANDS[executable]?.has(command)) {
+      throw new Error(`${executable} command denied; workers may use only explicit run/test package scripts`)
+    }
   }
   if (['node', 'deno', 'bun'].includes(executable) && lowerArgs.some(arg => ['-e', '--eval', '-p', '--print'].includes(arg))) throw new Error('dynamic program evaluation denied')
   const joined = [command, ...args].join('\0')

@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { delimiter, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
@@ -78,6 +78,27 @@ export function resolveAllowed(policy: WorkerPolicy, candidate: string, writing:
 export function resolveExecCwd(policy: WorkerPolicy, candidate?: string): string {
   if (candidate === undefined || candidate === '.' || candidate === './' || candidate === '.\\') return policy.root
   return resolveAllowed(policy, candidate, false)
+}
+
+function workerExecEnvironment(policy: WorkerPolicy): Record<string, string> {
+  const environment = Object.fromEntries(
+    Object.entries(safePathEnvironment(process.env)).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  )
+  const pathName = Object.hasOwn(environment, 'Path') ? 'Path' : 'PATH'
+  const localBin = resolve(policy.root, 'node_modules', '.bin')
+  const existing = environment[pathName]?.split(delimiter).filter(Boolean) ?? []
+  const key = (value: string): string => process.platform === 'win32' ? value.toLowerCase() : value
+  environment[pathName] = [localBin, ...existing.filter(value => key(value) !== key(localBin))].join(delimiter)
+  return environment
+}
+
+function explicitRepoExecutable(policy: WorkerPolicy, cwd: string, command: string): string {
+  if (isAbsolute(command) || !/[\\/]/u.test(command)) return command
+  const candidate = resolve(cwd, command)
+  if (!existsSync(candidate)) return candidate
+  const canonical = realpathSync(candidate)
+  if (!inside(policy.root, canonical)) throw new Error('explicit executable escapes the worktree through traversal or link')
+  return candidate
 }
 
 function textOutput(value: unknown): [{ type: 'text'; text: string }] {
@@ -242,7 +263,7 @@ export function apply(ctx: Context): void {
   }))
   if (policy.mode !== 'publication-conflict') ctx.tools.register(defineTool({
     name: 'leppy_exec',
-    description: 'Run an exact local argv without a shell. Keep command and args separate and never add shell quote characters; Windows node_modules/.bin commands select their .cmd shim automatically. Remote, publication, integration and dynamic-eval commands are denied.',
+    description: 'Run an exact local argv without a shell. Bare commands resolve local-first from the authenticated root node_modules/.bin; Windows shims select .cmd automatically. Keep command and args separate. Package managers permit only explicit run/test scripts; npx/dlx/corepack and alternate package frontends, install, cache overrides, remote, publication and dynamic-eval commands are denied.',
     parameters: {
       command: { type: 'string', required: true },
       args: { type: 'array', items: { type: 'string' }, required: true },
@@ -254,15 +275,19 @@ export function apply(ctx: Context): void {
     },
     async execute(args, exec) {
       const cwd = resolveExecCwd(policy, args.cwd)
-      const command = normalizeExecCommand(args.command, cwd)
-      validateArgv(command, args.args, cwd, policy.root, policy.gateFingerprint)
+      const normalized = normalizeExecCommand(args.command, cwd)
+      validateArgv(normalized, args.args, cwd, policy.root, policy.gateFingerprint)
+      const environment = workerExecEnvironment(policy)
+      const command = await ctx.subprocess.resolveExecutable(explicitRepoExecutable(policy, cwd, normalized), environment, exec.signal)
+      validateArgv(command, args.args, cwd, policy.root)
       const execution = ctx.sandboxPolicy.resolve(exec.agent?.session ? { session: exec.agent.session } : {})
       if (execution.mode !== 'workspace-write') throw new Error(`worker requires workspace-write, got ${execution.mode}`)
+      if (realpathSync(execution.workspaceRoot) !== policy.root) throw new Error('worker sandbox root does not match the authenticated worktree')
       const confined = ctx.sandbox.confine([command, ...args.args], execution as SandboxPolicy)
       const handle = ctx.subprocess.spawn({
         argv: confined.argv,
         cwd,
-        env: safePathEnvironment(process.env),
+        env: environment,
         stdio: { stdin: 'ignore', stdout: { maxBytes: 256 * 1024 }, stderr: { maxBytes: 256 * 1024 } },
         graceMs: 2_000,
         signal: exec.signal,

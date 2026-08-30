@@ -108,6 +108,8 @@ export interface LeppyLoopOptions {
   dependencyRecoveryDigest?: string
   /** Require lock-protected publication of a new isolated tree before starting this transition. */
   dependencyHydrationRequired?: boolean
+  /** Bind legacy worker-cache quarantine to the exact authenticated npx/commit failure. */
+  workerArtifactRecoveryDigest?: string
   /** Bind one recovery to the exact authenticated Windows structured-argv failure. */
   windowsArgvRecoveryDigest?: string
 }

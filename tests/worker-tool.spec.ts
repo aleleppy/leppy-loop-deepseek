@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
 import { apply as applyWorkerTools, commitTaskChanges, resolveAllowed, resolveExecCwd, validatedExecOutput, type WorkerPolicy } from '../src/worker-tool.js'
@@ -39,8 +39,15 @@ interface RegisteredWorkerTool {
 function registeredRuntime(
   root: string,
   mode: 'task' | 'publication-conflict',
-  output: { stdoutLossy?: boolean; stderrLossy?: boolean } = {},
-): { tools: string[]; definitions: RegisteredWorkerTool[]; commands: string[][]; promptVariables: Array<{ name: string; value: string }> } {
+  output: { stdoutLossy?: boolean; stderrLossy?: boolean; workspaceRoot?: string; resolvedCommand?: string } = {},
+): {
+  tools: string[]
+  definitions: RegisteredWorkerTool[]
+  commands: string[][]
+  resolutions: Array<{ command: string; environment: NodeJS.ProcessEnv }>
+  spawnEnvironments: NodeJS.ProcessEnv[]
+  promptVariables: Array<{ name: string; value: string }>
+} {
   const variables = ['LEPPY_WORKTREE', 'LEPPY_CHECKLIST', 'LEPPY_ALLOWED_PATHS', 'LEPPY_WORKER_MODE', 'LEPPY_SYSTEM_PROMPT'] as const
   const previous = Object.fromEntries(variables.map(name => [name, process.env[name]]))
   process.env.LEPPY_WORKTREE = root
@@ -51,6 +58,8 @@ function registeredRuntime(
   const tools: string[] = []
   const definitions: RegisteredWorkerTool[] = []
   const commands: string[][] = []
+  const resolutions: Array<{ command: string; environment: NodeJS.ProcessEnv }> = []
+  const spawnEnvironments: NodeJS.ProcessEnv[] = []
   const promptVariables: Array<{ name: string; value: string }> = []
   try {
     const stdout = { readFrom: () => ({ text: '', nextOffset: 0, lossy: output.stdoutLossy ?? false }) }
@@ -59,10 +68,19 @@ function registeredRuntime(
       systemPrompt: { variable: (name: string, provider: () => string) => { promptVariables.push({ name, value: provider() }); return () => {} } },
       tools: { register: (definition: RegisteredWorkerTool) => { tools.push(definition.name); definitions.push(definition); return () => {} } },
       subprocess: {
-        resolveExecutable: async () => 'git',
-        spawn: ({ argv }: { argv: string[] }) => { commands.push(argv); return { done: Promise.resolve({ exitCode: 1 }), collected: { stdout, stderr } } },
+        resolveExecutable: async (command: string, environment: NodeJS.ProcessEnv) => {
+          resolutions.push({ command, environment })
+          if (output.resolvedCommand) return output.resolvedCommand
+          if (command === 'tsc') return join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
+          return command
+        },
+        spawn: ({ argv, env }: { argv: string[]; env: NodeJS.ProcessEnv }) => {
+          commands.push(argv)
+          spawnEnvironments.push(env)
+          return { done: Promise.resolve({ exitCode: 1 }), collected: { stdout, stderr } }
+        },
       },
-      sandboxPolicy: { resolve: () => ({ mode: 'workspace-write' }) },
+      sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: output.workspaceRoot ?? root }) },
       sandbox: { confine: (argv: string[]) => ({ argv }) },
     } as unknown as Context)
   } finally {
@@ -72,7 +90,7 @@ function registeredRuntime(
       else process.env[name] = value
     }
   }
-  return { tools, definitions, commands, promptVariables }
+  return { tools, definitions, commands, resolutions, spawnEnvironments, promptVariables }
 }
 
 describe('worker commit capability', () => {
@@ -119,14 +137,90 @@ describe('worker commit capability', () => {
     expect(task.tools).toEqual(['leppy_read', 'leppy_search', 'leppy_edit', 'leppy_commit', 'leppy_write', 'leppy_exec'])
   })
 
-  it('normalizes quoted local executables and selects the Windows npm cmd shim before confinement', async () => {
+  it('normalizes explicit local executables before resolving and confinement', async () => {
     const root = repository()
     mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true })
     writeFileSync(join(root, 'node_modules', '.bin', 'tsc.cmd'), '@echo off\r\n')
+    if (process.platform !== 'win32') writeFileSync(join(root, 'node_modules', '.bin', 'tsc'), '#!/bin/sh\n')
     const runtime = registeredRuntime(root, 'task')
     const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
     await expect(execute({ command: "'node_modules/.bin/tsc'", args: ['--noEmit'] }, { signal: new AbortController().signal })).rejects.toThrow('command failed')
-    expect(runtime.commands.at(-1)).toEqual([process.platform === 'win32' ? 'node_modules/.bin/tsc.cmd' : 'node_modules/.bin/tsc', '--noEmit'])
+    const expected = join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
+    expect(runtime.resolutions.at(-1)?.command).toBe(expected)
+    expect(runtime.commands.at(-1)).toEqual([expected, '--noEmit'])
+  })
+
+  it('resolves bare package binaries local-first with the exact environment used to spawn', async () => {
+    const root = repository()
+    mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'), 'fixture\n')
+    mkdirSync(join(root, 'prisma', 'schemas', 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(join(root, 'prisma', 'schemas', 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'), 'untrusted nested fixture\n')
+    const runtime = registeredRuntime(root, 'task')
+    const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    await expect(execute({ command: 'tsc', args: ['--noEmit'], cwd: 'prisma/schemas' }, { signal: new AbortController().signal })).rejects.toThrow('command failed')
+    const resolution = runtime.resolutions.at(-1)!
+    const pathName = Object.hasOwn(resolution.environment, 'Path') ? 'Path' : 'PATH'
+    expect(resolution.environment[pathName]?.split(process.platform === 'win32' ? ';' : ':')[0]).toBe(join(root, 'node_modules', '.bin'))
+    expect(runtime.spawnEnvironments.at(-1)).toBe(resolution.environment)
+    expect(runtime.commands.at(-1)?.[0]).toBe(join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'))
+  })
+
+  it('denies package fetch, install and worktree cache fallbacks before executable resolution', async () => {
+    const root = repository()
+    const runtime = registeredRuntime(root, 'task')
+    const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    for (const invocation of [
+      { command: 'npx.cmd', args: ['playwright', 'test'] },
+      { command: 'npm.cmd', args: ['exec', 'playwright', '--', 'test'] },
+      { command: 'npm', args: ['--prefix', '.', 'exec', 'playwright'] },
+      { command: 'pnpm', args: ['dlx', 'playwright', 'test'] },
+      { command: 'pnpm', args: ['--dir', '.', 'up'] },
+      { command: 'yarn', args: ['dlx', 'playwright', 'test'] },
+      { command: 'bunx.exe', args: ['vitest'] },
+      { command: 'pnpx.cmd', args: ['playwright', 'test'] },
+      { command: 'yarnpkg', args: ['add', 'x'] },
+      { command: 'corepack.exe', args: ['pnpm', 'dlx', 'playwright'] },
+      { command: 'corepack', args: ['yarn', 'add', 'x'] },
+      { command: 'npm', args: ['install'] },
+      { command: 'npm', args: ['it'] },
+      { command: 'npm', args: ['prune'] },
+      { command: 'pnpm', args: ['--cache-dir=.npm-cache', 'test'] },
+    ]) {
+      await expect(execute(invocation, { signal: new AbortController().signal })).rejects.toThrow(/denied/u)
+    }
+    expect(runtime.resolutions).toHaveLength(0)
+    expect(runtime.commands).toHaveLength(0)
+  })
+
+  it('revalidates and denies a package frontend returned by executable resolution', async () => {
+    const root = repository()
+    const runtime = registeredRuntime(root, 'task', { resolvedCommand: join(root, 'node_modules', '.bin', 'corepack.cmd') })
+    const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    await expect(execute({ command: 'local-check', args: ['pnpm', 'dlx', 'playwright'] }, {
+      signal: new AbortController().signal,
+    })).rejects.toThrow(/package frontend denied/u)
+    expect(runtime.resolutions).toHaveLength(1)
+    expect(runtime.commands).toHaveLength(0)
+  })
+
+  it('rejects a mismatched sandbox root and explicit executable traversal before spawn', async () => {
+    const root = repository()
+    mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'), 'fixture\n')
+    const outside = mkdtempSync(join(tmpdir(), 'leppy-worker-outside-'))
+    const executable = join(outside, process.platform === 'win32' ? 'probe.cmd' : 'probe')
+    writeFileSync(executable, 'fixture\n')
+    const wrongRoot = registeredRuntime(root, 'task', { workspaceRoot: outside })
+    const wrongRootExec = wrongRoot.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    await expect(wrongRootExec({ command: 'tsc', args: [] }, { signal: new AbortController().signal })).rejects.toThrow('sandbox root')
+    expect(wrongRoot.commands).toHaveLength(0)
+
+    const traversal = registeredRuntime(root, 'task')
+    const traversalExec = traversal.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    await expect(traversalExec({ command: relative(root, executable), args: [] }, { signal: new AbortController().signal })).rejects.toThrow('escapes the worktree')
+    expect(traversal.resolutions).toHaveLength(0)
+    expect(traversal.commands).toHaveLength(0)
   })
 
   it('reports a missing search path as a non-fatal discovery result', async () => {

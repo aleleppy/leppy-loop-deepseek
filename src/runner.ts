@@ -20,6 +20,9 @@ import {
   inspectWorktreeDependencies, provisionWorktreeDependencies,
 } from './worktree-dependencies.js'
 import { windowsQuotedExecutableFailure } from './windows-command.js'
+import {
+  quarantineWorkerNpmCache, recordWorkerNpmCacheBaseline, workerNpmCacheRecovery, workerNpmCacheTransactionPresent,
+} from './worker-artifacts.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import type {
   ChecklistTask, LeppyLoopOptions, LifecycleAuthority, ModelCapability, RunDependencies, RunEvent,
@@ -438,6 +441,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   if (options.recoverExistingWip && !recovered) throw new Error('authenticated run disappeared during recovery')
   if (!recovered && !initialTask) throw new Error('checklist contains no open executable rows')
   let recoveryError: string | undefined
+  let npmCacheQuarantined = false
   if (recovered) {
     state = recovered.state
     recoveryError = state.lastError
@@ -497,6 +501,39 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       clearWorkerFailure(state)
       writeState(join(stateDir, 'run.json'), state)
       appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', { windowsStructuredArgv: 'activated' }))
+    }
+    const repairingWorkerNpmCache = workerNpmCacheRecovery(recoveryError)
+    if (options.workerArtifactRecoveryDigest) {
+      const observedDigest = recoveryError ? digest(recoveryError) : undefined
+      if (observedDigest !== options.workerArtifactRecoveryDigest || !repairingWorkerNpmCache) {
+        throw new Error('the authenticated worker npm cache recovery error changed before lock-protected quarantine')
+      }
+    }
+    if (repairingWorkerNpmCache && !options.workerArtifactRecoveryDigest) {
+      throw new Error('worker npm cache recovery requires the exact authenticated error digest')
+    }
+    const workerNpmCacheReceipt = workerNpmCacheTransactionPresent(stateDir)
+    if (repairingWorkerNpmCache || workerNpmCacheReceipt) {
+      if (!recovered || !state.lifecycleAuthority || !options.recoverRunId || options.recoverRunId !== state.runId) {
+        throw new Error('worker npm cache recovery requires the exact authenticated existing run')
+      }
+      if (!workerNpmCacheReceipt && (!Number.isSafeInteger(state.currentTask) || (state.currentTask ?? -1) < 0)) {
+        throw new Error('new worker npm cache recovery requires an authenticated current task')
+      }
+      const quarantined = await quarantineWorkerNpmCache({
+        worktree: state.worktree,
+        stateDir,
+        runId: state.runId,
+        ...(!workerNpmCacheReceipt ? { taskIndex: state.currentTask!, attempt: state.attempt } : {}),
+        ...(recoveryError ? { recoveryErrorDigest: digest(recoveryError) } : {}),
+        allowLegacyDigest: options.workerArtifactRecoveryDigest !== undefined,
+        key: createLeaseKey(stateDir),
+      })
+      npmCacheQuarantined = true
+      appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', {
+        workerArtifact: '.npm-cache', transactionId: quarantined.transactionId,
+        resumed: quarantined.resumed, basis: quarantined.basis,
+      }))
     }
     const initialDependencyState = inspectWorktreeDependencies(state.repoRoot, state.worktree)
     if (options.dependencyHydrationRequired && initialDependencyState.status !== 'copyable' && initialDependencyState.status !== 'installable') {
@@ -914,7 +951,10 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         ...legacyCustomInstructions(state.worktree),
         ...await discoverInstructions(state.worktree, allowedPaths),
         ...(dependencyBridge.status === 'local' ? [
-          `The controller copied and verified an isolated node_modules against ${dependencyBridge.lockfile}. Use repository package scripts or local tools; do not install packages. leppy_exec is structured argv: pass the executable in command and flags in args without any shell quote characters; on Windows node_modules/.bin automatically selects its .cmd shim. If a local tool is still unavailable, report blocked after the first failure instead of retrying variants.`,
+          `The controller copied and verified an isolated node_modules against ${dependencyBridge.lockfile}. Use repository package scripts or bare local tools; do not install packages. leppy_exec resolves bare executable names local-first from the authenticated root node_modules/.bin and selects Windows shims. Package managers permit only explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, package-manager cache overrides, or create an in-worktree cache. If a local tool is still unavailable, report blocked after the first failure instead of retrying variants.`,
+        ] : []),
+        ...(npmCacheQuarantined ? [
+          'The controller moved the prior wholly-untracked .npm-cache into its private authenticated quarantine. Do not recreate it; invoke bare local tools through leppy_exec.',
         ] : []),
         ...(task.index === gateRepairContext?.closureIndex ? [
           gateRepairContext.instruction,
@@ -932,6 +972,10 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         ...(effectiveGateFingerprint ? { gateFingerprint: effectiveGateFingerprint } : {}),
         instructions,
       }
+      recordWorkerNpmCacheBaseline({
+        worktree: state.worktree, stateDir, runId: state.runId,
+        taskIndex: task.index, attempt: state.attempt, key: createLeaseKey(stateDir),
+      })
       appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: model.model, effort: model.effort ?? null, paths: allowedPaths }, task, state.attempt))
       if (signal.aborted) throw abortReason(signal)
       let outcome = await dependencies.worker.run(request, signal)
@@ -955,6 +999,10 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             ...(retryModel.effort ? { effort: retryModel.effort } : {}),
           }
           if (!retryModel.effort) delete retryRequest.effort
+          recordWorkerNpmCacheBaseline({
+            worktree: state.worktree, stateDir, runId: state.runId,
+            taskIndex: task.index, attempt: outcomeAttempt, key: createLeaseKey(stateDir),
+          })
           appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'availability' }, task, outcomeAttempt))
           outcome = await dependencies.worker.run(retryRequest, signal)
           retryUsed = true
@@ -984,6 +1032,10 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           ...(retryModel.effort ? { effort: retryModel.effort } : {}),
         }
         if (!retryModel.effort) delete retryRequest.effort
+        recordWorkerNpmCacheBaseline({
+          worktree: state.worktree, stateDir, runId: state.runId,
+          taskIndex: task.index, attempt: outcomeAttempt, key: createLeaseKey(stateDir),
+        })
         appendEvent(eventsPath, event(state.runId, 'start', 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'no-commit' }, task, outcomeAttempt))
         verifyingNoCommit = true
         outcome = await dependencies.worker.run(retryRequest, signal)

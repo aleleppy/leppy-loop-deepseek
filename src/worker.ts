@@ -261,7 +261,7 @@ function workerPrompt(request: WorkerRequest): string {
     `Runtime platform: ${process.platform}.`,
     publicationConflict
       ? 'Use only the provided leppy_read, leppy_write, and leppy_delete tools. Every allowed path is exact; no directory descendants are authorized.'
-      : 'Use only the provided leppy_read, leppy_write, leppy_edit, leppy_search, leppy_exec, and leppy_commit tools. Use leppy_search instead of rg/grep/find, leppy_edit instead of patches, and never invoke a shell command string.',
+      : 'Use only the provided leppy_read, leppy_write, leppy_edit, leppy_search, leppy_exec, and leppy_commit tools. Use leppy_search instead of rg/grep/find, leppy_edit instead of patches, and never invoke a shell command string. leppy_exec resolves bare local binaries from the authenticated root node_modules/.bin; invoke playwright, vitest, tsc, or similar directly. Package-manager commands are limited to explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, dependency installation, cache overrides, or an in-worktree package-manager cache.',
     'Never read or edit the controlling checklist. Never push, publish, deploy, mutate PRs, fetch, merge, rebase, or manage worktrees. Never use git apply, restore, reset, clean, add, commit, or checkout through leppy_exec.',
     publicationConflict
       ? 'Resolve the exact files and finish without staging or committing. The authenticated controller exclusively owns the Git index and rebase continuation.'

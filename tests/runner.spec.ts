@@ -8,7 +8,7 @@ import { runLeppyLoop } from '../src/runner.js'
 import { persistRunStateProof } from '../src/run-state-proof.js'
 import { DEPENDENCY_REPLACEMENT_PENDING_CODE, dependencyResolutionMiss } from '../src/worktree-dependencies.js'
 import { PublicationConflictError } from '../src/publish.js'
-import type { PublicationHooks, PullRequestRequest, RunProgress, WorkerAdapter, WorkerOutcome, WorkerRequest } from '../src/types.js'
+import type { LifecycleAuthority, PublicationHooks, PullRequestRequest, RunProgress, WorkerAdapter, WorkerOutcome, WorkerRequest } from '../src/types.js'
 
 function completedOutcome(output = 'done'): WorkerOutcome {
   return {
@@ -1032,6 +1032,128 @@ describe('controller state machine', () => {
     expect(existsSync(join(first.worktree!, 'node_modules', 'invalid-tree.txt'))).toBe(false)
     expect(existsSync(join(first.worktree!, 'node_modules', 'typescript', 'package.json'))).toBe(true)
     expect(existsSync(join(first.stateDir!, 'dependency-staging-replacement.json'))).toBe(false)
+  }, 90_000)
+
+  it('quarantines an authenticated untracked npm cache stall before resuming preserved task WIP', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    const issuedAt = Date.now() - 1_000
+    const expiresAt = Date.now() + 60_000
+    const authority = (transitions: number): LifecycleAuthority => ({
+      sessionId: 'npm-cache-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+      maxTransitions: 16, transitions, issuedAt, expiresAt,
+    })
+    let workerCalls = 0
+    const worker: WorkerAdapter = {
+      async run(request) {
+        workerCalls += 1
+        if (workerCalls === 1) {
+          writeFileSync(join(request.worktree, 'src', 'value.txt'), 'done\n')
+          mkdirSync(join(request.worktree, '.npm-cache', '_logs'), { recursive: true })
+          writeFileSync(join(request.worktree, '.npm-cache', '_logs', 'attempt.log'), 'preserved cache bytes\n')
+          return {
+            status: 'failed', output: '',
+            error: 'npx is unavailable and leppy_commit rejected .npm-cache/_logs/attempt.log outside this task write scope',
+          }
+        }
+        expect(existsSync(join(request.worktree, '.npm-cache'))).toBe(false)
+        expect(request.instructions.join('\n')).toContain('private authenticated quarantine')
+        git(request.worktree, 'add', '--', 'src/value.txt')
+        git(request.worktree, 'commit', '-m', 'test: preserve recovered task wip')
+        return completedOutcome('validated preserved task WIP with the bare local executable')
+      },
+    }
+    const first = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, lifecycleAuthority: authority(1),
+    }, { ...modelDeps, worker })
+    expect(first.status).toBe('stalled')
+    expect(existsSync(join(first.worktree!, '.npm-cache'))).toBe(true)
+    const firstState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      workerArtifactRecoveryDigest: createHash('sha256').update(firstState.lastError).digest('hex'),
+      lifecycleAuthority: authority(2),
+    }, { ...modelDeps, worker })
+    expect(recovered.status).toBe('completed')
+    expect(workerCalls).toBe(2)
+    const receipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-npm-cache-recovery.json'), 'utf8'))
+    expect(receipt).toMatchObject({ runId: first.runId, phase: 'quarantined', basis: 'baseline-absent' })
+    expect(readFileSync(join(receipt.quarantine, '_logs', 'attempt.log'), 'utf8')).toBe('preserved cache bytes\n')
+  }, 90_000)
+
+  it('reconciles a completed cache receipt before worker release after another interruption', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    const issuedAt = Date.now() - 1_000
+    const expiresAt = Date.now() + 60_000
+    const authority = (transitions: number): LifecycleAuthority => ({
+      sessionId: 'npm-cache-reconcile-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+      maxTransitions: 16, transitions, issuedAt, expiresAt,
+    })
+    let calls = 0
+    const worker: WorkerAdapter = { async run(request) {
+      calls += 1
+      if (calls === 1) {
+        mkdirSync(join(request.worktree, '.npm-cache', '_logs'), { recursive: true })
+        writeFileSync(join(request.worktree, '.npm-cache', '_logs', 'attempt.log'), 'original\n')
+        return { status: 'failed', output: '', error: 'npx failed and leppy_commit rejected .npm-cache/_logs/attempt.log outside this task write scope' }
+      }
+      return { status: 'interrupted', output: '', error: 'simulated interruption after completed quarantine receipt' }
+    } }
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, lifecycleAuthority: authority(1) }, { ...modelDeps, worker })
+    const firstState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    const interrupted = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      workerArtifactRecoveryDigest: createHash('sha256').update(firstState.lastError).digest('hex'), lifecycleAuthority: authority(2),
+    }, { ...modelDeps, worker })
+    expect(interrupted.status).toBe('interrupted')
+    const completedState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    delete completedState.currentTask
+    writeFileSync(join(first.stateDir!, 'run.json'), `${JSON.stringify(completedState, null, 2)}\n`)
+    persistRunStateProof(
+      first.stateDir!, completedState,
+      Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64'),
+    )
+    mkdirSync(join(first.worktree!, '.npm-cache', '_logs'), { recursive: true })
+    writeFileSync(join(first.worktree!, '.npm-cache', '_logs', 'downtime.log'), 'new during downtime\n')
+    const forbiddenWorker = new FakeWorker()
+    const refused = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      lifecycleAuthority: authority(3),
+    }, { ...modelDeps, worker: forbiddenWorker })
+    expect(refused.status).toBe('stalled')
+    expect(refused.detail).toContain('appeared after the authenticated quarantine')
+    expect(forbiddenWorker.calls).toHaveLength(0)
+    expect(readFileSync(join(first.worktree!, '.npm-cache', '_logs', 'downtime.log'), 'utf8')).toBe('new during downtime\n')
+  }, 90_000)
+
+  it('refuses worker cache quarantine when recovery inferred a run without an exact run ID', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    const issuedAt = Date.now() - 1_000
+    const expiresAt = Date.now() + 60_000
+    const authority = (transitions: number): LifecycleAuthority => ({
+      sessionId: 'npm-cache-exact-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+      maxTransitions: 16, transitions, issuedAt, expiresAt,
+    })
+    const first = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, lifecycleAuthority: authority(1),
+    }, { ...modelDeps, worker: {
+      async run(request) {
+        mkdirSync(join(request.worktree, '.npm-cache', '_logs'), { recursive: true })
+        writeFileSync(join(request.worktree, '.npm-cache', '_logs', 'attempt.log'), 'preserve me\n')
+        return { status: 'failed', output: '', error: 'npx failed and leppy_commit rejected .npm-cache/_logs/attempt.log outside this task write scope' }
+      },
+    } })
+    const firstState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    const forbiddenWorker = new FakeWorker()
+    const refused = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true,
+      workerArtifactRecoveryDigest: createHash('sha256').update(firstState.lastError).digest('hex'),
+      lifecycleAuthority: authority(2),
+    }, { ...modelDeps, worker: forbiddenWorker })
+    expect(refused.status).toBe('stalled')
+    expect(refused.detail).toContain('exact authenticated existing run')
+    expect(forbiddenWorker.calls).toHaveLength(0)
+    expect(readFileSync(join(first.worktree!, '.npm-cache', '_logs', 'attempt.log'), 'utf8')).toBe('preserve me\n')
   }, 90_000)
 
   it('never releases another worker for an unresolved dependency miss even without a legacy hydration flag', async () => {

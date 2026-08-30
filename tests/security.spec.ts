@@ -17,7 +17,13 @@ describe('security boundary', () => {
   })
 
   it.each([
-    ['git', ['push']], ['gh', ['pr', 'merge']], ['npm', ['publish']], ['pwsh', ['-Command', 'x']],
+    ['git', ['push']], ['git.exe', ['commit', '-m', 'bypass']], ['gh', ['pr', 'merge']], ['npm', ['publish']],
+    ['npm.cmd', ['exec', 'playwright']], ['npm', ['--prefix', '.', 'exec', 'playwright']], ['npx.cmd', ['playwright']],
+    ['pnpm', ['dlx', 'vitest']], ['pnpm', ['--dir', '.', 'up']], ['yarn.cmd', ['install']], ['yarn', ['--cwd', '.']], ['yarn', ['--cwd', '.', 'add', 'x']],
+    ['bunx.exe', ['vitest']], ['pnpx.cmd', ['playwright']], ['yarnpkg', ['add', 'x']],
+    ['corepack.exe', ['pnpm', 'dlx', 'playwright']], ['corepack', ['yarn', 'add', 'x']],
+    ['npm', ['it']], ['npm', ['cit']], ['npm', ['prune']], ['npm', ['dedupe']],
+    ['npm', ['rebuild']], ['npm', ['--cache=.npm-cache', 'test']], ['pwsh', ['-Command', 'x']],
     ['node', ['-e', 'process.exit()']], ['curl', ['https://example.test']], ['git', ['worktree', 'remove', 'x']],
   ])('denies %s %j', (command, args) => {
     expect(() => validateArgv(command, args, process.cwd(), process.cwd())).toThrow()
@@ -28,6 +34,8 @@ describe('security boundary', () => {
     mkdirSync(join(root, 'scripts'))
     writeFileSync(join(root, 'scripts', 'focused.ps1'), 'exit 0\n')
     expect(() => validateArgv('pnpm', ['test', '--', 'focused'], root, root)).not.toThrow()
+    expect(() => validateArgv('pnpm', ['--dir', '.', 'run', 'lint'], root, root)).not.toThrow()
+    expect(() => validateArgv('npm.cmd', ['--prefix', '.', 'run', 'test:e2e'], root, root)).not.toThrow()
     expect(() => validateArgv('pwsh', ['-NoProfile', '-File', 'scripts/focused.ps1'], root, root)).not.toThrow()
     for (const selector of ['-Com', '-Comm', '-Enc', '-EncodedCommand']) {
       expect(() => validateArgv('powershell.exe', [selector, 'Write-Output bypass', '-File', 'scripts/focused.ps1'], root, root)).toThrow(/requires exact -File/)

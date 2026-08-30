@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [0.3.19] - 2026-08-30
+
+### Fixed
+
+- Worker argv now resolves bare executables local-first from the authenticated root `node_modules/.bin` through the Host subprocess resolver, then confines and spawns the exact resolved path with the same scrubbed environment. The sandbox's canonical write root must equal the run worktree. Windows launch suffixes no longer bypass command policy. Package managers are fail-closed to explicit `run`/`test` script commands; `npx`, `bunx`, `pnpx`, `yarnpkg`, `corepack`, dynamic execution, dependency mutation and project-local cache overrides fail before resolution or spawn.
+- Recovery of an exact authenticated `npx`/`leppy_commit` stall may move a wholly untracked physical `.npm-cache` out of the worktree into a private HMAC-authenticated, identity-bound quarantine transaction under the repository lock. New attempts require a signed pre-worker absence baseline; legacy runs require the exact current failure digest and exact run ID. The cache bytes and task WIP are preserved; tracked, staged, linked, ambiguous, recreated or identity-changed targets fail closed, cross-device state is rejected before a receipt exists, every receipt phase is reconciled before worker release, and a crash after receipt or atomic rename resumes the same transaction.
+
 ## [0.3.18] - 2026-08-30
 
 ### Fixed

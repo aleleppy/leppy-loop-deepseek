@@ -583,6 +583,31 @@ describe('grant-validated background controller tool', () => {
     expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ transitions: 3 })
   })
 
+  it('binds legacy npm cache quarantine to the exact authenticated controller error', async () => {
+    const owner = agent('npm-cache-owner')
+    const stalled = controller({
+      autoRecoveryBlocked: true,
+      detail: 'npx is unavailable and leppy_commit rejected .npm-cache/_logs/attempt.log outside this task write scope',
+      lifecycleAuthority: {
+        sessionId: 'npm-cache-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 4, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const jobs = new FakeJobs()
+    let received: LeppyLoopOptions | undefined
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      run: async options => { received = options; return { ...completed, runId: stalled.runId } },
+    })
+
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })).resolves.toMatchObject({ status: 'running', runId: stalled.runId })
+    await jobs.starts[0]!.hooks.done
+    expect(received?.workerArtifactRecoveryDigest).toMatch(/^[0-9a-f]{64}$/u)
+    expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ transitions: 5 })
+  })
+
   it('retries transient automatic follow-up handoff failures within the lifecycle', async () => {
     const followup = vi.fn()
     const owner = agent('followup-retry-agent', followup)
