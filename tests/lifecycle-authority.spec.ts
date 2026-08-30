@@ -86,6 +86,32 @@ describe('append-only lifecycle authority receipts', () => {
     expect(inspectLifecycleAuthority(dir, 'run-a')).toMatchObject({ status: 'invalid', reason: expect.stringContaining('head') })
   })
 
+  it('records a bounded direct-human TTL renewal and then admits the next transition', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: true, transitions: 1 }))
+    const renewed = authority({ allowPublication: false, transitions: 1, issuedAt: 90_000_000, expiresAt: 176_400_000 })
+    appendLifecycleAuthorityReceipt(dir, 'run-a', renewed)
+    appendLifecycleAuthorityReceipt(dir, 'run-a', { ...renewed, transitions: 2 })
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({
+      sequence: 3, authority: { transitions: 2, issuedAt: 90_000_000, expiresAt: 176_400_000, allowPublication: false },
+    })
+  })
+
+  it('rejects renewal that changes TTL bounds or consumes a transition simultaneously', () => {
+    const duration = 86_400_000
+    const changedTtl = stateDir()
+    appendLifecycleAuthorityReceipt(changedTtl, 'run-a', authority())
+    expect(() => appendLifecycleAuthorityReceipt(changedTtl, 'run-a', authority({
+      issuedAt: 90_000_000, expiresAt: 90_000_000 + duration + 1,
+    }))).toThrow('not monotonic')
+
+    const transition = stateDir()
+    appendLifecycleAuthorityReceipt(transition, 'run-a', authority())
+    expect(() => appendLifecycleAuthorityReceipt(transition, 'run-a', authority({
+      transitions: 2, issuedAt: 90_000_000, expiresAt: 90_000_000 + duration,
+    }))).toThrow('not monotonic')
+  })
+
   it('permits only a monotonic publication downgrade within the same authority chain', () => {
     const dir = stateDir()
     appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ allowPublication: true }))

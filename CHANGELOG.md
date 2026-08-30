@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.21] - 2026-08-30
+
+### Fixed
+
+- The authenticated lifecycle receipt chain now represents one direct-human permit renewal as a monotonic successor: session and budgets stay immutable, consumed transitions do not reset, publication can only downgrade, and `issuedAt`/`expiresAt` must both advance with the exact same bounded TTL. This lets `/leppy-loop continuar` persist the `0.3.20` renewal instead of rejecting it as changed immutable facts, while model hydration still rejects expired authority.
+
 ## [0.3.20] - 2026-08-30
 
 ### Fixed

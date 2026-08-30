@@ -68,21 +68,28 @@ function validAuthority(value: unknown): value is LifecycleAuthority {
     && (authority.revokedAt === undefined || (Number.isSafeInteger(authority.revokedAt) && authority.revokedAt >= authority.issuedAt!))
 }
 
-function baseFactsMatch(left: LifecycleAuthority, right: LifecycleAuthority): boolean {
+function immutableFactsMatch(left: LifecycleAuthority, right: LifecycleAuthority): boolean {
   return left.sessionId === right.sessionId
     && left.maxIterations === right.maxIterations
     && left.maxRepairCycles === right.maxRepairCycles
     && left.maxTransitions === right.maxTransitions
-    && left.issuedAt === right.issuedAt
-    && left.expiresAt === right.expiresAt
+}
+
+function permitWindowMatch(left: LifecycleAuthority, right: LifecycleAuthority): boolean {
+  return left.issuedAt === right.issuedAt && left.expiresAt === right.expiresAt
 }
 
 function validSuccessor(previous: LifecycleAuthority, next: LifecycleAuthority): boolean {
-  if (!baseFactsMatch(previous, next) || previous.revokedAt !== undefined) return false
+  if (!immutableFactsMatch(previous, next) || previous.revokedAt !== undefined) return false
   const publicationDowngrade = previous.allowPublication && !next.allowPublication
   if (previous.allowPublication !== next.allowPublication && !publicationDowngrade) return false
   const revocation = previous.revokedAt === undefined && next.revokedAt !== undefined
   const transitionDelta = next.transitions - previous.transitions
+  if (!permitWindowMatch(previous, next)) {
+    const sameBoundedTtl = next.expiresAt - next.issuedAt === previous.expiresAt - previous.issuedAt
+    return transitionDelta === 0 && !revocation && next.issuedAt > previous.issuedAt
+      && next.expiresAt > previous.expiresAt && sameBoundedTtl
+  }
   if (transitionDelta === 1) return !revocation
   if (transitionDelta === 0) return publicationDowngrade !== revocation
   return false
@@ -161,7 +168,7 @@ export function appendLifecycleAuthorityReceipt(stateDir: string, runId: string,
   if (!current) {
     if (authority.transitions !== 1 || authority.revokedAt !== undefined) throw new Error('initial lifecycle authority receipt must admit transition one')
   } else if (!validSuccessor(current.authority, authority)) {
-    if (!baseFactsMatch(current.authority, authority)) throw new Error('lifecycle authority immutable facts changed')
+    if (!immutableFactsMatch(current.authority, authority)) throw new Error('lifecycle authority immutable facts changed')
     if (current.authority.revokedAt !== undefined) throw new Error('lifecycle authority was revoked by direct human stop')
     throw new Error('lifecycle authority transition is not monotonic')
   }
