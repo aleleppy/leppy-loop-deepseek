@@ -4,17 +4,17 @@
 
 Leppy Loop is a native external Cordis bundle that executes a tracked Markdown checklist with a fresh DeepSeek Harness process and session for each worker line. The controller owns Git synchronization, the worktree, checklist transitions, closure, gates, durable recovery state, and process leases. Workers receive only the current line, its `Done:` contract, writable paths, applicable repository instructions, and explicit prohibitions; ordinary workers may inspect the worktree but cannot write outside those paths or read the controlling checklist.
 
-Version `0.3.25` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). It registers a Host-side `/leppy-loop` command, an always-discoverable grant-validated controller tool, a model-only `leppy-loop-operator` lifecycle skill that cannot collide with the human command, and browser cards without patching Harness.
+Version `0.3.26` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). It registers a Host-side `/leppy-loop` command, an always-discoverable grant-validated controller tool, a model-only `leppy-loop-operator` lifecycle skill that cannot collide with the human command, and browser cards without patching Harness.
 
 ## Install
 
-Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.3.25`. Configure the credential for the model provider selected in the Harness Models page, then build and install the tarball into the profile used by the Web host. Workers reuse that provider, model profile, and credential automatically; `DEEPSEEK_API_KEY` is not required when another provider is selected:
+Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.3.26`. Configure the credential for the model provider selected in the Harness Models page, then build and install the tarball into the profile used by the Web host. Workers reuse that provider, model profile, and credential automatically; `DEEPSEEK_API_KEY` is not required when another provider is selected:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm build
 pnpm pack
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.3.25.tgz
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.3.26.tgz
 ```
 
 Restart the existing `dsh web` process after changing its profile. A browser refresh cannot compose a newly installed Host plugin. A published GitHub Release tarball may replace the local `.tgz` path; there is no claim of publication in a plugin registry.
@@ -31,7 +31,7 @@ Create and commit a tracked checklist such as [`examples/feature.task.md`](examp
 /leppy-loop stop
 ```
 
-The slash command returns after minting one lifecycle permit and queues one short AI resolver turn. The same permit can drive up to sixteen sequential controller transitions for one session, canonical repository and run, so the AI can resume recoverable work, choose bounded gate repair, reconcile publication and react to background completion without asking the human for phase-specific slash commands. Exactly one transition may be in flight. Once bound, the permit uses an HMAC required-marker, chained receipts, and an authenticated monotonic head: admissions persist before job start, local-only downgrade before slash acknowledgment, and Stop revocation before kill. It rehydrates after a Host restart; corrupt modern authority is quarantined, mutable `run.json` is never authority, and consumed transitions cannot replay after a crash; it still expires after 24 hours, cannot cross sessions/repositories/runs, and cannot widen repair scope, merge or deploy. Explicit `do not publish`/local-only language irreversibly removes branch-push/PR authority from that lifecycle; otherwise `/leppy-loop` authorizes the AI to decide whether normal delivery includes the controller-owned branch and PR based on the conversation.
+The slash command returns after minting one lifecycle permit and queues one short AI resolver turn. The same permit can drive up to sixteen sequential controller transitions for one session, canonical repository and run, so the AI can resume recoverable work, choose bounded gate repair, reconcile publication and react to background completion without asking the human for phase-specific slash commands. Once all sixteen are consumed, only a fresh direct-human invocation may append a zero-consumption next budget epoch for that exact run, after live-job, repository-lock and signed-lease settlement; the model cannot reset it. Exactly one transition may be in flight. Once bound, the permit uses an HMAC required-marker, chained receipts, and an authenticated monotonic head: admissions persist before job start, local-only downgrade before slash acknowledgment, and Stop revocation before kill. It rehydrates after a Host restart; append-only Host-owned high-water anchors under `DSH_HOME` reject coordinated local head/prefix rollback, corrupt modern authority is quarantined, mutable `run.json` is never authority, and consumed transitions cannot replay after a crash; it still expires after 24 hours, cannot cross sessions/repositories/runs, and cannot widen repair scope, merge or deploy. Explicit `do not publish`/local-only language irreversibly removes branch-push/PR authority from that lifecycle; otherwise `/leppy-loop` authorizes the AI to decide whether normal delivery includes the controller-owned branch and PR based on the conversation.
 
 The globally discoverable `leppy_loop_control` tool receives technical checklist/base/run/recovery/publication facts while the human surface remains simple. Read-only `preflight` validates canonical scopes and the authoritative base before start. The tool binds an unbound permit to the first run exactly once, validates every continuation against the live HMAC-authenticated controller, uses cumulative transition budgets, and transfers each transition into owner-fenced `ctx.jobs`. `status` never trusts a remembered job ID and exposes durable controllers only to their signed owning session: a durable `running` state without an owner-fenced Host job is reported as `orphaned`. Gate fingerprints, clean-worktree checks, closure scope, receipts and bounded repair cycles remain controller-enforced; workers still cannot push or invoke `gh`.
 
@@ -149,7 +149,7 @@ The official sandbox does not confine network access. A malicious repository scr
 
 ## Costs and limitations
 
-Each line starts an independent context, so shared conversational cache is intentionally lost and model cost may be higher. Version `0.3.25` supports only the tested Harness pin. Network confinement, automatic push, PR mutation, release publication, package publication, and deployment are not provided. No remote action is automatic.
+Each line starts an independent context, so shared conversational cache is intentionally lost and model cost may be higher. Version `0.3.26` supports only the tested Harness pin. Network confinement, automatic push, PR mutation, release publication, package publication, and deployment are not provided. No remote action is automatic.
 
 ## Uninstall
 

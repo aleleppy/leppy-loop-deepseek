@@ -96,6 +96,8 @@ export interface PendingTaskValidation {
 }
 
 export interface LifecycleAuthority {
+  /** Monotonic direct-human budget epoch; legacy authenticated chains imply epoch 1. */
+  epoch?: number
   sessionId: string
   allowPublication: boolean
   maxIterations: number

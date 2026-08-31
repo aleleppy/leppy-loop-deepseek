@@ -2,6 +2,15 @@
 
 All notable changes are documented here.
 
+## [0.3.26] - 2026-08-30
+
+### Fixed
+
+- A fresh direct-human `/leppy-loop` reauthorization can now open a new sixteen-transition budget epoch for the exact same-session, same-repository, same-run controller only after its preceding epoch is fully exhausted. The epoch is part of every authenticated admission, cannot skip, inherit prior consumption, widen publication, cross a revocation, or reset automatically. Reauthorization uses a serialized prepare/persist/commit transaction; failed persistence leaves Host memory unchanged, while a higher durable epoch supersedes stale pre-crash memory.
+- Lifecycle authority rollback protection now extends beyond the replaceable run bundle. Each fully validated local chain advances an HMAC-authenticated, append-only, create-exclusive high-water anchor per run and sequence under Host-owned `DSH_HOME`; coordinated restoration of an old local head and receipt prefix therefore fails closed. Receipt persistence precedes head replacement, one exact authenticated tail can finish after a crash, and a missing mature head is reconstructed only from a pre-existing exact external anchor. Read-only inspection cannot create the trust evidence it requires.
+- Exhausted orphan recovery distinguishes stale durable `running` state from actual activity. Budget rollover rejects a live owner-fenced Host job, acquires the authenticated repository lock, and waits for definitive signed lease settlement before persisting the next epoch. Repository-lock producers and reclaimers now use the same tri-state OS identity rules as worker leases; inspection errors fail closed and no approximate wall-clock identity is synthesized.
+- Regression coverage includes slash→epoch 2/0→control 2/1→runner propagation, Host restart at the zero-consumption tail, stale-circuit rejection, persistence rollback and concurrent slash serialization, orphan/live-lock behavior, stale-RAM adoption, premature/skipped/inherited epochs, receipt-before-head crash recovery, cross-prefix rollback, same-sequence anchor forks, mature-head reconstruction, and repeated headless inspection with no trust-on-first-use side effect.
+
 ## [0.3.25] - 2026-08-30
 
 ### Fixed

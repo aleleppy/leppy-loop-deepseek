@@ -2,6 +2,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { atomicWriteJson, createLeaseKey } from './state.js'
+import { inspectLifecycleAuthorityAnchor, reconcileLifecycleAuthorityAnchor } from './lifecycle-authority-anchor.js'
 import { runFile } from './process.js'
 import type { LifecycleAuthority } from './types.js'
 
@@ -79,10 +80,11 @@ function validAuthority(value: unknown): value is LifecycleAuthority {
   const authority = value as Partial<LifecycleAuthority>
   return typeof authority.sessionId === 'string' && authority.sessionId.length > 0
     && typeof authority.allowPublication === 'boolean'
+    && (authority.epoch === undefined || (Number.isSafeInteger(authority.epoch) && authority.epoch > 0))
     && [authority.maxIterations, authority.maxRepairCycles, authority.maxTransitions, authority.transitions, authority.issuedAt, authority.expiresAt]
       .every(candidate => typeof candidate === 'number' && Number.isSafeInteger(candidate))
     && authority.maxIterations! > 0 && authority.maxRepairCycles! > 0 && authority.maxTransitions! > 0
-    && authority.transitions! > 0 && authority.transitions! <= authority.maxTransitions!
+    && authority.transitions! >= 0 && authority.transitions! <= authority.maxTransitions!
     && authority.expiresAt! > authority.issuedAt!
     && (authority.revokedAt === undefined || (Number.isSafeInteger(authority.revokedAt) && authority.revokedAt >= authority.issuedAt!))
 }
@@ -98,8 +100,13 @@ function permitWindowMatch(left: LifecycleAuthority, right: LifecycleAuthority):
   return left.issuedAt === right.issuedAt && left.expiresAt === right.expiresAt
 }
 
+function authorityEpoch(authority: LifecycleAuthority): number {
+  return authority.epoch ?? 1
+}
+
 export function lifecycleAuthoritiesEqual(left: LifecycleAuthority, right: LifecycleAuthority): boolean {
   return immutableFactsMatch(left, right) && permitWindowMatch(left, right)
+    && authorityEpoch(left) === authorityEpoch(right)
     && left.allowPublication === right.allowPublication && left.transitions === right.transitions
     && left.revokedAt === right.revokedAt
 }
@@ -109,9 +116,16 @@ function validSuccessor(previous: LifecycleAuthority, next: LifecycleAuthority):
   const publicationDowngrade = previous.allowPublication && !next.allowPublication
   if (previous.allowPublication !== next.allowPublication && !publicationDowngrade) return false
   const revocation = previous.revokedAt === undefined && next.revokedAt !== undefined
+  const previousEpoch = authorityEpoch(previous)
+  const nextEpoch = authorityEpoch(next)
+  const sameBoundedTtl = next.expiresAt - next.issuedAt === previous.expiresAt - previous.issuedAt
+  if (nextEpoch === previousEpoch + 1) {
+    return previous.transitions === previous.maxTransitions && next.transitions === 0 && !revocation
+      && next.issuedAt > previous.issuedAt && next.expiresAt > previous.expiresAt && sameBoundedTtl
+  }
+  if (nextEpoch !== previousEpoch) return false
   const transitionDelta = next.transitions - previous.transitions
   if (!permitWindowMatch(previous, next)) {
-    const sameBoundedTtl = next.expiresAt - next.issuedAt === previous.expiresAt - previous.issuedAt
     return transitionDelta === 0 && !revocation && next.issuedAt > previous.issuedAt
       && next.expiresAt > previous.expiresAt && sameBoundedTtl
   }
@@ -142,23 +156,26 @@ export function inspectLifecycleAuthority(stateDir: string, runId: string): Life
   const headPath = resolve(stateDir, 'lifecycle-authority-head.json')
   const requiredPath = resolve(stateDir, 'lifecycle-authority-required.hmac')
   if (names.length === 0 && !existsSync(headPath) && !existsSync(requiredPath)) return { status: 'legacy' }
-  if (!existsSync(keyPath) || !existsSync(headPath) || !existsSync(requiredPath)) return invalid('lifecycle authority key, required marker, or monotonic head is missing')
+  if (!existsSync(keyPath) || !existsSync(requiredPath)) return invalid('lifecycle authority key or required marker is missing')
   let key: Buffer
-  let head: LifecycleAuthorityHead
+  let head: LifecycleAuthorityHead | undefined
   try {
     key = Buffer.from(readFileSync(keyPath, 'utf8').trim(), 'base64')
-    head = JSON.parse(readFileSync(headPath, 'utf8')) as LifecycleAuthorityHead
+    if (existsSync(headPath)) head = JSON.parse(readFileSync(headPath, 'utf8')) as LifecycleAuthorityHead
   } catch { return invalid('lifecycle authority head is unreadable') }
-  if (head.schemaVersion !== 1 || head.runId !== runId || !Number.isSafeInteger(head.sequence) || head.sequence < 1
-    || typeof head.digest !== 'string' || typeof head.hmac !== 'string') return invalid('lifecycle authority head shape is invalid')
-  const unsignedHead = headPayload({ schemaVersion: 1, runId: head.runId, sequence: head.sequence, digest: head.digest })
-  if (!equalProof(head.hmac, proof(key, unsignedHead))) return invalid('lifecycle authority head authentication failed')
+  if (head) {
+    if (head.schemaVersion !== 1 || head.runId !== runId || !Number.isSafeInteger(head.sequence) || head.sequence < 1
+      || typeof head.digest !== 'string' || typeof head.hmac !== 'string') return invalid('lifecycle authority head shape is invalid')
+    const unsignedHead = headPayload({ schemaVersion: 1, runId: head.runId, sequence: head.sequence, digest: head.digest })
+    if (!equalProof(head.hmac, proof(key, unsignedHead))) return invalid('lifecycle authority head authentication failed')
+    if (names.length !== head.sequence && names.length !== head.sequence + 1) return invalid('lifecycle authority chain length does not match its monotonic head')
+  } else if (names.length === 0) return invalid('lifecycle authority monotonic head is missing')
   let requiredProof: string
   try { requiredProof = readFileSync(requiredPath, 'utf8').trim() } catch { return invalid('lifecycle authority required marker is unreadable') }
   if (!equalProof(requiredProof, proof(key, `lifecycle-authority-required\0${runId}`))) return invalid('lifecycle authority required marker authentication failed')
-  if (names.length !== head.sequence) return invalid('lifecycle authority chain length does not match its monotonic head')
 
   let previous: AuthenticatedLifecycleAuthority | undefined
+  let authenticatedHead = head === undefined
   const chain: LifecycleAuthority[] = []
   for (let index = 0; index < names.length; index += 1) {
     const name = names[index]!
@@ -174,14 +191,29 @@ export function inspectLifecycleAuthority(stateDir: string, runId: string): Life
     })
     if (!equalProof(receipt.hmac, proof(key, unsignedReceipt))) return invalid('lifecycle authority receipt authentication failed')
     const currentDigest = digest(unsignedReceipt)
+    if (head?.sequence === sequence) authenticatedHead = head.digest === currentDigest
     if (receipt.previousDigest !== (previous?.digest ?? null)) return invalid('lifecycle authority receipt chain is broken')
     if (!previous) {
-      if (receipt.authority.transitions !== 1 || receipt.authority.revokedAt !== undefined) return invalid('initial lifecycle authority receipt is invalid')
+      if (authorityEpoch(receipt.authority) !== 1 || receipt.authority.transitions !== 1 || receipt.authority.revokedAt !== undefined) return invalid('initial lifecycle authority receipt is invalid')
     } else if (!validSuccessor(previous.authority, receipt.authority)) return invalid('lifecycle authority successor is not monotonic')
     previous = { authority: receipt.authority, sequence, digest: currentDigest }
     chain.push({ ...receipt.authority })
   }
-  if (!previous || head.sequence !== previous.sequence || head.digest !== previous.digest) return invalid('lifecycle authority head does not authenticate the current tail')
+  if (!previous || !authenticatedHead) return invalid('lifecycle authority head does not authenticate its receipt prefix')
+  if (!head && previous.sequence > 1) {
+    const existingAnchor = inspectLifecycleAuthorityAnchor(stateDir, runId, previous.sequence, previous.digest)
+    if (existingAnchor.status !== 'equal') {
+      return invalid(existingAnchor.status === 'invalid'
+        ? existingAnchor.reason
+        : 'missing lifecycle authority head is not bound to a pre-existing external high-water mark')
+    }
+  }
+  const anchor = reconcileLifecycleAuthorityAnchor(stateDir, runId, previous.sequence, previous.digest)
+  if (anchor.status === 'invalid') return invalid(anchor.reason)
+  if (!head || head.sequence !== previous.sequence) {
+    const unsignedHead = { schemaVersion: 1 as const, runId, sequence: previous.sequence, digest: previous.digest }
+    atomicWriteJson(headPath, { ...unsignedHead, hmac: proof(key, headPayload(unsignedHead)) })
+  } else if (head.digest !== previous.digest) return invalid('lifecycle authority head does not authenticate the current tail')
   return { status: 'valid', ...previous, chain }
 }
 
@@ -190,15 +222,27 @@ export function readAuthenticatedLifecycleAuthority(stateDir: string, runId: str
   return inspected.status === 'valid' ? inspected : undefined
 }
 
-/** Advance the authenticated head before appending one immutable admission, downgrade, or revocation receipt. */
-export function appendLifecycleAuthorityReceipt(stateDir: string, runId: string, authority: LifecycleAuthority): AuthenticatedLifecycleAuthority {
+export interface LifecycleAuthorityWriteHooks {
+  afterReceipt?: () => void
+  afterHead?: () => void
+}
+
+/** Persist one immutable receipt before atomically advancing its authenticated head. */
+export function appendLifecycleAuthorityReceipt(
+  stateDir: string,
+  runId: string,
+  authority: LifecycleAuthority,
+  hooks: LifecycleAuthorityWriteHooks = {},
+): AuthenticatedLifecycleAuthority {
   if (!validAuthority(authority)) throw new Error('invalid lifecycle authority receipt')
   mkdirSync(resolve(stateDir, 'lifecycle-authority'), { recursive: true })
   const inspected = inspectLifecycleAuthority(stateDir, runId)
   if (inspected.status === 'invalid') throw new Error(`existing lifecycle authority is invalid: ${inspected.reason}`)
   const current = inspected.status === 'valid' ? inspected : undefined
   if (!current) {
-    if (authority.transitions !== 1 || authority.revokedAt !== undefined) throw new Error('initial lifecycle authority receipt must admit transition one')
+    if (authorityEpoch(authority) !== 1 || authority.transitions !== 1 || authority.revokedAt !== undefined) {
+      throw new Error('initial lifecycle authority receipt must admit epoch one transition one')
+    }
   } else if (!validSuccessor(current.authority, authority)) {
     if (!immutableFactsMatch(current.authority, authority)) throw new Error('lifecycle authority immutable facts changed')
     if (current.authority.revokedAt !== undefined) throw new Error('lifecycle authority was revoked by direct human stop')
@@ -217,14 +261,22 @@ export function appendLifecycleAuthorityReceipt(stateDir: string, runId: string,
   const currentDigest = digest(serializedReceipt)
   const unsignedHead = { schemaVersion: 1 as const, runId, sequence, digest: currentDigest }
   const head: LifecycleAuthorityHead = { ...unsignedHead, hmac: proof(key, headPayload(unsignedHead)) }
-  atomicWriteJson(resolve(stateDir, 'lifecycle-authority-head.json'), head)
   const receipt: LifecycleAuthorityReceipt = { ...unsignedReceipt, hmac: proof(key, serializedReceipt) }
   const path = resolve(stateDir, 'lifecycle-authority', `authority-${String(sequence).padStart(6, '0')}.json`)
   writeFileSync(path, `${JSON.stringify(receipt)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+  hooks.afterReceipt?.()
+  atomicWriteJson(resolve(stateDir, 'lifecycle-authority-head.json'), head)
+  hooks.afterHead?.()
+  const anchor = reconcileLifecycleAuthorityAnchor(stateDir, runId, sequence, currentDigest)
+  if (anchor.status === 'invalid') throw new Error(anchor.reason)
   return { authority: receipt.authority, sequence, digest: currentDigest }
 }
 
-export async function lifecycleStateDir(repoRoot: string, runId: string): Promise<string> {
+export async function lifecycleCommonDir(repoRoot: string): Promise<string> {
   const commonRaw = (await runFile('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot })).stdout.trim()
-  return resolve(repoRoot, commonRaw, 'leppy-loop', 'runs', runId)
+  return resolve(repoRoot, commonRaw)
+}
+
+export async function lifecycleStateDir(repoRoot: string, runId: string): Promise<string> {
+  return resolve(await lifecycleCommonDir(repoRoot), 'leppy-loop', 'runs', runId)
 }

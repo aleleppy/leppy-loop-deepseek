@@ -15,8 +15,10 @@ import {
 import { selectControllerForPublication, selectControllerForStatus } from '../src/controller-auth.js'
 import type { AuthenticatedController } from '../src/controller-auth.js'
 import { HumanGrantStore } from '../src/human-grant.js'
+import { lifecycleCommonDir } from '../src/lifecycle-authority.js'
 import { parseLeppyLoopCommandInput, tokenizeLeppyLoopCommandInput } from '../src/options.js'
 import type { LeppyLoopRuntime } from '../src/command.js'
+import { acquireLock } from '../src/state.js'
 import type { LeppyLoopOptions, LifecycleAuthority, PendingTaskValidation, RunProgress, RunResult } from '../src/types.js'
 
 const cwd = process.cwd()
@@ -358,6 +360,126 @@ describe('simple human slash surface', () => {
     expect(persisted!.expiresAt).toBeGreaterThan(durable.lifecycleAuthority!.expiresAt)
   })
 
+  it('opens and persists a fresh budget epoch when a direct human reauthorizes the exact exhausted run', async () => {
+    const order: string[] = []
+    const owner = agent('exhausted-owner', () => { order.push('followup') })
+    const exhausted = controller({
+      lifecycleAuthority: {
+        sessionId: 'exhausted-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 16, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const persisted: LifecycleAuthority[] = []
+    let observed: LeppyLoopOptions | undefined
+    const jobs = new FakeJobs()
+    const rt = runtime({
+      inspectControllers: async () => [exhausted],
+      persistAuthority: async (_repo, _runId, authority) => { persisted.push({ ...authority }); order.push('persist') },
+      run: async options => { observed = options; return { ...completed, runId: exhausted.runId } },
+    })
+    const ctx = context(jobs)
+    await expect(executeLeppyLoopCommand(ctx, invocation(owner, 'continuar'), rt)).resolves.toMatchObject({ kind: 'success' })
+    expect(order).toEqual(['persist', 'followup'])
+    expect(persisted[0]).toMatchObject({ epoch: 2, transitions: 0, maxTransitions: 16, sessionId: 'exhausted-owner' })
+    await expect(executeLeppyLoopControl(ctx, rt, owner, {
+      operation: 'continue', runId: exhausted.runId, tasks: exhausted.checklistRelative, syncBranch: exhausted.syncBranch,
+    })).resolves.toMatchObject({ status: 'running', runId: exhausted.runId })
+    expect(persisted[1]).toMatchObject({ epoch: 2, transitions: 1 })
+    await jobs.starts[0]!.hooks.done
+    expect(observed?.lifecycleAuthority).toMatchObject({ epoch: 2, transitions: 1 })
+  })
+
+  it('renews an exhausted orphaned durable-running controller only after its lock and lease have settled', async () => {
+    const owner = agent('orphaned-budget-owner')
+    const orphaned = controller({
+      status: 'running',
+      lifecycleAuthority: {
+        sessionId: 'orphaned-budget-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 16, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    let persisted: LifecycleAuthority | undefined
+    const rt = runtime({
+      inspectControllers: async () => [orphaned],
+      persistAuthority: async (_repo, _runId, authority) => { persisted = authority },
+    })
+    await expect(executeLeppyLoopCommand(context(), invocation(owner, 'continuar'), rt)).resolves.toMatchObject({ kind: 'success' })
+    expect(persisted).toMatchObject({ epoch: 2, transitions: 0 })
+  })
+
+  it('does not roll an exhausted budget while an authenticated repository lock remains live', async () => {
+    const owner = agent('live-lock-budget-owner')
+    const stalled = controller({
+      lifecycleAuthority: {
+        sessionId: 'live-lock-budget-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 16, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    let persisted = false
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      persistAuthority: async () => { persisted = true },
+    })
+    const release = await acquireLock(await lifecycleCommonDir(cwd), 'other-live-run')
+    try {
+      await expect(executeLeppyLoopCommand(context(), invocation(owner, 'continuar'), rt)).resolves.toMatchObject({
+        kind: 'error', text: expect.stringContaining('repository lock'),
+      })
+      expect(persisted).toBe(false)
+    } finally { release() }
+  })
+
+  it('rolls back a prepared renewal when durable persistence fails and permits a clean retry', async () => {
+    const followup = vi.fn()
+    const owner = agent('persist-retry-owner', followup)
+    const durable = controller({
+      lifecycleAuthority: {
+        sessionId: 'persist-retry-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 15, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    let writes = 0
+    const rt = runtime({
+      inspectControllers: async () => [durable],
+      persistAuthority: async () => { writes += 1; if (writes === 1) throw new Error('disk full') },
+    })
+    await expect(executeLeppyLoopCommand(context(), invocation(owner, 'continuar'), rt)).resolves.toMatchObject({
+      kind: 'error', text: expect.stringContaining('disk full'),
+    })
+    expect(rt.grants.permits(owner, cwd)).toHaveLength(0)
+    await expect(executeLeppyLoopCommand(context(), invocation(owner, 'continuar'), rt)).resolves.toMatchObject({ kind: 'success' })
+    expect(writes).toBe(2)
+    expect(followup).toHaveBeenCalledOnce()
+    expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ epoch: 1, transitions: 15 })
+  })
+
+  it('serializes concurrent direct-human renewals for one exact run', async () => {
+    const followup = vi.fn()
+    const owner = agent('concurrent-renew-owner', followup)
+    const durable = controller({
+      lifecycleAuthority: {
+        sessionId: 'concurrent-renew-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 15, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    let releasePersist!: () => void
+    const persistence = new Promise<void>(resolve => { releasePersist = resolve })
+    let writes = 0
+    const rt = runtime({
+      inspectControllers: async () => [durable],
+      persistAuthority: async () => { writes += 1; await persistence },
+    })
+    const first = executeLeppyLoopCommand(context(), invocation(owner, 'continuar'), rt)
+    await vi.waitFor(() => { expect(writes).toBe(1) })
+    await expect(executeLeppyLoopCommand(context(), invocation(owner, 'continuar'), rt)).resolves.toMatchObject({
+      kind: 'error', text: expect.stringContaining('already in progress'),
+    })
+    releasePersist()
+    await expect(first).resolves.toMatchObject({ kind: 'success' })
+    expect(writes).toBe(1)
+    expect(followup).toHaveBeenCalledOnce()
+  })
+
   it('renews and durably persists an expired permit from one fresh direct-human continue command', async () => {
     const order: string[] = []
     const owner = agent('expired-owner', () => { order.push('followup') })
@@ -547,6 +669,46 @@ describe('grant-validated background controller tool', () => {
     expect(persisted).toMatchObject({ transitions: 3, allowPublication: false })
     expect(persisted!.issuedAt).toBeGreaterThan(stalled.lifecycleAuthority!.issuedAt)
     expect(persisted!.expiresAt).toBeGreaterThan(stalled.lifecycleAuthority!.expiresAt)
+  })
+
+  it('hydrates a freshly persisted zero-consumption epoch before evaluating an open recovery circuit', async () => {
+    const owner = agent('epoch-restart-owner')
+    const updatedAt = Date.now() - 10_000
+    const stalled = controller({
+      autoRecoveryBlocked: true, detail: 'unchanged ordinary failure', updatedAt: new Date(updatedAt).toISOString(),
+      lifecycleAuthority: {
+        epoch: 2, sessionId: 'epoch-restart-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 0, issuedAt: updatedAt + 1_000, expiresAt: updatedAt + 86_401_000,
+      },
+    })
+    const jobs = new FakeJobs()
+    let persisted: LifecycleAuthority | undefined
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      persistAuthority: async (_repo, _runId, authority) => { persisted = authority },
+      run: async options => ({ ...completed, runId: options.recoverRunId! }),
+    })
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })).resolves.toMatchObject({ status: 'running', runId: stalled.runId })
+    expect(persisted).toMatchObject({ epoch: 2, transitions: 1 })
+    await jobs.starts[0]!.hooks.done
+  })
+
+  it('does not treat a stale zero-consumption epoch as fresh circuit authority after restart', async () => {
+    const owner = agent('stale-epoch-owner')
+    const updatedAt = Date.now() - 10_000
+    const stalled = controller({
+      autoRecoveryBlocked: true, detail: 'unchanged ordinary failure', updatedAt: new Date(updatedAt).toISOString(),
+      lifecycleAuthority: {
+        epoch: 2, sessionId: 'stale-epoch-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 0, issuedAt: updatedAt - 1_000, expiresAt: updatedAt + 86_399_000,
+      },
+    })
+    const rt = runtime({ inspectControllers: async () => [stalled] })
+    await expect(executeLeppyLoopControl(context(), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })).rejects.toThrow('fresh direct human')
   })
 
   it('reuses persisted authority when an exact-lock dependency bridge changes an ENOTCACHED condition', async () => {

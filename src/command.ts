@@ -15,11 +15,12 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { inspectAuthenticatedControllers, migrateRunStateSecurityProof, selectControllerForStatus } from './controller-auth.js'
 import type { AuthenticatedController } from './controller-auth.js'
 import { resolveRepoRoot } from './git.js'
-import { acquireLifecycleAuthorityMutex, appendLifecycleAuthorityReceipt, lifecycleStateDir } from './lifecycle-authority.js'
+import { acquireLifecycleAuthorityMutex, appendLifecycleAuthorityReceipt, lifecycleCommonDir, lifecycleStateDir } from './lifecycle-authority.js'
 import { harnessRunDependencies } from './harness-runtime.js'
 import { HumanGrantStore } from './human-grant.js'
+import { acquireLock } from './state.js'
 import type { RecoveryAuthority } from './human-grant.js'
-import { runLeppyLoop } from './runner.js'
+import { awaitAuthenticatedLeaseSettlement, runLeppyLoop } from './runner.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import { dependencyHydrationAvailable, dependencyResolutionMiss } from './worktree-dependencies.js'
 import { windowsQuotedExecutableFailure } from './windows-command.js'
@@ -244,7 +245,7 @@ async function persistLifecycleAuthority(runtime: LeppyLoopRuntime, repoRoot: st
 
 function lifecycleAuthority(grant: ReturnType<HumanGrantStore['reserve']>['grant']): LifecycleAuthority {
   return {
-    sessionId: grant.sessionId, allowPublication: grant.allowPublication, maxIterations: grant.maxIterations,
+    epoch: grant.epoch, sessionId: grant.sessionId, allowPublication: grant.allowPublication, maxIterations: grant.maxIterations,
     maxRepairCycles: grant.maxRepairCycles, maxTransitions: grant.maxTransitions, transitions: grant.transitions,
     issuedAt: grant.issuedAt, expiresAt: grant.expiresAt,
     ...(grant.revokedAt === undefined ? {} : { revokedAt: grant.revokedAt }),
@@ -485,6 +486,9 @@ export async function executeLeppyLoopControl(
   }
 
   const livePermits = runtime.grants.permits(agent, repoRoot).filter(permit => permit.runId === runId)
+  const durableReauthorizationFresh = args.operation === 'continue' && controller?.lifecycleAuthority !== undefined
+    && controller.lifecycleAuthority.transitions < controller.lifecycleAuthority.maxTransitions
+    && controller.lifecycleAuthority.issuedAt > Date.parse(controller.updatedAt)
   const dependencyHydration = args.operation === 'continue' && controller !== undefined && dependencyHydrationAvailable(controller)
   const dependencyRepair = args.operation === 'continue' && controller !== undefined && dependencyResolutionMiss(controller.detail)
   const windowsArgvRepair = args.operation === 'continue' && controller?.autoRecoveryBlocked === true
@@ -493,6 +497,7 @@ export async function executeLeppyLoopControl(
   const ignoredBaselineRepair = args.operation === 'continue' && workerIgnoredBaselineRecovery(controller?.detail)
   if (args.operation === 'continue' && controller?.autoRecoveryBlocked === true
     && !dependencyRepair && !windowsArgvRepair && !workerArtifactRepair && !ignoredBaselineRepair
+    && !durableReauthorizationFresh
     && !livePermits.some(permit => permit.reauthorizedAt > Date.parse(controller.updatedAt))) {
     throw new Error('automatic recovery circuit is open; a fresh direct human /leppy-loop authorization is required before another unchanged attempt')
   }
@@ -651,18 +656,39 @@ export async function executeLeppyLoopCommand(
     const latest = selectControllerForStatus(controllers)
     const explicitlyNew = /\b(?:novo|nova|new|iniciar|start)\b/u.test(normalizeIntent(intent.naturalLanguage))
     const selected = explicitlyNew || (latest?.status === 'completed' && latest.pullRequestUrl) ? undefined : latest
-    const grant = selected?.lifecycleAuthority
-      ? runtime.grants.reauthorize({
+    let grant: ReturnType<HumanGrantStore['issue']>
+    if (selected?.lifecycleAuthority) {
+      const rollingBudget = selected.lifecycleAuthority.transitions >= selected.lifecycleAuthority.maxTransitions
+      let releaseRolloverLock: (() => void) | undefined
+      if (rollingBudget) {
+        const live = liveJobRecord(ctx, runtime, invocation.agent, repoRoot)
+        if (live?.runId === selected.runId) {
+          throw new Error('cannot renew an exhausted lifecycle budget while its final controller transition is still running')
+        }
+        releaseRolloverLock = await acquireLock(await lifecycleCommonDir(repoRoot), selected.runId)
+      }
+      try {
+        if (rollingBudget) await awaitAuthenticatedLeaseSettlement(await lifecycleStateDir(repoRoot, selected.runId), selected.runId)
+        const prepared = runtime.grants.prepareReauthorization({
           agent: invocation.agent, repoRoot, runId: selected.runId,
           authority: selected.lifecycleAuthority, allowPublication: intent.allowPublication,
         })
-      : runtime.grants.issue({
-          agent: invocation.agent, repoRoot, ...(selected ? { runId: selected.runId } : {}),
-          allowPublication: intent.allowPublication,
-          maxIterations: GRANT_MAX_ITERATIONS, maxRepairCycles: GRANT_MAX_REPAIR_CYCLES, maxTransitions: GRANT_MAX_TRANSITIONS,
-        })
-    if (selected?.lifecycleAuthority) {
-      await persistLifecycleAuthority(runtime, repoRoot, selected.runId, runtime.grants.authority(grant))
+        try {
+          await persistLifecycleAuthority(runtime, repoRoot, selected.runId, runtime.grants.authority(prepared.grant))
+          grant = prepared.commit()
+        } catch (error) {
+          prepared.rollback()
+          throw error
+        }
+      } finally {
+        releaseRolloverLock?.()
+      }
+    } else {
+      grant = runtime.grants.issue({
+        agent: invocation.agent, repoRoot, ...(selected ? { runId: selected.runId } : {}),
+        allowPublication: intent.allowPublication,
+        maxIterations: GRANT_MAX_ITERATIONS, maxRepairCycles: GRANT_MAX_REPAIR_CYCLES, maxTransitions: GRANT_MAX_TRANSITIONS,
+      })
     }
     const effectiveIntent = { ...intent, allowPublication: grant.allowPublication }
     invocation.agent.followup(createUserMessage({

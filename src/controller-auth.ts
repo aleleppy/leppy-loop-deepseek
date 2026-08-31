@@ -140,6 +140,7 @@ function validLifecycleAuthority(value: unknown): value is LifecycleAuthority | 
   const authority = value as Partial<LifecycleAuthority>
   return typeof authority.sessionId === 'string'
     && typeof authority.allowPublication === 'boolean'
+    && (authority.epoch === undefined || (Number.isSafeInteger(authority.epoch) && authority.epoch > 0))
     && [authority.maxIterations, authority.maxRepairCycles, authority.maxTransitions, authority.transitions, authority.issuedAt, authority.expiresAt]
       .every(candidate => typeof candidate === 'number' && Number.isSafeInteger(candidate))
     && authority.maxIterations! > 0 && authority.maxRepairCycles! > 0 && authority.maxTransitions! > 0

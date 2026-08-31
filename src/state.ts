@@ -84,9 +84,10 @@ async function lockOwnerIsLive(lock: LockObservation | undefined): Promise<boole
       return typeof legacy.pid === 'number' && processExists(legacy.pid)
     } catch { return false }
   }
-  const identity = await processIdentity(owner.pid)
-  if (identity !== undefined) return identity === owner.processStart
-  return processExists(owner.pid)
+  const inspection = await inspectProcessIdentity(owner.pid)
+  if (inspection.status === 'error') return true
+  if (inspection.status === 'absent') return false
+  return inspection.identity === owner.processStart
 }
 
 function writeExclusiveLock(path: string, payload: RepositoryLockPayload): void {
@@ -101,7 +102,9 @@ export async function acquireLock(commonDir: string, runId: string): Promise<() 
   mkdirSync(lockDir, { recursive: true })
   const path = join(lockDir, 'active.lock')
   const reclaimPath = join(lockDir, 'active.reclaim')
-  const processStart = await processIdentity(process.pid) ?? String(Date.now() - Math.floor(process.uptime() * 1000))
+  const processStart = requireFoundProcessIdentity(
+    await inspectProcessIdentity(process.pid), 'cannot authenticate repository lock owner process identity',
+  )
   const payload: RepositoryLockPayload = {
     schemaVersion: 1,
     runId,

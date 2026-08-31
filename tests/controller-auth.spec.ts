@@ -15,10 +15,11 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
 
-function authority(): LifecycleAuthority {
+function authority(overrides: Partial<LifecycleAuthority> = {}): LifecycleAuthority {
   return {
     sessionId: 'session-a', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
     maxTransitions: 16, transitions: 1, issuedAt: 1_000, expiresAt: 86_401_000,
+    ...overrides,
   }
 }
 
@@ -103,6 +104,19 @@ describe('authenticated controller lifecycle authority integrity', () => {
     await expect(inspectAuthenticatedControllers(legacy.root)).resolves.toHaveLength(1)
   })
 
+  it('exposes an authenticated zero-consumption epoch tail after Host restart while run state remains on its prior epoch', async () => {
+    const fixture = repository(true)
+    for (let transitions = 2; transitions <= 16; transitions += 1) {
+      appendLifecycleAuthorityReceipt(fixture.stateDir, fixture.runId, authority({ transitions }))
+    }
+    appendLifecycleAuthorityReceipt(fixture.stateDir, fixture.runId, authority({
+      epoch: 2, transitions: 0, issuedAt: 90_000_000, expiresAt: 176_400_000,
+    }))
+    await expect(inspectAuthenticatedControllers(fixture.root)).resolves.toMatchObject([{
+      runId: fixture.runId, lifecycleAuthority: { epoch: 2, transitions: 0 },
+    }])
+  })
+
   it('migrates legacy ownership once and rejects later recovery-state tampering', async () => {
     const legacy = repository(false)
     const statePath = join(legacy.stateDir, 'run.json')
@@ -166,7 +180,7 @@ describe('authenticated controller lifecycle authority integrity', () => {
     await expect(inspectAuthenticatedControllers(afterTargetProof.root)).resolves.toHaveLength(0)
   })
 
-  it('quarantines a modern controller after receipt corruption or head deletion', async () => {
+  it('quarantines receipt corruption but repairs a missing local head from the external anchor', async () => {
     const corrupted = repository(true)
     const receiptPath = join(corrupted.stateDir, 'lifecycle-authority', 'authority-000001.json')
     const receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) as { authority: { allowPublication: boolean } }
@@ -176,7 +190,7 @@ describe('authenticated controller lifecycle authority integrity', () => {
 
     const missingHead = repository(true)
     unlinkSync(join(missingHead.stateDir, 'lifecycle-authority-head.json'))
-    await expect(inspectAuthenticatedControllers(missingHead.root)).resolves.toHaveLength(0)
+    await expect(inspectAuthenticatedControllers(missingHead.root)).resolves.toHaveLength(1)
   })
 
   it('does not reinterpret a deleted modern chain as legacy while its authenticated marker remains', async () => {

@@ -1,7 +1,8 @@
-import { mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { lifecycleAuthorityAnchorDirectory, reconcileLifecycleAuthorityAnchor } from '../src/lifecycle-authority-anchor.js'
 import { appendLifecycleAuthorityReceipt, inspectLifecycleAuthority, readAuthenticatedLifecycleAuthority } from '../src/lifecycle-authority.js'
 import type { LifecycleAuthority } from '../src/types.js'
 
@@ -20,6 +21,11 @@ function authority(overrides: Partial<LifecycleAuthority> = {}): LifecycleAuthor
 }
 
 describe('append-only lifecycle authority receipts', () => {
+  it('rejects a chain that tries to begin after epoch one', () => {
+    const dir = stateDir()
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ epoch: 2 }))).toThrow('epoch one transition one')
+  })
+
   it('authenticates monotonic admissions and chooses the newest complete receipt chain', () => {
     const dir = stateDir()
     appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
@@ -30,7 +36,7 @@ describe('append-only lifecycle authority receipts', () => {
   })
 
   it.each([
-    ['sessionId', 'session-b'], ['allowPublication', true], ['maxIterations', 65],
+    ['epoch', 2], ['sessionId', 'session-b'], ['allowPublication', true], ['maxIterations', 65],
     ['maxRepairCycles', 4], ['maxTransitions', 17], ['transitions', 2],
     ['issuedAt', 999], ['expiresAt', 86_401_001], ['revokedAt', 2_000],
   ] as const)('fails closed when signed authority field %s is tampered', (field, replacement) => {
@@ -79,11 +85,29 @@ describe('append-only lifecycle authority receipts', () => {
     }
   })
 
-  it('does not reinterpret a modern run with a missing head as legacy', () => {
+  it('reconstructs a missing local head only from the exact external high-water anchor', () => {
     const dir = stateDir()
     appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions: 2 }))
+    const headPath = join(dir, 'lifecycle-authority-head.json')
+    unlinkSync(headPath)
+    expect(inspectLifecycleAuthority(dir, 'run-a')).toMatchObject({ status: 'valid', sequence: 2 })
+    expect(existsSync(headPath)).toBe(true)
+  })
+
+  it('never lets repeated headless mature-chain inspection create its own trust anchor', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions: 2 }))
+    const anchorDir = lifecycleAuthorityAnchorDirectory(dir, 'run-a')
+    rmSync(anchorDir, { recursive: true, force: true })
     unlinkSync(join(dir, 'lifecycle-authority-head.json'))
-    expect(inspectLifecycleAuthority(dir, 'run-a')).toMatchObject({ status: 'invalid', reason: expect.stringContaining('head') })
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      expect(inspectLifecycleAuthority(dir, 'run-a')).toMatchObject({
+        status: 'invalid', reason: expect.stringContaining('pre-existing external high-water'),
+      })
+      expect(existsSync(anchorDir)).toBe(false)
+    }
   })
 
   it('accepts a direct-human renewal with the exact same TTL and transition delta zero', () => {
@@ -169,6 +193,70 @@ describe('append-only lifecycle authority receipts', () => {
     expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({
       issuedAt: 90_000_000, expiresAt: 176_400_000,
     }))).toThrow('revoked by direct human stop')
+  })
+
+  it('records one bounded budget epoch rollover only after the authenticated prior epoch is exhausted', () => {
+    const dir = stateDir()
+    const exhausted = authority({ transitions: 16 })
+    for (let transitions = 1; transitions <= exhausted.transitions; transitions += 1) {
+      appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions }))
+    }
+    const renewed = authority({ epoch: 2, transitions: 0, issuedAt: 90_000_000, expiresAt: 176_400_000 })
+    appendLifecycleAuthorityReceipt(dir, 'run-a', renewed)
+    appendLifecycleAuthorityReceipt(dir, 'run-a', { ...renewed, transitions: 1 })
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({
+      sequence: 18, authority: { epoch: 2, transitions: 1, issuedAt: 90_000_000, expiresAt: 176_400_000 },
+    })
+  })
+
+  it.each([
+    ['before exhaustion', authority({ transitions: 15 }), authority({ epoch: 2, transitions: 0, issuedAt: 90_000_000, expiresAt: 176_400_000 })],
+    ['with a skipped epoch', authority({ transitions: 16 }), authority({ epoch: 3, transitions: 0, issuedAt: 90_000_000, expiresAt: 176_400_000 })],
+    ['with inherited consumption', authority({ transitions: 16 }), authority({ epoch: 2, transitions: 1, issuedAt: 90_000_000, expiresAt: 176_400_000 })],
+  ] as const)('rejects budget epoch rollover %s', (_label, before, after) => {
+    const dir = stateDir()
+    for (let transitions = 1; transitions <= before.transitions; transitions += 1) {
+      appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions }))
+    }
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', after)).toThrow('not monotonic')
+  })
+
+  it('repairs one fully authenticated receipt persisted before its monotonic head', () => {
+    const dir = stateDir()
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority(), {
+      afterReceipt: () => { throw new Error('crash after receipt') },
+    })).toThrow('crash after receipt')
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({ sequence: 1, authority: { transitions: 1 } })
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions: 2 }))
+    expect(() => appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions: 3 }), {
+      afterReceipt: () => { throw new Error('crash after receipt') },
+    })).toThrow('crash after receipt')
+    expect(readAuthenticatedLifecycleAuthority(dir, 'run-a')).toMatchObject({ sequence: 3, authority: { transitions: 3 } })
+  })
+
+  it('rejects coordinated restoration of an older valid local head and receipt prefix', () => {
+    const dir = stateDir()
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority())
+    const oldHead = readFileSync(join(dir, 'lifecycle-authority-head.json'), 'utf8')
+    appendLifecycleAuthorityReceipt(dir, 'run-a', authority({ transitions: 2 }))
+    writeFileSync(join(dir, 'lifecycle-authority-head.json'), oldHead)
+    unlinkSync(join(dir, 'lifecycle-authority', 'authority-000002.json'))
+    expect(inspectLifecycleAuthority(dir, 'run-a')).toMatchObject({
+      status: 'invalid', reason: expect.stringContaining('external lifecycle authority anchor detected receipt-chain rollback'),
+    })
+  })
+
+  it('makes each run anchor append-only and rejects a same-sequence fork', () => {
+    const dir = stateDir()
+    expect(reconcileLifecycleAuthorityAnchor(dir, 'run-anchor', 1, 'a'.repeat(64))).toMatchObject({ status: 'valid', relation: 'created' })
+    expect(reconcileLifecycleAuthorityAnchor(dir, 'run-anchor', 1, 'a'.repeat(64))).toMatchObject({ status: 'valid', relation: 'equal' })
+    expect(reconcileLifecycleAuthorityAnchor(dir, 'run-anchor', 1, 'b'.repeat(64))).toMatchObject({
+      status: 'invalid', reason: expect.stringContaining('rollback or fork'),
+    })
+    expect(reconcileLifecycleAuthorityAnchor(dir, 'run-anchor', 2, 'c'.repeat(64))).toMatchObject({ status: 'valid', relation: 'advanced' })
+    expect(reconcileLifecycleAuthorityAnchor(dir, 'run-anchor', 1, 'a'.repeat(64))).toMatchObject({
+      status: 'invalid', reason: expect.stringContaining('rollback or fork'),
+    })
   })
 
   it('records a bounded direct-human TTL renewal and then admits the next transition', () => {
