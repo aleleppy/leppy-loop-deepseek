@@ -854,11 +854,13 @@ describe('grant-validated background controller tool', () => {
     expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ transitions: 5 })
   })
 
-  it('reuses persisted authority once when the installed controller gains legacy non-empty baseline recovery', async () => {
+  it.each([
+    ['missing manifest', 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'],
+    ['three-addition search', 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'],
+  ] as const)('reuses persisted authority once when the installed controller supersedes %s recovery', async (_label, detail) => {
     const owner = agent('ignored-baseline-owner')
     const stalled = controller({
-      autoRecoveryBlocked: true,
-      detail: 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline',
+      autoRecoveryBlocked: true, detail,
       lifecycleAuthority: {
         sessionId: 'ignored-baseline-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
         maxTransitions: 16, transitions: 5, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,

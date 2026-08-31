@@ -57,10 +57,13 @@ async function reconcile(repo: ReturnType<typeof fixture>, digest: string, hooks
 }
 
 describe('authenticated ignored artifact recovery', () => {
-  it('recognizes only the exact pre-subset capability failure', () => {
-    const detail = 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'
-    expect(workerIgnoredBaselineRecovery(detail)).toBe(true)
-    expect(workerIgnoredBaselineRecovery(`prefix: ${detail}`)).toBe(false)
+  it('recognizes only exact superseded legacy capability failures', () => {
+    const missing = 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'
+    const threeAddition = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'
+    expect(workerIgnoredBaselineRecovery(missing)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(threeAddition)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(`prefix: ${missing}`)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 100 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(undefined)).toBe(false)
   })
 
@@ -253,6 +256,19 @@ describe('authenticated ignored artifact recovery', () => {
     expect(existsSync(added)).toBe(false)
     expect(readFileSync(join(inferred.quarantine!, 'ignored', 'worker-output.txt'), 'utf8')).toBe('worker\n')
 
+    const fourOutputs = fixture()
+    const fourPreserved = writeIgnored(fourOutputs.root, 'pre-existing.txt', 'preserve\n')
+    const fourRecorded = await baseline(fourOutputs)
+    rmSync(join(fourOutputs.stateDir, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    const generated = Array.from({ length: 4 }, (_value, index) => writeIgnored(fourOutputs.root, `worker-output-${index}.txt`, `worker-${index}\n`))
+    const inferredFour = await reconcile(fourOutputs, fourRecorded.digest)
+    expect(inferredFour).toMatchObject({
+      basis: 'authenticated-subset-digest',
+      paths: ['ignored/worker-output-0.txt', 'ignored/worker-output-1.txt', 'ignored/worker-output-2.txt', 'ignored/worker-output-3.txt'],
+    })
+    expect(readFileSync(fourPreserved, 'utf8')).toBe('preserve\n')
+    expect(generated.every(path => !existsSync(path))).toBe(true)
+
     const unmatched = fixture()
     writeIgnored(unmatched.root, 'unknown.txt', 'preserve\n')
     const unknownDigest = createHash('sha256').update('unknown baseline').digest('hex')
@@ -313,6 +329,30 @@ describe('authenticated ignored artifact recovery', () => {
     const recovered = await reconcile(repo, recorded.digest)
     expect(recovered).toMatchObject({ basis: 'authenticated-subset-digest', paths: ['ignored/worker-output.txt'] })
     expect(readFileSync(existing, 'utf8')).toBe('before\n')
+  })
+
+  it('exhausts four removals for the complete predecessor-error entry envelope', async () => {
+    const repo = fixture()
+    for (let index = 0; index < 39; index += 1) {
+      writeIgnored(repo.root, `wide/${String(index).padStart(2, '0')}.txt`, `${index}\n`)
+    }
+    const unknownDigest = createHash('sha256').update('unmatched predecessor baseline').digest('hex')
+
+    await expect(reconcile(repo, unknownDigest)).rejects.toThrow('within 4 additions and 92170 candidates')
+    expect(existsSync(join(repo.stateDir, 'worker-ignored-path-baselines', '0-1.json'))).toBe(false)
+    expect(existsSync(join(repo.stateDir, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
+  }, 30_000)
+
+  it('retains the predecessor work cap outside the exact four-addition bridge envelope', async () => {
+    const repo = fixture()
+    for (let index = 0; index < 40; index += 1) {
+      writeIgnored(repo.root, `wide/${String(index).padStart(2, '0')}.txt`, `${index}\n`)
+    }
+    const unknownDigest = createHash('sha256').update('unmatched wide predecessor baseline').digest('hex')
+
+    await expect(reconcile(repo, unknownDigest)).rejects.toThrow('exceeds 10000 authenticated candidates')
+    expect(existsSync(join(repo.stateDir, 'worker-ignored-path-baselines', '0-1.json'))).toBe(false)
+    expect(existsSync(join(repo.stateDir, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
   })
 
   it('rejects legacy subset inference before combinatorial work exceeds its entry budget', async () => {

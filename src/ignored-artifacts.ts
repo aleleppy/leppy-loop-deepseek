@@ -11,15 +11,24 @@ const BASELINES = 'worker-ignored-path-baselines'
 const RECOVERIES = 'worker-ignored-path-recovery'
 const QUARANTINES = 'worker-ignored-path-quarantine'
 const LEGACY_SUBSET_MAX_ENTRIES = 128
-const LEGACY_SUBSET_MAX_ADDITIONS = 3
-const LEGACY_SUBSET_MAX_CANDIDATES = 10_000
-const LEGACY_SUBSET_MAX_FINGERPRINT_CHARS = 128 * 1024
+const LEGACY_SUBSET_THREE_ADDITIONS = 3
+const LEGACY_SUBSET_THREE_CANDIDATES = 10_000
+const LEGACY_SUBSET_FOUR_ADDITIONS = 4
+const LEGACY_SUBSET_FOUR_ENTRY_ENVELOPE = 39
+// The superseded 3-addition/10,000-candidate search could emit its terminal no-match
+// detail only for at most 39 entries. Exhausting removals 1..4 for 39 entries costs
+// 92,170 candidates, so this cap completely covers every state admitted by that
+// exact capability bridge. Wider snapshots retain the predecessor's smaller bounds.
+const LEGACY_SUBSET_FOUR_CANDIDATES = 100_000
+const LEGACY_SUBSET_MAX_FINGERPRINT_BYTES = 128 * 1024
+const LEGACY_SUBSET_MAX_HASHED_BYTES = 512 * 1024 * 1024
 export const EMPTY_IGNORED_PATHS_DIGEST = createHash('sha256').update(JSON.stringify([])).digest('hex')
 const LEGACY_BASELINE_MISSING_DETAIL = 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'
+const LEGACY_SUBSET_THREE_ADDITION_DETAIL = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'
 
-/** One bounded capability transition from the pre-subset legacy recovery failure. */
+/** One bounded capability transition from a superseded legacy recovery failure. */
 export function workerIgnoredBaselineRecovery(detail: string | undefined): boolean {
-  return detail === LEGACY_BASELINE_MISSING_DETAIL
+  return detail === LEGACY_BASELINE_MISSING_DETAIL || detail === LEGACY_SUBSET_THREE_ADDITION_DETAIL
 }
 
 type Baseline = {
@@ -180,21 +189,30 @@ async function inferLegacyBaselineSubset(entries: readonly string[], expectedDig
   if (entries.length > LEGACY_SUBSET_MAX_ENTRIES) {
     throw new Error(`legacy ignored baseline inference exceeds ${LEGACY_SUBSET_MAX_ENTRIES} current entries`)
   }
-  const fingerprintChars = entries.reduce((total, entry) => total + entry.length, 0)
-  if (fingerprintChars > LEGACY_SUBSET_MAX_FINGERPRINT_CHARS) {
-    throw new Error(`legacy ignored baseline inference exceeds ${LEGACY_SUBSET_MAX_FINGERPRINT_CHARS} fingerprint characters`)
+  const fingerprintBytes = entries.reduce((total, entry) => total + Buffer.byteLength(entry, 'utf8'), 0)
+  if (fingerprintBytes > LEGACY_SUBSET_MAX_FINGERPRINT_BYTES) {
+    throw new Error(`legacy ignored baseline inference exceeds ${LEGACY_SUBSET_MAX_FINGERPRINT_BYTES} UTF-8 fingerprint bytes`)
   }
   if (fingerprintDigest(entries) === expectedDigest) return entries
+  const expanded = entries.length <= LEGACY_SUBSET_FOUR_ENTRY_ENVELOPE
+  const maxAdditions = expanded ? LEGACY_SUBSET_FOUR_ADDITIONS : LEGACY_SUBSET_THREE_ADDITIONS
+  const maxCandidates = expanded ? LEGACY_SUBSET_FOUR_CANDIDATES : LEGACY_SUBSET_THREE_CANDIDATES
   let examined = 0
+  let hashedBytes = 0
   let match: readonly string[] | undefined
   const removed = new Set<number>()
   const evaluate = async (): Promise<void> => {
     examined += 1
-    if (examined > LEGACY_SUBSET_MAX_CANDIDATES) {
-      throw new Error(`legacy ignored baseline inference exceeds ${LEGACY_SUBSET_MAX_CANDIDATES} authenticated candidates`)
+    if (examined > maxCandidates) {
+      throw new Error(`legacy ignored baseline inference exceeds ${maxCandidates} authenticated candidates`)
     }
     const candidate = entries.filter((_entry, index) => !removed.has(index))
-    if (fingerprintDigest(candidate) === expectedDigest) match = candidate
+    const serialized = JSON.stringify(candidate)
+    hashedBytes += Buffer.byteLength(serialized, 'utf8')
+    if (hashedBytes > LEGACY_SUBSET_MAX_HASHED_BYTES) {
+      throw new Error(`legacy ignored baseline inference exceeds ${LEGACY_SUBSET_MAX_HASHED_BYTES} cumulative hashed bytes`)
+    }
+    if (createHash('sha256').update(serialized).digest('hex') === expectedDigest) match = candidate
     if (examined % 128 === 0) await new Promise<void>(resolveYield => { setImmediate(resolveYield) })
   }
   const search = async (start: number, remaining: number): Promise<void> => {
@@ -206,10 +224,12 @@ async function inferLegacyBaselineSubset(entries: readonly string[], expectedDig
       removed.delete(index)
     }
   }
-  for (let additions = 1; additions <= Math.min(LEGACY_SUBSET_MAX_ADDITIONS, entries.length) && !match; additions += 1) {
+  for (let additions = 1; additions <= Math.min(maxAdditions, entries.length) && !match; additions += 1) {
     await search(0, additions)
   }
-  if (!match) throw new Error('worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints')
+  if (!match) {
+    throw new Error(`worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints within ${maxAdditions} additions and ${examined} candidates`)
+  }
   return match
 }
 

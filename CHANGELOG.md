@@ -2,6 +2,14 @@
 
 All notable changes are documented here.
 
+## [0.3.27] - 2026-08-31
+
+### Fixed
+
+- The exact `0.3.26` terminal legacy-baseline inference failure receives one capability-changed continuation under its already persisted lifecycle authority. Because that predecessor could emit the terminal no-match detail only after exhausting removals one through three within 10,000 candidates, it proves a maximum of 39 current fingerprints. The migration therefore exhaustively tests a fourth removal only inside that authenticated envelope: 92,170 total candidates at 39 entries, below its 100,000 cap. Wider snapshots retain the predecessor's three-removal/10,000-candidate bounds, and prefixed, suffixed, current, or unrelated errors cannot use the bridge.
+- Legacy subset work is now also bounded by actual UTF-8 volume: current fingerprints may total at most 128 KiB and candidate serialization/hashing aborts above 512 MiB cumulatively. Search still yields every 128 candidates. Any limit, mismatch, changed baseline, identity race, or no-match result remains fail-closed before a baseline receipt, recovery transaction, quarantine move, verifier, or worker starts.
+- Regressions exercise four generated ignored outputs through unit and committed-candidate recovery, preserve pre-existing ignored WIP, quarantine only the exact digest-proven complement, and release only the isolated verifier. Boundary tests enumerate the full 39-entry predecessor envelope, retain the old cap at 40 entries, and assert neither failure creates baseline or recovery receipts.
+
 ## [0.3.26] - 2026-08-30
 
 ### Fixed
