@@ -1064,7 +1064,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         const reconciled = await reconcileWorkerIgnoredPaths({
           worktree: state.worktree, stateDir, runId: state.runId,
           taskKey: active.taskKey, taskIndex: active.taskIndex, attempt: active.attempt,
-          expectedBaselineDigest: active.ignoredPathsDigest,
+          expectedBaselineDigest: active.ignoredPathsDigest, legacyBaseHead: active.baseHead,
           ...(active.ignoredArtifactTransaction ? { expectedTransaction: active.ignoredArtifactTransaction } : {}),
           key: createLeaseKey(stateDir),
           onTransactionPrepared: async transaction => {

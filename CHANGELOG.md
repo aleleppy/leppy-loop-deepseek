@@ -2,6 +2,15 @@
 
 All notable changes are documented here.
 
+## [0.3.29] - 2026-08-31
+
+### Fixed
+
+- Legacy ignored-baseline inference now augments current ignored fingerprints only with exact paths that became Git additions since the authenticated active-attempt `baseHead` and remain ignored under `git check-ignore --no-index`. Current bytes/type/path must reconstruct the authenticated SHA-256 baseline digest exactly; ordinary tracked additions are excluded. A second full ignored-plus-promotion snapshot must remain identical before the signed inferred receipt, and post-receipt retries revalidate inferred tracked promotions by fingerprint and filesystem identity.
+- The exact predecessor four-addition terminal receives one persisted-authority capability transition only when its canonical candidate count equals a complete one-through-four removal total for 0..39 entries. Leading-zero, unsafe, impossible, current promotion-aware, prefixed and suffixed diagnostics remain rejected. New no-match errors identify promotion-aware inference and cannot replay this bridge.
+- Promotion discovery is capped at 128 added paths. Promoted file content is capped independently at 512 MiB per snapshot/retry and hashed as a stream after metadata preflight, with growth and exact byte-count checks. Oversized, mutated, raced, ordinary tracked, hardlinked or unmatched state fails before a baseline receipt, recovery transaction, quarantine move or verifier.
+- Regression coverage reproduces the live two-fingerprint/three-candidate predecessor condition, exact unchanged force-add promotion plus four generated ignored outputs, modern-versus-legacy promotion policy, ordinary tracked filtering, mutation and identity races, crash after inferred receipt, and sparse oversized files. The runner quarantines only digest-proven generated outputs before releasing one isolated verifier.
+
 ## [0.3.28] - 2026-08-31
 
 ### Fixed

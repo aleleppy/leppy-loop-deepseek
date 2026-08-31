@@ -402,8 +402,8 @@ describe('controller state machine', () => {
     expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'attempt-12.log'), 'utf8')).toBe('legacy worker output\n')
   }, 90_000)
 
-  it('recovers a committed legacy attempt after four ignored additions from an authenticated non-empty subset', async () => {
-    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
+  it('recovers a committed legacy attempt with an exact tracked promotion plus four ignored additions', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt,ignored-worker-output/pre-existing.env | Done: implementation committed\n')
     writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
     git(repo.root, 'add', '--', '.gitignore')
     git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
@@ -422,6 +422,7 @@ describe('controller state machine', () => {
     const baseHead = git(first.worktree!, 'rev-parse', 'HEAD')
     writeFileSync(join(first.worktree!, 'src', 'value.txt'), 'committed candidate\n')
     git(first.worktree!, 'add', '--', 'src/value.txt')
+    git(first.worktree!, 'add', '-f', '--', 'ignored-worker-output/pre-existing.env')
     git(first.worktree!, 'commit', '-m', 'feat: committed legacy candidate')
     state.activeTaskAttempt = {
       schemaVersion: 1,
@@ -456,7 +457,10 @@ describe('controller state machine', () => {
     expect(verifierCalls).toBe(1)
     expect(readFileSync(preserved, 'utf8')).toBe('pre-existing ignored WIP\n')
     const baselineReceipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-baselines', `0-${state.attempt}.json`), 'utf8'))
-    expect(baselineReceipt).toMatchObject({ basis: 'authenticated-subset-digest', digest: authenticatedBaseline.digest })
+    expect(baselineReceipt).toMatchObject({
+      basis: 'authenticated-subset-digest', digest: authenticatedBaseline.digest,
+      entries: [{ path: 'ignored-worker-output/pre-existing.env' }],
+    })
     const receipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`), 'utf8'))
     for (let index = 0; index < 4; index += 1) {
       expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', `worker-report-${index}.json`), 'utf8')).toBe(`{"worker":${index}}\n`)

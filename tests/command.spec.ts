@@ -887,6 +887,7 @@ describe('grant-validated background controller tool', () => {
     ['missing manifest', 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'],
     ['three-addition search', 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'],
     ['whitespace-normalized three-addition search', '\r\n worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints\t'],
+    ['ignored-only four-addition search', 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints within 4 additions and 3 candidates'],
   ] as const)('status then reuses persisted authority once when the installed controller supersedes %s recovery', async (_label, detail) => {
     const owner = agent('ignored-baseline-owner')
     const updatedAt = Date.now() - 30_000
@@ -930,12 +931,12 @@ describe('grant-validated background controller tool', () => {
     })).rejects.toThrow('[condition=a8c80a08d394598c; bytes=101; activeAttempt=no]')
 
     const nearMatch = controller({
-      autoRecoveryBlocked: true, detail: `${exact} within 4 additions and 92170 candidates`,
+      autoRecoveryBlocked: true, detail: `${exact} after exact newly tracked promotion inference within 4 additions and 3 candidates`,
       updatedAt: new Date(updatedAt).toISOString(), activeTaskAttempt: activeAttempt(), lifecycleAuthority: authority,
     })
     await expect(executeLeppyLoopControl(context(), runtime({ inspectControllers: async () => [nearMatch] }), owner, {
       operation: 'continue', runId: nearMatch.runId, tasks: nearMatch.checklistRelative, syncBranch: nearMatch.syncBranch,
-    })).rejects.toThrow(/\[condition=[0-9a-f]{16}; bytes=141; activeAttempt=yes\]/u)
+    })).rejects.toThrow(/\[condition=[0-9a-f]{16}; bytes=183; activeAttempt=yes\]/u)
 
     const multibyte = controller({
       autoRecoveryBlocked: true, detail: 'falha ç', updatedAt: new Date(updatedAt).toISOString(),
