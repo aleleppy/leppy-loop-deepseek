@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { createEmbeddedRunStateProof, inspectRunStateProof, persistRunStateProof } from '../src/run-state-proof.js'
 import type { RunStateProofInput } from '../src/run-state-proof.js'
-import { acquireLock, createLeaseKey, signLease, verifyLease } from '../src/state.js'
+import { acquireLock, createLeaseKey, requireFoundProcessIdentity, signLease, verifyLease } from '../src/state.js'
 import type { ActiveTaskAttempt, PendingTaskValidation } from '../src/types.js'
 
 describe('authenticated leases', () => {
@@ -14,6 +14,12 @@ describe('authenticated leases', () => {
     const lease = signLease({ schemaVersion: 1, runId: 'r', taskIndex: 2, attempt: 1, pid: 42, processStart: 'start-a', heartbeat: new Date().toISOString() }, key)
     expect(verifyLease(lease, key)).toBe(true)
     expect(verifyLease({ ...lease, payload: { ...lease.payload, processStart: 'start-b' } }, key)).toBe(false)
+  })
+
+  it('requires a real OS process identity before a worker host may sign its lease', () => {
+    expect(requireFoundProcessIdentity({ status: 'found', identity: 'os-start' }, 'worker host')).toBe('os-start')
+    expect(() => requireFoundProcessIdentity({ status: 'error', detail: 'transient probe failure' }, 'worker host')).toThrow('transient probe failure')
+    expect(() => requireFoundProcessIdentity({ status: 'absent' }, 'worker host')).toThrow('definitively absent')
   })
 })
 

@@ -168,21 +168,56 @@ export function verifyLease(lease: SignedLease, key: Buffer): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected)
 }
 
-export async function processIdentity(pid: number): Promise<string | undefined> {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined
+export type ProcessIdentityInspection =
+  | { status: 'found'; identity: string }
+  | { status: 'absent' }
+  | { status: 'error'; detail: string }
+
+export async function inspectProcessIdentity(pid: number): Promise<ProcessIdentityInspection> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { status: 'error', detail: 'process ID is invalid' }
   if (process.platform === 'linux') {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
-      return stat.split(' ')[21]
-    } catch { return undefined }
+      const identity = stat.split(' ')[21]
+      return identity ? { status: 'found', identity } : { status: 'error', detail: 'process stat lacks start identity' }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      return code === 'ENOENT' || code === 'ESRCH'
+        ? { status: 'absent' }
+        : { status: 'error', detail: `process stat inspection failed: ${code ?? 'unknown'}` }
+    }
   }
   if (process.platform === 'win32') {
-    const script = `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`
+    const script = `$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue;if($null -eq $p){Write-Output 'ABSENT';exit 0};try{Write-Output ('FOUND:'+$p.StartTime.ToUniversalTime().Ticks)}catch{Write-Error $_;exit 4}`
     const result = await runFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { allowFailure: true })
-    return result.exitCode === 0 ? result.stdout.trim() : undefined
+    if (result.exitCode !== 0) return { status: 'error', detail: `PowerShell process inspection failed: exit ${result.exitCode}` }
+    const output = result.stdout.trim()
+    if (output === 'ABSENT') return { status: 'absent' }
+    if (output.startsWith('FOUND:') && output.length > 'FOUND:'.length) {
+      return { status: 'found', identity: output.slice('FOUND:'.length) }
+    }
+    return { status: 'error', detail: 'PowerShell process inspection returned an invalid record' }
   }
   const result = await runFile('ps', ['-o', 'lstart=', '-p', String(pid)], { allowFailure: true })
-  return result.exitCode === 0 ? result.stdout.trim() : undefined
+  if (result.exitCode === 0 && result.stdout.trim() !== '') return { status: 'found', identity: result.stdout.trim() }
+  try {
+    process.kill(pid, 0)
+    return { status: 'error', detail: `ps inspection failed for a process that still exists: exit ${result.exitCode}` }
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH'
+      ? { status: 'absent' }
+      : { status: 'error', detail: `process existence inspection failed: ${(error as NodeJS.ErrnoException).code ?? 'unknown'}` }
+  }
+}
+
+export function requireFoundProcessIdentity(inspection: ProcessIdentityInspection, label: string): string {
+  if (inspection.status === 'found') return inspection.identity
+  throw new Error(`${label}: ${inspection.status === 'error' ? inspection.detail : 'process is definitively absent'}`)
+}
+
+export async function processIdentity(pid: number): Promise<string | undefined> {
+  const inspection = await inspectProcessIdentity(pid)
+  return inspection.status === 'found' ? inspection.identity : undefined
 }
 
 export function statePath(base: string, runId: string): string {

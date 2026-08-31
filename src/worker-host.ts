@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path'
 import { readFileSync } from 'node:fs'
 import { Context } from '@deepseek-ai/cordis'
 import { LocalSubprocessRuntime } from '@deepseek-ai/dsh-subprocess-local'
-import { atomicWriteJson, processIdentity, signLease } from './state.js'
+import { atomicWriteJson, inspectProcessIdentity, requireFoundProcessIdentity, signLease } from './state.js'
 import type { LeasePayload } from './state.js'
 
 const require = createRequire(import.meta.url)
@@ -20,6 +20,9 @@ async function main(): Promise<void> {
   const manifest = JSON.parse(readFileSync(packageJson, 'utf8')) as { bin: Record<string, string> }
   const runtimeBin = join(packageDir, manifest.bin['dsh-jsonrpc-agent']!)
   const config = required('LEPPY_WORKER_CONFIG')
+  const processStart = requireFoundProcessIdentity(
+    await inspectProcessIdentity(process.pid), 'cannot authenticate worker host process identity',
+  )
   const context = new Context()
   const fiber = await context.plugin(LocalSubprocessRuntime)
   const runtime = context.subprocess
@@ -30,7 +33,6 @@ async function main(): Promise<void> {
     stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
     graceMs: 3_000,
   })
-  const processStart = await processIdentity(process.pid) ?? String(Date.now() - Math.floor(process.uptime() * 1000))
   const base: LeasePayload = { schemaVersion: 1, runId, taskIndex, attempt, pid: process.pid, processStart, heartbeat: new Date().toISOString() }
   const heartbeat = (): void => atomicWriteJson(leasePath, signLease({ ...base, heartbeat: new Date().toISOString() }, key))
   heartbeat()

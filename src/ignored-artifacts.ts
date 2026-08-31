@@ -10,7 +10,17 @@ import type { IgnoredArtifactTransactionRef } from './types.js'
 const BASELINES = 'worker-ignored-path-baselines'
 const RECOVERIES = 'worker-ignored-path-recovery'
 const QUARANTINES = 'worker-ignored-path-quarantine'
+const LEGACY_SUBSET_MAX_ENTRIES = 128
+const LEGACY_SUBSET_MAX_ADDITIONS = 3
+const LEGACY_SUBSET_MAX_CANDIDATES = 10_000
+const LEGACY_SUBSET_MAX_FINGERPRINT_CHARS = 128 * 1024
 export const EMPTY_IGNORED_PATHS_DIGEST = createHash('sha256').update(JSON.stringify([])).digest('hex')
+const LEGACY_BASELINE_MISSING_DETAIL = 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'
+
+/** One bounded capability transition from the pre-subset legacy recovery failure. */
+export function workerIgnoredBaselineRecovery(detail: string | undefined): boolean {
+  return detail === LEGACY_BASELINE_MISSING_DETAIL
+}
 
 type Baseline = {
   schemaVersion: 1
@@ -20,7 +30,7 @@ type Baseline = {
   attempt: number
   digest: string
   entries: readonly BaselineEntry[]
-  basis: 'recorded' | 'authenticated-empty-digest'
+  basis: 'recorded' | 'authenticated-empty-digest' | 'authenticated-subset-digest'
   proof: string
 }
 
@@ -109,7 +119,8 @@ function validBaseline(value: unknown, key: Buffer): value is Baseline {
     && Array.isArray(baseline.entries) && baseline.entries.length <= 100_000 && baseline.entries.every(validBaselineEntry)
     && baseline.entries.every((entry, index) => index === 0 || baseline.entries![index - 1]!.path < entry.path)
     && createHash('sha256').update(JSON.stringify(baseline.entries.map(entry => entry.fingerprint))).digest('hex') === baseline.digest
-    && (baseline.basis === 'recorded' || baseline.basis === 'authenticated-empty-digest')
+    && (baseline.basis === 'recorded' || baseline.basis === 'authenticated-empty-digest'
+      || baseline.basis === 'authenticated-subset-digest')
     && validProof(value as Record<string, unknown>, key)
 }
 
@@ -159,6 +170,47 @@ function recoveryPath(stateDir: string, taskIndex: number, attempt: number): str
 
 function entryPath(fingerprint: string): string {
   return fingerprint.slice(0, fingerprint.indexOf('\0'))
+}
+
+function fingerprintDigest(entries: readonly string[]): string {
+  return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
+}
+
+async function inferLegacyBaselineSubset(entries: readonly string[], expectedDigest: string): Promise<readonly string[]> {
+  if (entries.length > LEGACY_SUBSET_MAX_ENTRIES) {
+    throw new Error(`legacy ignored baseline inference exceeds ${LEGACY_SUBSET_MAX_ENTRIES} current entries`)
+  }
+  const fingerprintChars = entries.reduce((total, entry) => total + entry.length, 0)
+  if (fingerprintChars > LEGACY_SUBSET_MAX_FINGERPRINT_CHARS) {
+    throw new Error(`legacy ignored baseline inference exceeds ${LEGACY_SUBSET_MAX_FINGERPRINT_CHARS} fingerprint characters`)
+  }
+  if (fingerprintDigest(entries) === expectedDigest) return entries
+  let examined = 0
+  let match: readonly string[] | undefined
+  const removed = new Set<number>()
+  const evaluate = async (): Promise<void> => {
+    examined += 1
+    if (examined > LEGACY_SUBSET_MAX_CANDIDATES) {
+      throw new Error(`legacy ignored baseline inference exceeds ${LEGACY_SUBSET_MAX_CANDIDATES} authenticated candidates`)
+    }
+    const candidate = entries.filter((_entry, index) => !removed.has(index))
+    if (fingerprintDigest(candidate) === expectedDigest) match = candidate
+    if (examined % 128 === 0) await new Promise<void>(resolveYield => { setImmediate(resolveYield) })
+  }
+  const search = async (start: number, remaining: number): Promise<void> => {
+    if (match) return
+    if (remaining === 0) { await evaluate(); return }
+    for (let index = start; index <= entries.length - remaining && !match; index += 1) {
+      removed.add(index)
+      await search(index + 1, remaining - 1)
+      removed.delete(index)
+    }
+  }
+  for (let additions = 1; additions <= Math.min(LEGACY_SUBSET_MAX_ADDITIONS, entries.length) && !match; additions += 1) {
+    await search(0, additions)
+  }
+  if (!match) throw new Error('worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints')
+  return match
 }
 
 function fingerprintAt(path: string, absolute: string): string {
@@ -277,6 +329,8 @@ export async function reconcileWorkerIgnoredPaths(options: {
   expectedTransaction?: IgnoredArtifactTransactionRef
   key: Buffer
   onTransactionPrepared?: (transaction: IgnoredArtifactTransactionRef) => Promise<void>
+  afterLegacySnapshot?: () => Promise<void>
+  afterLegacyBaselinePersisted?: () => Promise<void>
   afterReceiptPrepared?: () => Promise<void>
   afterEntryQuarantined?: (index: number) => Promise<void>
 }): Promise<{ digest: string; quarantine?: string; paths: readonly string[]; resumed: boolean; basis: Baseline['basis'] }> {
@@ -284,23 +338,51 @@ export async function reconcileWorkerIgnoredPaths(options: {
   const stateDir = realpathSync(options.stateDir)
   if (inside(worktree, stateDir)) throw new Error('worker ignored quarantine state must be outside the worktree')
   const baselineFile = baselinePath(stateDir, options.taskIndex, options.attempt)
+  const receiptFile = recoveryPath(stateDir, options.taskIndex, options.attempt)
   let baseline = readSigned(baselineFile, options.key, validBaseline, 'worker ignored baseline')
-  if (!baseline) {
-    if (options.expectedBaselineDigest !== EMPTY_IGNORED_PATHS_DIGEST) {
-      throw new Error('worker ignored artifact recovery lacks its authenticated pre-attempt baseline')
+  if (baseline?.basis === 'authenticated-subset-digest' && !options.expectedTransaction && !entryExists(receiptFile)) {
+    assertBinding(baseline, options)
+    if (baseline.digest !== options.expectedBaselineDigest) {
+      throw new Error('worker ignored baseline digest disagrees with authenticated task state')
     }
-    baseline = sign({
+    try {
+      const current = await ignoredPathSnapshot(worktree)
+      await assertBaselinePreserved(worktree, baseline, current.entries)
+    } catch {
+      baseline = undefined
+    }
+  }
+  if (!baseline) {
+    const current = await ignoredPathSnapshot(worktree)
+    const fingerprints = options.expectedBaselineDigest === EMPTY_IGNORED_PATHS_DIGEST
+      ? [] as readonly string[]
+      : await inferLegacyBaselineSubset(current.entries, options.expectedBaselineDigest)
+    await options.afterLegacySnapshot?.()
+    const entries = fingerprints.map(fingerprint => {
+      const path = entryPath(fingerprint)
+      return { path, fingerprint, identity: identity(resolve(worktree, path)) }
+    })
+    const inferred = sign({
       schemaVersion: 1 as const, runId: options.runId, taskKey: options.taskKey,
       taskIndex: options.taskIndex, attempt: options.attempt,
-      digest: EMPTY_IGNORED_PATHS_DIGEST, entries: [] as readonly BaselineEntry[], basis: 'authenticated-empty-digest' as const,
+      digest: options.expectedBaselineDigest, entries,
+      basis: options.expectedBaselineDigest === EMPTY_IGNORED_PATHS_DIGEST
+        ? 'authenticated-empty-digest' as const : 'authenticated-subset-digest' as const,
     }, options.key)
+    const stable = await ignoredPathSnapshot(worktree)
+    if (stable.entries.length !== current.entries.length
+      || stable.entries.some((entry, index) => entry !== current.entries[index])) {
+      throw new Error('ignored artifacts changed during legacy baseline inference')
+    }
+    await assertBaselinePreserved(worktree, inferred, stable.entries)
+    baseline = inferred
     atomicWriteJson(baselineFile, baseline)
+    await options.afterLegacyBaselinePersisted?.()
   }
   if (!baseline) throw new Error('worker ignored baseline could not be established')
   assertBinding(baseline, options)
   if (baseline.digest !== options.expectedBaselineDigest) throw new Error('worker ignored baseline digest disagrees with authenticated task state')
 
-  const receiptFile = recoveryPath(stateDir, options.taskIndex, options.attempt)
   let recovery = readSigned(receiptFile, options.key, validRecovery, 'worker ignored recovery')
   const resumed = recovery !== undefined
   if (options.expectedTransaction && !recovery) {

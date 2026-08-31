@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
-  EMPTY_IGNORED_PATHS_DIGEST, recordWorkerIgnoredPathBaseline, reconcileWorkerIgnoredPaths,
+  EMPTY_IGNORED_PATHS_DIGEST, recordWorkerIgnoredPathBaseline, reconcileWorkerIgnoredPaths, workerIgnoredBaselineRecovery,
 } from '../src/ignored-artifacts.js'
 import type { IgnoredArtifactTransactionRef } from '../src/types.js'
 
@@ -45,6 +45,8 @@ async function baseline(repo: ReturnType<typeof fixture>) {
 async function reconcile(repo: ReturnType<typeof fixture>, digest: string, hooks: {
   expectedTransaction?: IgnoredArtifactTransactionRef
   onTransactionPrepared?: (transaction: IgnoredArtifactTransactionRef) => Promise<void>
+  afterLegacySnapshot?: () => Promise<void>
+  afterLegacyBaselinePersisted?: () => Promise<void>
   afterReceiptPrepared?: () => Promise<void>
   afterEntryQuarantined?: (index: number) => Promise<void>
 } = {}) {
@@ -55,6 +57,13 @@ async function reconcile(repo: ReturnType<typeof fixture>, digest: string, hooks
 }
 
 describe('authenticated ignored artifact recovery', () => {
+  it('recognizes only the exact pre-subset capability failure', () => {
+    const detail = 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'
+    expect(workerIgnoredBaselineRecovery(detail)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(`prefix: ${detail}`)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(undefined)).toBe(false)
+  })
+
   it('quarantines only baseline-absent files and preserves their bytes', async () => {
     const repo = fixture()
     const before = await baseline(repo)
@@ -226,7 +235,7 @@ describe('authenticated ignored artifact recovery', () => {
     expect(readFileSync(join(quarantined.quarantine!, 'ignored', 'reappeared.txt'), 'utf8')).toBe('first\n')
   })
 
-  it('resumes a legacy active attempt only when its authenticated digest proves an empty baseline', async () => {
+  it('recovers legacy empty and cryptographically provable non-empty baselines', async () => {
     const empty = fixture()
     const source = writeIgnored(empty.root, 'legacy.txt', 'legacy\n')
     const recovered = await reconcile(empty, EMPTY_IGNORED_PATHS_DIGEST)
@@ -234,10 +243,85 @@ describe('authenticated ignored artifact recovery', () => {
     expect(existsSync(source)).toBe(false)
 
     const nonEmpty = fixture()
-    writeIgnored(nonEmpty.root, 'unknown.txt', 'preserve\n')
+    const preserved = writeIgnored(nonEmpty.root, 'pre-existing.txt', 'preserve\n')
+    const recorded = await baseline(nonEmpty)
+    rmSync(join(nonEmpty.stateDir, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    const added = writeIgnored(nonEmpty.root, 'worker-output.txt', 'worker\n')
+    const inferred = await reconcile(nonEmpty, recorded.digest)
+    expect(inferred).toMatchObject({ basis: 'authenticated-subset-digest', paths: ['ignored/worker-output.txt'] })
+    expect(readFileSync(preserved, 'utf8')).toBe('preserve\n')
+    expect(existsSync(added)).toBe(false)
+    expect(readFileSync(join(inferred.quarantine!, 'ignored', 'worker-output.txt'), 'utf8')).toBe('worker\n')
+
+    const unmatched = fixture()
+    writeIgnored(unmatched.root, 'unknown.txt', 'preserve\n')
     const unknownDigest = createHash('sha256').update('unknown baseline').digest('hex')
-    await expect(reconcile(nonEmpty, unknownDigest)).rejects.toThrow('lacks its authenticated pre-attempt baseline')
-    expect(readFileSync(join(nonEmpty.root, 'ignored', 'unknown.txt'), 'utf8')).toBe('preserve\n')
+    await expect(reconcile(unmatched, unknownDigest)).rejects.toThrow('cannot prove its legacy non-empty baseline')
+    expect(readFileSync(join(unmatched.root, 'ignored', 'unknown.txt'), 'utf8')).toBe('preserve\n')
+  })
+
+  it('moves nothing when a legacy non-empty baseline fingerprint changed', async () => {
+    const repo = fixture()
+    const existing = writeIgnored(repo.root, 'pre-existing.txt', 'before\n')
+    const recorded = await baseline(repo)
+    rmSync(join(repo.stateDir, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    writeFileSync(existing, 'changed\n')
+    const added = writeIgnored(repo.root, 'worker-output.txt', 'worker\n')
+
+    await expect(reconcile(repo, recorded.digest)).rejects.toThrow('cannot prove its legacy non-empty baseline')
+    expect(readFileSync(existing, 'utf8')).toBe('changed\n')
+    expect(readFileSync(added, 'utf8')).toBe('worker\n')
+    expect(existsSync(join(repo.stateDir, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
+  })
+
+  it('does not persist a poisoned inferred baseline when files race identity sampling', async () => {
+    const repo = fixture()
+    const existing = writeIgnored(repo.root, 'pre-existing.txt', 'before\n')
+    const recorded = await baseline(repo)
+    rmSync(join(repo.stateDir, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    const added = writeIgnored(repo.root, 'worker-output.txt', 'worker\n')
+
+    await expect(reconcile(repo, recorded.digest, {
+      afterLegacySnapshot: async () => { writeFileSync(existing, 'raced\n') },
+    })).rejects.toThrow('changed during legacy baseline inference')
+    expect(existsSync(join(repo.stateDir, 'worker-ignored-path-baselines', '0-1.json'))).toBe(false)
+    expect(readFileSync(added, 'utf8')).toBe('worker\n')
+
+    writeFileSync(existing, 'before\n')
+    const recovered = await reconcile(repo, recorded.digest)
+    expect(recovered).toMatchObject({ basis: 'authenticated-subset-digest', paths: ['ignored/worker-output.txt'] })
+    expect(readFileSync(existing, 'utf8')).toBe('before\n')
+  })
+
+  it('safely re-infers an inconsistent subset receipt before any transaction exists', async () => {
+    const repo = fixture()
+    const existing = writeIgnored(repo.root, 'pre-existing.txt', 'before\n')
+    const recorded = await baseline(repo)
+    rmSync(join(repo.stateDir, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    writeIgnored(repo.root, 'worker-output.txt', 'worker\n')
+    await expect(reconcile(repo, recorded.digest, {
+      afterLegacyBaselinePersisted: async () => {
+        unlinkSync(existing)
+        writeFileSync(existing, 'raced after persist\n')
+        throw new Error('crash after inferred baseline persisted')
+      },
+    })).rejects.toThrow('crash after inferred baseline persisted')
+    expect(existsSync(join(repo.stateDir, 'worker-ignored-path-baselines', '0-1.json'))).toBe(true)
+
+    unlinkSync(existing)
+    writeFileSync(existing, 'before\n')
+    const recovered = await reconcile(repo, recorded.digest)
+    expect(recovered).toMatchObject({ basis: 'authenticated-subset-digest', paths: ['ignored/worker-output.txt'] })
+    expect(readFileSync(existing, 'utf8')).toBe('before\n')
+  })
+
+  it('rejects legacy subset inference before combinatorial work exceeds its entry budget', async () => {
+    const repo = fixture()
+    for (let index = 0; index < 129; index += 1) writeIgnored(repo.root, `wide/${String(index).padStart(3, '0')}.txt`, `${index}\n`)
+    const unknownDigest = createHash('sha256').update('unmatched wide baseline').digest('hex')
+
+    await expect(reconcile(repo, unknownDigest)).rejects.toThrow('exceeds 128 current entries')
+    expect(existsSync(join(repo.stateDir, 'worker-ignored-path-baselines', '0-1.json'))).toBe(false)
   })
 
   it('rejects hardlinked worker artifacts without moving either link', async () => {

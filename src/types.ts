@@ -281,6 +281,8 @@ export interface RunDependencies {
   defaultModel?: () => Promise<{ provider: string; model: string; effort?: string }>
   publishPullRequest?: (request: PullRequestRequest, signal: AbortSignal, hooks: PublicationHooks) => Promise<PublishedPullRequest>
   onProgress?: (progress: RunProgress) => void | Promise<void>
+  /** Test seam for authenticated worker-lease settlement; production waits for definitive process-identity absence. */
+  awaitAuthenticatedLeaseSettlement?: (stateDir: string, runId: string) => Promise<void>
   /** Test seam for controller-owned npm lock materialization; production uses npm ci with scripts disabled. */
   installNpmDependencies?: (installRoot: string, cacheRoot: string, signal?: AbortSignal) => Promise<void>
   signal?: AbortSignal

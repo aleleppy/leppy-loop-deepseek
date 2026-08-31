@@ -24,6 +24,7 @@ import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import { dependencyHydrationAvailable, dependencyResolutionMiss } from './worktree-dependencies.js'
 import { windowsQuotedExecutableFailure } from './windows-command.js'
 import { workerNpmCacheRecovery } from './worker-artifacts.js'
+import { workerIgnoredBaselineRecovery } from './ignored-artifacts.js'
 import type { LeppyLoopOptions, LifecycleAuthority, RunDependencies, RunProgress, RunResult, WorkerPolicy } from './types.js'
 
 declare module '@deepseek-ai/dsh-commands/types' {
@@ -489,8 +490,9 @@ export async function executeLeppyLoopControl(
   const windowsArgvRepair = args.operation === 'continue' && controller?.autoRecoveryBlocked === true
     && controller.windowsArgvBridgeActive !== true && windowsQuotedExecutableFailure(controller.detail)
   const workerArtifactRepair = args.operation === 'continue' && workerNpmCacheRecovery(controller?.detail)
+  const ignoredBaselineRepair = args.operation === 'continue' && workerIgnoredBaselineRecovery(controller?.detail)
   if (args.operation === 'continue' && controller?.autoRecoveryBlocked === true
-    && !dependencyRepair && !windowsArgvRepair && !workerArtifactRepair
+    && !dependencyRepair && !windowsArgvRepair && !workerArtifactRepair && !ignoredBaselineRepair
     && !livePermits.some(permit => permit.reauthorizedAt > Date.parse(controller.updatedAt))) {
     throw new Error('automatic recovery circuit is open; a fresh direct human /leppy-loop authorization is required before another unchanged attempt')
   }

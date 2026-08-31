@@ -6,7 +6,8 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import * as gitModule from '../src/git.js'
 import { parseChecklist, selectTask } from '../src/checklist.js'
-import { runLeppyLoop } from '../src/runner.js'
+import { awaitAuthenticatedLeaseSettlement, runLeppyLoop } from '../src/runner.js'
+import { createLeaseKey, signLease } from '../src/state.js'
 import { persistRunStateProof } from '../src/run-state-proof.js'
 import { acquireLifecycleAuthorityMutex, appendLifecycleAuthorityReceipt, lifecycleStateDir } from '../src/lifecycle-authority.js'
 import { DEPENDENCY_REPLACEMENT_PENDING_CODE, dependencyResolutionMiss } from '../src/worktree-dependencies.js'
@@ -278,6 +279,48 @@ describe('controller state machine', () => {
     expect(readFileSync(join(stateDir, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
   }, 90_000)
 
+  it('waits fail-closed for a live authenticated lease without killing a reusable PID', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'leppy-live-lease-'))
+    const leaseDir = join(stateDir, 'leases')
+    mkdirSync(leaseDir)
+    const key = createLeaseKey(stateDir)
+    const lease = signLease({
+      schemaVersion: 1, runId: 'lease-run', taskIndex: 0, attempt: 1,
+      pid: 4242, processStart: 'still-live', heartbeat: new Date().toISOString(),
+    }, key)
+    writeFileSync(join(leaseDir, '0-1.json'), `${JSON.stringify(lease)}\n`)
+
+    await expect(awaitAuthenticatedLeaseSettlement(stateDir, 'lease-run', {
+      inspect: async () => ({ status: 'found', identity: 'still-live' }), wait: async () => {}, maxChecks: 2,
+    })).rejects.toThrow('will not terminate a reusable PID')
+
+    let checks = 0
+    await expect(awaitAuthenticatedLeaseSettlement(stateDir, 'lease-run', {
+      inspect: async () => {
+        checks += 1
+        return { status: 'found', identity: checks === 1 ? 'still-live' : 'reused-by-unrelated-process' }
+      },
+      wait: async () => {}, maxChecks: 2,
+    })).resolves.toBeUndefined()
+    expect(checks).toBe(2)
+
+    checks = 0
+    await expect(awaitAuthenticatedLeaseSettlement(stateDir, 'lease-run', {
+      inspect: async () => {
+        checks += 1
+        return checks === 1
+          ? { status: 'error', detail: 'transient inspection failure' }
+          : { status: 'found', identity: 'still-live' }
+      },
+      wait: async () => {}, maxChecks: 2,
+    })).rejects.toThrow('will not terminate a reusable PID')
+
+    await expect(awaitAuthenticatedLeaseSettlement(stateDir, 'lease-run', {
+      inspect: async () => ({ status: 'error', detail: 'persistent inspection failure' }),
+      wait: async () => {}, maxChecks: 2,
+    })).rejects.toThrow('identity inspection failed closed')
+  })
+
   it('quarantines a baseline-absent ignored side effect before verifying and adopting the candidate', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
     writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
@@ -357,6 +400,105 @@ describe('controller state machine', () => {
     const receipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`), 'utf8'))
     expect(receipt).toMatchObject({ phase: 'quarantined' })
     expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'attempt-12.log'), 'utf8')).toBe('legacy worker output\n')
+  }, 90_000)
+
+  it('recovers a committed legacy attempt from an authenticated non-empty ignored subset', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
+    const first = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, runId: () => 'legacysubset01', worker: new FakeWorker([blockedNotRunOutcome('seed legacy state')]) },
+    )
+    const statePath = join(first.stateDir!, 'run.json')
+    const state = JSON.parse(readFileSync(statePath, 'utf8'))
+    const checklistSource = readFileSync(join(first.worktree!, 'tasks.task.md'), 'utf8')
+    const task = selectTask(parseChecklist(checklistSource, join(first.worktree!, 'tasks.task.md')))!
+    mkdirSync(join(first.worktree!, 'ignored-worker-output'), { recursive: true })
+    const preserved = join(first.worktree!, 'ignored-worker-output', 'pre-existing.env')
+    writeFileSync(preserved, 'pre-existing ignored WIP\n')
+    const authenticatedBaseline = await gitModule.ignoredPathSnapshot(first.worktree!)
+    const baseHead = git(first.worktree!, 'rev-parse', 'HEAD')
+    writeFileSync(join(first.worktree!, 'src', 'value.txt'), 'committed candidate\n')
+    git(first.worktree!, 'add', '--', 'src/value.txt')
+    git(first.worktree!, 'commit', '-m', 'feat: committed legacy candidate')
+    state.activeTaskAttempt = {
+      schemaVersion: 1,
+      taskKey: createHash('sha256').update(JSON.stringify({ index: task.index, phase: task.phase, kind: task.kind, raw: task.raw })).digest('hex'),
+      taskIndex: task.index, baseHead,
+      checklistDigest: createHash('sha256').update(checklistSource).digest('hex'),
+      ignoredPathsDigest: authenticatedBaseline.digest,
+      attempt: state.attempt,
+    }
+    delete state.stateProof
+    writeFileSync(statePath, `${JSON.stringify(state)}\n`)
+    persistRunStateProof(first.stateDir!, state, Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64'))
+    rmSync(join(first.stateDir!, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    const output = join(first.worktree!, 'ignored-worker-output', 'worker-report.json')
+    writeFileSync(output, '{"worker":true}\n')
+
+    let verifierCalls = 0
+    const verifier: WorkerAdapter = { async run(request) {
+      verifierCalls += 1
+      expect(request.mode).toBe('verification')
+      expect(existsSync(output)).toBe(false)
+      expect(readFileSync(preserved, 'utf8')).toBe('pre-existing ignored WIP\n')
+      return completedOutcome('candidate independently verified')
+    } }
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker: verifier })
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(verifierCalls).toBe(1)
+    expect(readFileSync(preserved, 'utf8')).toBe('pre-existing ignored WIP\n')
+    const baselineReceipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-baselines', `0-${state.attempt}.json`), 'utf8'))
+    expect(baselineReceipt).toMatchObject({ basis: 'authenticated-subset-digest', digest: authenticatedBaseline.digest })
+    const receipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`), 'utf8'))
+    expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'worker-report.json'), 'utf8')).toBe('{"worker":true}\n')
+  }, 90_000)
+
+  it('does not infer or move legacy ignored state while an authenticated lease remains live', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
+    const first = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, runId: () => 'legacylive01', worker: new FakeWorker([blockedNotRunOutcome('seed live lease recovery')]) },
+    )
+    const statePath = join(first.stateDir!, 'run.json')
+    const state = JSON.parse(readFileSync(statePath, 'utf8'))
+    const checklistSource = readFileSync(join(first.worktree!, 'tasks.task.md'), 'utf8')
+    const task = selectTask(parseChecklist(checklistSource, join(first.worktree!, 'tasks.task.md')))!
+    mkdirSync(join(first.worktree!, 'ignored-worker-output'), { recursive: true })
+    writeFileSync(join(first.worktree!, 'ignored-worker-output', 'pre-existing.txt'), 'baseline\n')
+    const authenticatedBaseline = await gitModule.ignoredPathSnapshot(first.worktree!)
+    state.activeTaskAttempt = {
+      schemaVersion: 1,
+      taskKey: createHash('sha256').update(JSON.stringify({ index: task.index, phase: task.phase, kind: task.kind, raw: task.raw })).digest('hex'),
+      taskIndex: task.index, baseHead: git(first.worktree!, 'rev-parse', 'HEAD'),
+      checklistDigest: createHash('sha256').update(checklistSource).digest('hex'),
+      ignoredPathsDigest: authenticatedBaseline.digest, attempt: state.attempt,
+    }
+    delete state.stateProof
+    writeFileSync(statePath, `${JSON.stringify(state)}\n`)
+    persistRunStateProof(first.stateDir!, state, Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64'))
+    rmSync(join(first.stateDir!, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    const workerOutput = join(first.worktree!, 'ignored-worker-output', 'live-worker.log')
+    writeFileSync(workerOutput, 'still writing\n')
+    const worker = new FakeWorker()
+
+    await expect(runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, {
+      ...modelDeps, worker,
+      awaitAuthenticatedLeaseSettlement: async () => { throw new Error('authenticated worker lease process remains live; recovery will not terminate a reusable PID: 4242') },
+    })).rejects.toThrow('will not terminate a reusable PID')
+    expect(worker.calls).toHaveLength(0)
+    expect(readFileSync(workerOutput, 'utf8')).toBe('still writing\n')
+    expect(existsSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`))).toBe(false)
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).activeTaskAttempt).toMatchObject({ ignoredPathsDigest: authenticatedBaseline.digest })
   }, 90_000)
 
   it('automatically quarantines task-generated ignored npm cache while preserving bytes in private state', async () => {

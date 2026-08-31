@@ -692,6 +692,29 @@ describe('grant-validated background controller tool', () => {
     expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ transitions: 5 })
   })
 
+  it('reuses persisted authority once when the installed controller gains legacy non-empty baseline recovery', async () => {
+    const owner = agent('ignored-baseline-owner')
+    const stalled = controller({
+      autoRecoveryBlocked: true,
+      detail: 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline',
+      lifecycleAuthority: {
+        sessionId: 'ignored-baseline-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 5, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const jobs = new FakeJobs()
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      run: async () => ({ ...completed, runId: stalled.runId }),
+    })
+
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
+    })).resolves.toMatchObject({ status: 'running', runId: stalled.runId })
+    await jobs.starts[0]!.hooks.done
+    expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ transitions: 6 })
+  })
+
   it('retries transient automatic follow-up handoff failures within the lifecycle', async () => {
     const followup = vi.fn()
     const owner = agent('followup-retry-agent', followup)

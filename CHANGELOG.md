@@ -2,6 +2,14 @@
 
 All notable changes are documented here.
 
+## [0.3.25] - 2026-08-30
+
+### Fixed
+
+- Legacy active attempts whose authenticated ignored baseline digest is non-empty can now recover only when a bounded search finds an exact ordered subset of the current path/content fingerprints whose SHA-256 equals that digest. The inferred baseline is stable-preflighted before persistence, safely re-inferred after a pre-transaction crash/race, capped at 128 entries, three additions, 10,000 candidates and 128 Ki fingerprint text, and yields the event loop every 128 candidates. Changed/missing baseline WIP, tracked legacy promotion, oversized or unmatched state still fail closed; only the proven complement enters the existing authenticated quarantine transaction.
+- Recovery no longer terminates a worker by reusable PID. Under the repository lock it polls a tri-state OS process identity and advances only after definitive absence or a positively different start identity; persistent workers and inspection failures stop before run-state, receipt, quarantine, verifier or worker mutation. Worker hosts must obtain a real OS identity before creating Context or spawning a child and never synthesize a wall-clock fallback lease identity.
+- The exact authenticated pre-subset failure receives one capability-changed continuation through existing persisted lifecycle authority, so installing this release does not require another direct-human transition solely to exercise the newly available safe migration. Prefix, suffix and unrelated worker diagnostics cannot use that bridge. Regression coverage includes committed candidate verification with a preserved non-empty ignored baseline, lease survivor/PID reuse/inspection failure, producer identity failure, inference races before and after persistence, combinatorial bounds and exact authority matching.
+
 ## [0.3.24] - 2026-08-30
 
 ### Fixed

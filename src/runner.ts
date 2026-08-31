@@ -8,8 +8,8 @@ import {
   status as gitStatus, summarizeDiff, verificationStatus, writeChecklistAndAmend,
 } from './git.js'
 import { lintChecklist, markTaskDone, markTaskOpen, parseChecklist, selectTask } from './checklist.js'
-import { appendEvent, acquireLock, atomicWriteJson, createLeaseKey, processIdentity, statePath, verifyLease } from './state.js'
-import type { SignedLease } from './state.js'
+import { appendEvent, acquireLock, atomicWriteJson, createLeaseKey, inspectProcessIdentity, statePath, verifyLease } from './state.js'
+import type { ProcessIdentityInspection, SignedLease } from './state.js'
 import { fingerprint, redact, scrubEnvironment } from './security.js'
 import { runFile, runOpaqueShell } from './process.js'
 import { physicalRelative } from './path.js'
@@ -351,17 +351,41 @@ function writeState(path: string, state: RunState): void {
   if (!existsSync(requiredPath)) ensureRunStateProofRequired(stateDir, state.runId, key)
 }
 
-async function terminateAuthenticatedLease(stateDir: string, runId: string): Promise<void> {
+interface LeaseSettlementOperations {
+  inspect?: (pid: number) => Promise<ProcessIdentityInspection>
+  wait?: () => Promise<void>
+  maxChecks?: number
+}
+
+export async function awaitAuthenticatedLeaseSettlement(
+  stateDir: string, runId: string, operations: LeaseSettlementOperations = {},
+): Promise<void> {
   const leaseDir = join(stateDir, 'leases')
   if (!existsSync(leaseDir)) return
+  const inspect = operations.inspect ?? inspectProcessIdentity
+  const wait = operations.wait ?? (async () => await new Promise<void>(resolveWait => { setTimeout(resolveWait, 250) }))
+  const maxChecks = operations.maxChecks ?? 40
   const key = createLeaseKey(stateDir)
   for (const name of readdirSync(leaseDir).filter(file => file.endsWith('.json'))) {
     const lease = JSON.parse(readFileSync(join(leaseDir, name), 'utf8')) as SignedLease
     if (!verifyLease(lease, key) || lease.payload.runId !== runId) continue
-    const current = await processIdentity(lease.payload.pid)
-    if (current === undefined || current !== lease.payload.processStart) continue
-    if (process.platform === 'win32') await runFile('taskkill.exe', ['/PID', String(lease.payload.pid), '/T', '/F'], { allowFailure: true })
-    else { try { process.kill(lease.payload.pid, 'SIGTERM') } catch { /* already exited */ } }
+    let settled = false
+    let lastInspection: ProcessIdentityInspection | undefined
+    for (let check = 0; check < maxChecks; check += 1) {
+      lastInspection = await inspect(lease.payload.pid)
+      if (lastInspection.status === 'absent'
+        || (lastInspection.status === 'found' && lastInspection.identity !== lease.payload.processStart)) {
+        settled = true
+        break
+      }
+      if (check + 1 < maxChecks) await wait()
+    }
+    if (!settled && lastInspection?.status === 'error') {
+      throw new Error(`authenticated worker lease identity inspection failed closed: ${lastInspection.detail}`)
+    }
+    if (!settled) {
+      throw new Error(`authenticated worker lease process remains live; recovery will not terminate a reusable PID: ${lease.payload.pid}`)
+    }
   }
 }
 
@@ -506,7 +530,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       state.taskAttempts ??= {}
       reconcileDurableLifecycleAuthority(state, stateDir)
       applyLifecycleAuthority(state, options.lifecycleAuthority)
-      await terminateAuthenticatedLease(stateDir, state.runId)
+      if (dependencies.awaitAuthenticatedLeaseSettlement) await dependencies.awaitAuthenticatedLeaseSettlement(stateDir, state.runId)
+      else await awaitAuthenticatedLeaseSettlement(stateDir, state.runId)
       const previousStatus = state.status
       state.status = 'running'
       delete state.lastError
