@@ -2,6 +2,15 @@
 
 All notable changes are documented here.
 
+## [0.3.30] - 2026-08-31
+
+### Fixed
+
+- The exact `0.3.29` promotion-aware terminal receives one persisted-authority capability transition that also evaluates current ordinary untracked paths against regular `.gitignore` blobs from the authenticated active-attempt base. Only paths that were ignored under those immutable base rules enter the exact bounded fingerprint set; the historical SHA-256 digest remains the sole baseline authority. Generated base-ignored ordinary files join the existing signed quarantine transaction, while an unchanged de-ignored baseline path is preserved and still prevents candidate adoption as dirty WIP.
+- Base ignore reconstruction preserves Git mode, type, object identity, pathname and blob bytes. Only regular `100644`/`100755` blobs are materialized; symlink/gitlink entries are skipped, checkout-transforming filter/encoding/ident attributes reject recovery, and authority-bearing `-z` protocols use binary output with strict UTF-8 round-trip. Literal POSIX backslashes are preserved, Windows-noncanonical backslashes reject, invalid bytes never become replacement-character rules, and scratch index/worktree cleanup is unconditional.
+- Candidate and ignore sources are capped at 128 paths/files, base rules at 1 MiB, and file content at independently streamed 512 MiB budgets. Reconciliation, resumed preflight, immediate pre-move and final quarantine validation all stream exact fingerprints and retain growth, byte-count, identity, hardlink and same-device checks.
+- Regressions cover unchanged and changed de-ignored baselines, mixed ignored/ordinary generated-output quarantine, dirty-WIP adoption refusal, symlink `.gitignore`, checkout filters, invalid UTF-8 blob bytes versus a real replacement-character filename, and literal POSIX backslashes. The new base-ignore terminal is versioned and cannot replay its own anti-thrash bridge.
+
 ## [0.3.29] - 2026-08-31
 
 ### Fixed

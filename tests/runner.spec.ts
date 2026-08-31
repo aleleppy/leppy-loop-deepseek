@@ -467,6 +467,60 @@ describe('controller state machine', () => {
     }
   }, 90_000)
 
+  it('quarantines exact base-ignored outputs but does not adopt a candidate with preserved de-ignored WIP', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt,config | Done: implementation committed\n')
+    mkdirSync(join(repo.root, 'config'))
+    writeFileSync(join(repo.root, 'config', '.gitignore'), 'ignored-worker-output/\n')
+    git(repo.root, 'add', '--', 'config/.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
+    const first = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, runId: () => 'legacydeignore1', worker: new FakeWorker([blockedNotRunOutcome('seed legacy state')]) },
+    )
+    const statePath = join(first.stateDir!, 'run.json')
+    const state = JSON.parse(readFileSync(statePath, 'utf8'))
+    const checklistSource = readFileSync(join(first.worktree!, 'tasks.task.md'), 'utf8')
+    const task = selectTask(parseChecklist(checklistSource, join(first.worktree!, 'tasks.task.md')))!
+    mkdirSync(join(first.worktree!, 'config', 'ignored-worker-output'), { recursive: true })
+    const preserved = join(first.worktree!, 'config', 'ignored-worker-output', 'pre-existing.env')
+    writeFileSync(preserved, 'pre-existing ignored WIP\n')
+    const authenticatedBaseline = await gitModule.ignoredPathSnapshot(first.worktree!)
+    const baseHead = git(first.worktree!, 'rev-parse', 'HEAD')
+    writeFileSync(join(first.worktree!, 'config', '.gitignore'), 'ignored-worker-output/still-ignored.json\n')
+    writeFileSync(join(first.worktree!, 'src', 'value.txt'), 'committed candidate\n')
+    git(first.worktree!, 'add', '--', 'config/.gitignore', 'src/value.txt')
+    git(first.worktree!, 'commit', '-m', 'feat: committed de-ignore candidate')
+    state.activeTaskAttempt = {
+      schemaVersion: 1,
+      taskKey: createHash('sha256').update(JSON.stringify({ index: task.index, phase: task.phase, kind: task.kind, raw: task.raw })).digest('hex'),
+      taskIndex: task.index, baseHead,
+      checklistDigest: createHash('sha256').update(checklistSource).digest('hex'),
+      ignoredPathsDigest: authenticatedBaseline.digest,
+      attempt: state.attempt,
+    }
+    delete state.stateProof
+    writeFileSync(statePath, `${JSON.stringify(state)}\n`)
+    persistRunStateProof(first.stateDir!, state, Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64'))
+    rmSync(join(first.stateDir!, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    const deignoredOutput = join(first.worktree!, 'config', 'ignored-worker-output', 'worker-report.json')
+    const ignoredOutput = join(first.worktree!, 'config', 'ignored-worker-output', 'still-ignored.json')
+    writeFileSync(deignoredOutput, '{"worker":"ordinary"}\n')
+    writeFileSync(ignoredOutput, '{"worker":"ignored"}\n')
+    const verifier = new FakeWorker([completedOutcome('must not verify dirty preserved WIP')])
+
+    await expect(runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker: verifier })).rejects.toThrow('worker must leave a clean tree')
+    expect(verifier.calls).toHaveLength(0)
+    expect(readFileSync(preserved, 'utf8')).toBe('pre-existing ignored WIP\n')
+    expect(existsSync(deignoredOutput)).toBe(false)
+    expect(existsSync(ignoredOutput)).toBe(false)
+    const receipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`), 'utf8'))
+    expect(receipt.entries.map((entry: { path: string }) => entry.path)).toEqual([
+      'config/ignored-worker-output/still-ignored.json', 'config/ignored-worker-output/worker-report.json',
+    ])
+  }, 90_000)
+
   it('does not infer or move legacy ignored state while an authenticated lease remains live', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
     writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')

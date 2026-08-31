@@ -1,8 +1,9 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
-import { createReadStream, lstatSync, mkdirSync, readFileSync, realpathSync, readlinkSync, renameSync } from 'node:fs'
+import { createReadStream, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readlinkSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { ignoredPathSnapshot } from './git.js'
-import { runFile } from './process.js'
+import { runFile, runFileBuffer } from './process.js'
 import { scrubEnvironment } from './security.js'
 import { atomicWriteJson } from './state.js'
 import type { IgnoredArtifactTransactionRef } from './types.js'
@@ -23,10 +24,37 @@ const LEGACY_SUBSET_FOUR_CANDIDATES = 100_000
 const LEGACY_SUBSET_MAX_FINGERPRINT_BYTES = 128 * 1024
 const LEGACY_SUBSET_MAX_HASHED_BYTES = 512 * 1024 * 1024
 const LEGACY_PROMOTION_MAX_CONTENT_BYTES = 512 * 1024 * 1024
+const LEGACY_BASE_IGNORE_MAX_FILES = 128
+const LEGACY_BASE_IGNORE_MAX_BYTES = 1024 * 1024
+
+function canonicalGitPath(path: string, label: string): string {
+  if (process.platform === 'win32' && path.includes('\\')) {
+    throw new Error(`${label} contains a Windows-noncanonical backslash path`)
+  }
+  return path
+}
+
+function binaryNulRecords(output: Buffer, label: string): string[] {
+  const records: string[] = []
+  let start = 0
+  for (let index = 0; index <= output.length; index += 1) {
+    if (index < output.length && output[index] !== 0) continue
+    if (index > start) {
+      const bytes = output.subarray(start, index)
+      const decoded = bytes.toString('utf8')
+      if (!Buffer.from(decoded, 'utf8').equals(bytes)) throw new Error(`${label} contains a non-UTF-8 path`)
+      records.push(decoded)
+    }
+    start = index + 1
+  }
+  return records
+}
+
 export const EMPTY_IGNORED_PATHS_DIGEST = createHash('sha256').update(JSON.stringify([])).digest('hex')
 const LEGACY_BASELINE_MISSING_DETAIL = 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'
 const LEGACY_SUBSET_THREE_ADDITION_DETAIL = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'
 const LEGACY_SUBSET_FOUR_DETAIL = new RegExp(`^${LEGACY_SUBSET_THREE_ADDITION_DETAIL} within 4 additions and ([0-9]+) candidates$`, 'u')
+const LEGACY_TRACKED_PROMOTION_DETAIL = new RegExp(`^${LEGACY_SUBSET_THREE_ADDITION_DETAIL} after exact newly tracked promotion inference within 4 additions and ([0-9]+) candidates$`, 'u')
 const LEGACY_SUBSET_FOUR_TERMINAL_CANDIDATES = new Set(Array.from({ length: 40 }, (_value, entries) => {
   let total = 0
   let combinations = 1
@@ -42,6 +70,7 @@ export function workerIgnoredBaselineRecovery(detail: string | undefined): boole
   const normalized = detail?.trim()
   if (normalized === LEGACY_BASELINE_MISSING_DETAIL || normalized === LEGACY_SUBSET_THREE_ADDITION_DETAIL) return true
   const fourAddition = normalized?.match(LEGACY_SUBSET_FOUR_DETAIL)
+    ?? normalized?.match(LEGACY_TRACKED_PROMOTION_DETAIL)
   if (!fourAddition) return false
   const candidates = Number(fourAddition[1])
   return Number.isSafeInteger(candidates) && fourAddition[1] === String(candidates)
@@ -202,7 +231,10 @@ function fingerprintDigest(entries: readonly string[]): string {
   return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
 }
 
-async function inferLegacyBaselineSubset(entries: readonly string[], expectedDigest: string, promotionAware = false): Promise<readonly string[]> {
+async function inferLegacyBaselineSubset(
+  entries: readonly string[], expectedDigest: string,
+  inference: 'ignored-only' | 'tracked-promotion' | 'base-ignore' = 'ignored-only',
+): Promise<readonly string[]> {
   if (entries.length > LEGACY_SUBSET_MAX_ENTRIES) {
     throw new Error(`legacy ignored baseline inference exceeds ${LEGACY_SUBSET_MAX_ENTRIES} current entries`)
   }
@@ -245,27 +277,22 @@ async function inferLegacyBaselineSubset(entries: readonly string[], expectedDig
     await search(0, additions)
   }
   if (!match) {
-    const capability = promotionAware ? ' after exact newly tracked promotion inference' : ''
+    const capability = inference === 'base-ignore'
+      ? ' after exact tracked-promotion and base-ignore inference'
+      : inference === 'tracked-promotion' ? ' after exact newly tracked promotion inference' : ''
     throw new Error(`worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints${capability} within ${maxAdditions} additions and ${examined} candidates`)
   }
   return match
 }
 
-function fingerprintAt(path: string, absolute: string): string {
-  const stat = lstatSync(absolute)
-  if (stat.isSymbolicLink()) return `${path}\0link\0${readlinkSync(absolute)}`
-  if (!stat.isFile()) return `${path}\0${stat.isDirectory() ? 'directory' : 'special'}\0${stat.mode}`
-  return `${path}\0file\0${stat.size}\0${createHash('sha256').update(readFileSync(absolute)).digest('hex')}`
-}
-
-async function promotedFingerprintAt(path: string, absolute: string, budget: { bytes: number }): Promise<string> {
+async function boundedFingerprintAt(path: string, absolute: string, budget: { bytes: number }): Promise<string> {
   const stat = lstatSync(absolute)
   if (stat.isSymbolicLink()) return `${path}\0link\0${readlinkSync(absolute)}`
   if (!stat.isFile()) return `${path}\0${stat.isDirectory() ? 'directory' : 'special'}\0${stat.mode}`
   const before = budget.bytes
   budget.bytes += stat.size
   if (budget.bytes > LEGACY_PROMOTION_MAX_CONTENT_BYTES) {
-    throw new Error('legacy ignored promotion inference exceeds 512 MiB of file content')
+    throw new Error('worker ignored artifact fingerprinting exceeds 512 MiB of file content')
   }
   const hash = createHash('sha256')
   let bytes = 0
@@ -273,7 +300,7 @@ async function promotedFingerprintAt(path: string, absolute: string, budget: { b
     const buffer = Buffer.from(chunk)
     bytes += buffer.length
     if (before + bytes > LEGACY_PROMOTION_MAX_CONTENT_BYTES) {
-      throw new Error('legacy ignored promotion inference exceeds 512 MiB of file content')
+      throw new Error('worker ignored artifact fingerprinting exceeds 512 MiB of file content')
     }
     hash.update(buffer)
   }
@@ -293,12 +320,27 @@ function sameIdentity(left: ArtifactIdentity, right: ArtifactIdentity): boolean 
   return left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink && left.type === right.type
 }
 
+async function boundedLegacyCandidateFingerprints(worktree: string, paths: readonly string[]): Promise<readonly string[]> {
+  const budget = { bytes: 0 }
+  const fingerprints: string[] = []
+  for (const path of paths) {
+    if (path.startsWith('/') || path.split('/').some(segment => segment === '..' || segment === '')) {
+      throw new Error(`legacy ignored-path candidate is invalid: ${path}`)
+    }
+    const absolute = resolve(worktree, path)
+    if (!inside(worktree, absolute)) throw new Error(`legacy ignored-path candidate escapes worktree: ${path}`)
+    fingerprints.push(await boundedFingerprintAt(path, absolute, budget))
+  }
+  return fingerprints
+}
+
 async function newlyTrackedIgnoredFingerprints(worktree: string, baseHead: string): Promise<readonly string[]> {
   if (!/^[0-9a-f]{40,64}$/u.test(baseHead)) throw new Error('legacy ignored promotion base HEAD is invalid')
-  const addedResult = await runFile('git', [
+  const addedResult = await runFileBuffer('git', [
     'diff', '--name-only', '--diff-filter=A', '-z', `${baseHead}..HEAD`, '--',
   ], { cwd: worktree, env: scrubEnvironment(process.env) })
-  const added = [...new Set(addedResult.stdout.split('\0').filter(Boolean).map(path => path.replaceAll('\\', '/')))].sort()
+  const added = [...new Set(binaryNulRecords(addedResult, 'legacy ignored promotion tree')
+    .map(path => canonicalGitPath(path, 'legacy ignored promotion tree')))].sort()
   if (added.length > LEGACY_SUBSET_MAX_ENTRIES) {
     throw new Error(`legacy ignored promotion inference exceeds ${LEGACY_SUBSET_MAX_ENTRIES} newly tracked paths`)
   }
@@ -312,28 +354,108 @@ async function newlyTrackedIgnoredFingerprints(worktree: string, baseHead: strin
     }
     if (result.exitCode === 0) ignored.push(path)
   }
-  const budget = { bytes: 0 }
-  const fingerprints: string[] = []
-  for (const path of ignored) {
-    if (path.startsWith('/') || path.split('/').some(segment => segment === '..' || segment === '')) {
-      throw new Error(`newly tracked ignored-path candidate is invalid: ${path}`)
-    }
-    const absolute = resolve(worktree, path)
-    if (!inside(worktree, absolute)) throw new Error(`newly tracked ignored-path candidate escapes worktree: ${path}`)
-    fingerprints.push(await promotedFingerprintAt(path, absolute, budget))
+  return await boundedLegacyCandidateFingerprints(worktree, ignored)
+}
+
+async function baseIgnoredCurrentUntrackedFingerprints(worktree: string, baseHead: string): Promise<readonly string[]> {
+  if (!/^[0-9a-f]{40,64}$/u.test(baseHead)) throw new Error('legacy base-ignore HEAD is invalid')
+  const untrackedResult = await runFileBuffer('git', [
+    'ls-files', '--others', '--exclude-standard', '-z', '--', '.',
+    ':(exclude,glob)**/node_modules/**', ':(exclude,glob).npm-cache/**', ':(exclude,glob)**/.npm-cache/**',
+  ], { cwd: worktree, env: scrubEnvironment(process.env) })
+  const untracked = [...new Set(binaryNulRecords(untrackedResult, 'legacy base-ignore untracked state')
+    .map(path => canonicalGitPath(path, 'legacy base-ignore untracked state')))].sort()
+  if (untracked.length > LEGACY_SUBSET_MAX_ENTRIES) {
+    throw new Error(`legacy base-ignore inference exceeds ${LEGACY_SUBSET_MAX_ENTRIES} current untracked paths`)
   }
-  return fingerprints
+  const ignoreList = await runFileBuffer('git', [
+    'ls-tree', '-r', '-z', baseHead,
+  ], { cwd: worktree, env: scrubEnvironment(process.env) })
+  const ignoreEntries: Array<{ objectId: string; path: string }> = []
+  for (const record of binaryNulRecords(ignoreList, 'legacy base-ignore tree')) {
+    const separator = record.indexOf('\t')
+    if (separator < 0) throw new Error('legacy base-ignore tree record is malformed')
+    const metadata = record.slice(0, separator).match(/^([0-9]{6}) (blob|tree|commit) ([0-9a-f]{40,64})$/u)
+    if (!metadata) throw new Error('legacy base-ignore tree metadata is malformed')
+    const path = canonicalGitPath(record.slice(separator + 1), 'legacy base-ignore tree')
+    if (path !== '.gitignore' && !path.endsWith('/.gitignore')) continue
+    if (metadata[1] !== '100644' && metadata[1] !== '100755') continue
+    if (metadata[2] !== 'blob') throw new Error(`legacy base-ignore regular entry is not a blob: ${path}`)
+    ignoreEntries.push({ objectId: metadata[3]!, path })
+  }
+  ignoreEntries.sort((left, right) => left.path.localeCompare(right.path))
+  if (ignoreEntries.length > LEGACY_BASE_IGNORE_MAX_FILES) {
+    throw new Error(`legacy base-ignore inference exceeds ${LEGACY_BASE_IGNORE_MAX_FILES} ignore files`)
+  }
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'leppy-base-ignore-')))
+  const baseEnvironment = {
+    ...scrubEnvironment(process.env), GIT_INDEX_FILE: join(scratch, 'base.index'),
+  }
+  try {
+    await runFile('git', ['read-tree', baseHead], { cwd: worktree, env: baseEnvironment })
+    let ignoreBytes = 0
+    for (const entry of ignoreEntries) {
+      const { path } = entry
+      if (path.startsWith('/') || path.split('/').some(segment => segment === '..' || segment === '')
+        || (path !== '.gitignore' && !path.endsWith('/.gitignore'))) {
+        throw new Error(`legacy base-ignore path is invalid: ${path}`)
+      }
+      const attributes = await runFile('git', [
+        'check-attr', '-z', '--cached', 'filter', 'working-tree-encoding', 'ident', '--', path,
+      ], { cwd: worktree, env: baseEnvironment })
+      const attributeFields = attributes.stdout.split('\0').filter(Boolean)
+      if (attributeFields.length % 3 !== 0) throw new Error(`legacy base-ignore attributes are malformed: ${path}`)
+      for (let index = 0; index < attributeFields.length; index += 3) {
+        const value = attributeFields[index + 2]
+        if (value !== 'unspecified' && value !== 'unset') {
+          throw new Error(`legacy base-ignore entry uses a checkout-transforming attribute: ${path}`)
+        }
+      }
+      const source = await runFileBuffer('git', ['cat-file', 'blob', entry.objectId], {
+        cwd: worktree, env: scrubEnvironment(process.env),
+      })
+      ignoreBytes += source.length
+      if (ignoreBytes > LEGACY_BASE_IGNORE_MAX_BYTES) {
+        throw new Error('legacy base-ignore inference exceeds 1 MiB of ignore rules')
+      }
+      const target = resolve(scratch, path)
+      if (!inside(scratch, target)) throw new Error(`legacy base-ignore path escapes scratch root: ${path}`)
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, source)
+    }
+    const baseIgnored: string[] = []
+    for (const path of untracked) {
+      const result = await runFile('git', [
+        `--work-tree=${scratch}`, 'check-ignore', '--no-index', '--', path,
+      ], { cwd: worktree, env: baseEnvironment, allowFailure: true })
+      if (result.exitCode !== 0 && result.exitCode !== 1) {
+        throw new Error(`cannot authenticate base-ignored candidate: ${result.stderr}`)
+      }
+      if (result.exitCode === 0) baseIgnored.push(path)
+    }
+    return await boundedLegacyCandidateFingerprints(worktree, baseIgnored)
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
+async function legacyRecoverySnapshot(worktree: string, baseHead: string | undefined): Promise<{ entries: readonly string[]; digest: string }> {
+  const ignored = await ignoredPathSnapshot(worktree)
+  const deignored = baseHead ? await baseIgnoredCurrentUntrackedFingerprints(worktree, baseHead) : []
+  const entries = [...ignored.entries, ...deignored].sort()
+  return { entries, digest: createHash('sha256').update(JSON.stringify(entries)).digest('hex') }
 }
 
 async function trackedPaths(worktree: string, paths: readonly string[]): Promise<Set<string>> {
   const tracked = new Set<string>()
   for (let offset = 0; offset < paths.length; offset += 100) {
     const chunk = paths.slice(offset, offset + 100)
-    const result = await runFile('git', ['ls-files', '-z', '--', ...chunk.map(path => `:(literal)${path}`)], {
-      cwd: worktree, env: scrubEnvironment(process.env), allowFailure: true,
+    const result = await runFileBuffer('git', ['ls-files', '-z', '--', ...chunk.map(path => `:(literal)${path}`)], {
+      cwd: worktree, env: scrubEnvironment(process.env),
     })
-    if (result.exitCode !== 0) throw new Error(`cannot authenticate tracked ignored-path adoption: ${result.stderr}`)
-    for (const path of result.stdout.split('\0').filter(Boolean)) tracked.add(path.replaceAll('\\', '/'))
+    for (const path of binaryNulRecords(result, 'tracked ignored-path adoption')) {
+      tracked.add(canonicalGitPath(path, 'tracked ignored-path adoption'))
+    }
   }
   return tracked
 }
@@ -349,21 +471,22 @@ async function assertBaselinePreserved(worktree: string, baseline: Baseline, cur
     }
   }
   if (missing.length === 0) return
-  const tracked = await trackedPaths(worktree, missing)
-  const unresolved = missing.find(path => !tracked.has(path))
-  if (unresolved) throw new Error(`pre-existing ignored artifact disappeared during worker attempt: ${unresolved}`)
   if (baseline.basis === 'authenticated-subset-digest') {
     const missingSet = new Set(missing)
     const budget = { bytes: 0 }
     for (const entry of baseline.entries) {
       if (!missingSet.has(entry.path)) continue
       const absolute = resolve(worktree, entry.path)
-      if (await promotedFingerprintAt(entry.path, absolute, budget) !== entry.fingerprint
+      if (await boundedFingerprintAt(entry.path, absolute, budget) !== entry.fingerprint
         || !sameIdentity(identity(absolute), entry.identity)) {
-        throw new Error(`inferred legacy ignored artifact changed after tracked promotion: ${entry.path}`)
+        throw new Error(`inferred legacy ignored artifact changed outside ignored baseline: ${entry.path}`)
       }
     }
+    return
   }
+  const tracked = await trackedPaths(worktree, missing)
+  const unresolved = missing.find(path => !tracked.has(path))
+  if (unresolved) throw new Error(`pre-existing ignored artifact disappeared during worker attempt: ${unresolved}`)
 }
 
 function assertBinding(value: Baseline | Recovery, options: { runId: string; taskKey: string; taskIndex: number; attempt: number }): void {
@@ -464,10 +587,13 @@ export async function reconcileWorkerIgnoredPaths(options: {
     const promoted = options.expectedBaselineDigest !== EMPTY_IGNORED_PATHS_DIGEST && options.legacyBaseHead
       ? await newlyTrackedIgnoredFingerprints(worktree, options.legacyBaseHead)
       : []
-    const candidates = [...current.entries, ...promoted].sort()
+    const deignored = options.expectedBaselineDigest !== EMPTY_IGNORED_PATHS_DIGEST && options.legacyBaseHead
+      ? await baseIgnoredCurrentUntrackedFingerprints(worktree, options.legacyBaseHead)
+      : []
+    const candidates = [...current.entries, ...promoted, ...deignored].sort()
     const fingerprints = options.expectedBaselineDigest === EMPTY_IGNORED_PATHS_DIGEST
       ? [] as readonly string[]
-      : await inferLegacyBaselineSubset(candidates, options.expectedBaselineDigest, true)
+      : await inferLegacyBaselineSubset(candidates, options.expectedBaselineDigest, 'base-ignore')
     await options.afterLegacySnapshot?.()
     const entries = fingerprints.map(fingerprint => {
       const path = entryPath(fingerprint)
@@ -484,10 +610,13 @@ export async function reconcileWorkerIgnoredPaths(options: {
     const stablePromoted = options.expectedBaselineDigest !== EMPTY_IGNORED_PATHS_DIGEST && options.legacyBaseHead
       ? await newlyTrackedIgnoredFingerprints(worktree, options.legacyBaseHead)
       : []
-    const stableCandidates = [...stable.entries, ...stablePromoted].sort()
+    const stableDeignored = options.expectedBaselineDigest !== EMPTY_IGNORED_PATHS_DIGEST && options.legacyBaseHead
+      ? await baseIgnoredCurrentUntrackedFingerprints(worktree, options.legacyBaseHead)
+      : []
+    const stableCandidates = [...stable.entries, ...stablePromoted, ...stableDeignored].sort()
     if (stableCandidates.length !== candidates.length
       || stableCandidates.some((entry, index) => entry !== candidates[index])) {
-      throw new Error('ignored artifacts or tracked promotions changed during legacy baseline inference')
+      throw new Error('ignored artifacts, tracked promotions, or base-ignored paths changed during legacy baseline inference')
     }
     await assertBaselinePreserved(worktree, inferred, stable.entries)
     baseline = inferred
@@ -508,7 +637,7 @@ export async function reconcileWorkerIgnoredPaths(options: {
     if (recovery.baselineDigest !== baseline.digest) throw new Error('worker ignored recovery baseline changed')
     if (options.expectedTransaction) assertTransactionRef(recovery, options.expectedTransaction)
   } else {
-    const current = await ignoredPathSnapshot(worktree)
+    const current = await legacyRecoverySnapshot(worktree, options.legacyBaseHead)
     await assertBaselinePreserved(worktree, baseline, current.entries)
     const baselinePaths = new Set(baseline.entries.map(entry => entry.path))
     const added = current.entries.filter(entry => !baselinePaths.has(entryPath(entry)))
@@ -518,8 +647,10 @@ export async function reconcileWorkerIgnoredPaths(options: {
     mkdirSync(quarantineRoot, { recursive: true })
     const canonicalRoot = realpathSync(quarantineRoot)
     if (!inside(stateDir, canonicalRoot)) throw new Error('worker ignored quarantine root escapes private state')
-    const entries = added.map(fingerprint => {
-      const path = entryPath(fingerprint).replaceAll('\\', '/')
+    const entries: Array<{ path: string; fingerprint: string; source: string; quarantine: string; identity: ArtifactIdentity }> = []
+    const reconciliationBudget = { bytes: 0 }
+    for (const fingerprint of added) {
+      const path = canonicalGitPath(entryPath(fingerprint), 'worker ignored quarantine entry')
       if (path.startsWith('/') || path.split('/').some(segment => segment === '..' || segment === '')) {
         throw new Error(`worker ignored artifact path is invalid: ${path}`)
       }
@@ -527,7 +658,9 @@ export async function reconcileWorkerIgnoredPaths(options: {
       if (!inside(worktree, source) || !samePath(realpathSync(dirname(source)), resolve(dirname(source)))) {
         throw new Error(`worker ignored artifact parent is not one physical in-worktree path: ${path}`)
       }
-      if (fingerprintAt(path, source) !== fingerprint) throw new Error(`worker ignored artifact changed during reconciliation: ${path}`)
+      if (await boundedFingerprintAt(path, source, reconciliationBudget) !== fingerprint) {
+        throw new Error(`worker ignored artifact changed during reconciliation: ${path}`)
+      }
       const sourceIdentity = identity(source)
       if (sourceIdentity.type !== 'file') throw new Error(`worker ignored artifact quarantine rejects symlinks: ${path}`)
       const quarantine = resolve(canonicalRoot, path)
@@ -539,8 +672,8 @@ export async function reconcileWorkerIgnoredPaths(options: {
       }
       const destinationDevice = lstatSync(canonicalDestinationParent, { bigint: true }).dev.toString(10)
       if (sourceIdentity.dev !== destinationDevice) throw new Error('worker ignored artifact quarantine requires one filesystem')
-      return { path, fingerprint, source, quarantine, identity: sourceIdentity }
-    })
+      entries.push({ path, fingerprint, source, quarantine, identity: sourceIdentity })
+    }
     recovery = sign({
       schemaVersion: 1 as const, transactionId, runId: options.runId, taskKey: options.taskKey,
       taskIndex: options.taskIndex, attempt: options.attempt, baselineDigest: baseline.digest,
@@ -559,7 +692,7 @@ export async function reconcileWorkerIgnoredPaths(options: {
   if (!samePath(canonicalQuarantineRoot, quarantineRoot) || !inside(stateDir, canonicalQuarantineRoot)) {
     throw new Error('worker ignored recovery quarantine root is not one physical private-state directory')
   }
-  const preMoveSnapshot = await ignoredPathSnapshot(worktree)
+  const preMoveSnapshot = await legacyRecoverySnapshot(worktree, options.legacyBaseHead)
   await assertBaselinePreserved(worktree, baseline, preMoveSnapshot.entries)
   const preMoveEntries = new Map(preMoveSnapshot.entries.map(entry => [entryPath(entry), entry]))
   const authenticatedPaths = new Set([
@@ -570,7 +703,10 @@ export async function reconcileWorkerIgnoredPaths(options: {
   if (unauthenticatedAddition) {
     throw new Error(`unplanned ignored artifact appeared during quarantine recovery: ${entryPath(unauthenticatedAddition)}`)
   }
-  const moveStates = recovery.entries.map(entry => {
+  const moveStates: Array<{ entry: Recovery['entries'][number]; source: string; quarantine: string; sourceExists: boolean }> = []
+  const preflightSourceBudget = { bytes: 0 }
+  const preflightQuarantineBudget = { bytes: 0 }
+  for (const entry of recovery.entries) {
     const source = resolve(entry.source)
     const quarantine = resolve(entry.quarantine)
     if (!inside(worktree, source) || !inside(canonicalQuarantineRoot, quarantine)
@@ -594,30 +730,37 @@ export async function reconcileWorkerIgnoredPaths(options: {
       if (preMoveEntries.get(entry.path) !== entry.fingerprint) {
         throw new Error(`worker ignored recovery source is no longer the authenticated ignored artifact: ${entry.path}`)
       }
-      if (!sameIdentity(identity(source), entry.identity) || fingerprintAt(entry.path, source) !== entry.fingerprint) {
+      if (!sameIdentity(identity(source), entry.identity)
+        || await boundedFingerprintAt(entry.path, source, preflightSourceBudget) !== entry.fingerprint) {
         throw new Error(`worker ignored artifact source identity changed: ${entry.path}`)
       }
       const destinationDevice = lstatSync(quarantineParent, { bigint: true }).dev.toString(10)
       if (entry.identity.dev !== destinationDevice) throw new Error('worker ignored artifact quarantine requires one filesystem')
-    } else if (!sameIdentity(identity(quarantine), entry.identity) || fingerprintAt(entry.path, quarantine) !== entry.fingerprint) {
+    } else if (!sameIdentity(identity(quarantine), entry.identity)
+      || await boundedFingerprintAt(entry.path, quarantine, preflightQuarantineBudget) !== entry.fingerprint) {
       throw new Error(`worker ignored artifact quarantine identity changed: ${entry.path}`)
     }
-    return { entry, source, quarantine, sourceExists }
-  })
+    moveStates.push({ entry, source, quarantine, sourceExists })
+  }
+  const moveSourceBudget = { bytes: 0 }
+  const finalQuarantineBudget = { bytes: 0 }
   for (const [index, move] of moveStates.entries()) {
     const { entry, source, quarantine, sourceExists } = move
     if (sourceExists) {
       if (!entryExists(source) || entryExists(quarantine)
         || !samePath(realpathSync(dirname(source)), resolve(dirname(source)))
         || !samePath(realpathSync(dirname(quarantine)), resolve(dirname(quarantine)))
-        || !sameIdentity(identity(source), entry.identity)
-        || fingerprintAt(entry.path, source) !== entry.fingerprint) {
+        || !sameIdentity(identity(source), entry.identity)) {
+        throw new Error(`worker ignored artifact changed after complete preflight: ${entry.path}`)
+      }
+      if (await boundedFingerprintAt(entry.path, source, moveSourceBudget) !== entry.fingerprint) {
         throw new Error(`worker ignored artifact changed after complete preflight: ${entry.path}`)
       }
       renameSync(source, quarantine)
       await options.afterEntryQuarantined?.(index)
     }
-    if (!sameIdentity(identity(quarantine), entry.identity) || fingerprintAt(entry.path, quarantine) !== entry.fingerprint) {
+    if (!sameIdentity(identity(quarantine), entry.identity)
+      || await boundedFingerprintAt(entry.path, quarantine, finalQuarantineBudget) !== entry.fingerprint) {
       throw new Error(`worker ignored artifact quarantine identity changed: ${entry.path}`)
     }
     if (entryExists(source)) throw new Error(`worker ignored artifact reappeared during quarantine: ${entry.path}`)
@@ -632,7 +775,7 @@ export async function reconcileWorkerIgnoredPaths(options: {
     recovery = sign(unsigned, options.key)
     atomicWriteJson(receiptFile, recovery)
   }
-  const finalSnapshot = await ignoredPathSnapshot(worktree)
+  const finalSnapshot = await legacyRecoverySnapshot(worktree, options.legacyBaseHead)
   await assertBaselinePreserved(worktree, baseline, finalSnapshot.entries)
   const baselinePaths = new Set(baseline.entries.map(entry => entry.path))
   const unexpected = finalSnapshot.entries.find(entry => !baselinePaths.has(entryPath(entry)))

@@ -30,6 +30,31 @@ export async function runFile(file: string, args: readonly string[], options: { 
   }
 }
 
+/** Execute without text decoding when protocol bytes are authority-bearing. */
+export async function runFileBuffer(file: string, args: readonly string[], options: {
+  cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; signal?: AbortSignal | undefined
+} = {}): Promise<Buffer> {
+  return await new Promise((resolvePromise, reject) => {
+    execFile(file, [...args], {
+      cwd: options.cwd,
+      env: options.env,
+      timeout: options.timeoutMs,
+      signal: options.signal,
+      windowsHide: true,
+      maxBuffer: 16 * 1024 * 1024,
+      encoding: null,
+    }, (error, stdout, stderr) => {
+      const output = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout)
+      if (!error) {
+        resolvePromise(output)
+        return
+      }
+      const diagnostic = Buffer.isBuffer(stderr) ? stderr.toString('utf8') : stderr
+      reject(new Error(`${file} ${args.join(' ')} failed: ${(diagnostic || error.message).trim()}`))
+    })
+  })
+}
+
 function signalError(signal: AbortSignal): Error {
   if (signal.reason instanceof Error) return signal.reason
   return new Error(typeof signal.reason === 'string' ? signal.reason : 'command aborted')

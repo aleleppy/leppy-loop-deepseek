@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
-import { runFile } from './process.js'
+import { runFile, runFileBuffer } from './process.js'
 
 export interface GitSetup {
   repoRoot: string
@@ -151,17 +151,36 @@ export async function verificationStatus(cwd: string, signal?: AbortSignal): Pro
   ], { cwd, signal })).stdout
 }
 
+function strictGitNulPaths(output: Buffer, label: string): string[] {
+  const paths: string[] = []
+  let start = 0
+  for (let index = 0; index <= output.length; index += 1) {
+    if (index < output.length && output[index] !== 0) continue
+    if (index > start) {
+      const bytes = output.subarray(start, index)
+      const path = bytes.toString('utf8')
+      if (!Buffer.from(path, 'utf8').equals(bytes)) throw new Error(`${label} contains a non-UTF-8 path`)
+      if (process.platform === 'win32' && path.includes('\\')) {
+        throw new Error(`${label} contains a Windows-noncanonical backslash path`)
+      }
+      paths.push(path)
+    }
+    start = index + 1
+  }
+  return paths
+}
+
 export interface IgnoredPathSnapshot {
   entries: readonly string[]
   digest: string
 }
 
 export async function ignoredPathSnapshot(cwd: string, signal?: AbortSignal): Promise<IgnoredPathSnapshot> {
-  const output = (await runFile('git', [
+  const output = await runFileBuffer('git', [
     'ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', '.',
     ':(exclude,glob)**/node_modules/**', ':(exclude,glob).npm-cache/**', ':(exclude,glob)**/.npm-cache/**',
-  ], { cwd, signal })).stdout
-  const paths = output.split('\0').filter(Boolean).sort()
+  ], { cwd, signal })
+  const paths = strictGitNulPaths(output, 'ignored artifact baseline').sort()
   if (paths.length > 100_000) throw new Error('ignored artifact baseline exceeds 100000 paths')
   let totalBytes = 0
   const entries = paths.map(path => {
