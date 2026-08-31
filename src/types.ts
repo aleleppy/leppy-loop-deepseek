@@ -95,6 +95,19 @@ export interface PendingTaskValidation {
   validationEvidenceDigest?: string
 }
 
+export interface IgnoredBaselineBridgeIdentity {
+  schemaVersion: 1
+  conditionDigest: string
+  activeAttemptDigest: string
+}
+
+export interface IgnoredBaselineBridgeAdmission extends IgnoredBaselineBridgeIdentity {
+  phase: 'prepared' | 'consumed'
+  authorityEpoch: number
+  authorityTransition: number
+  requestDigest: string
+}
+
 export interface LifecycleAuthority {
   /** Monotonic direct-human budget epoch; legacy authenticated chains imply epoch 1. */
   epoch?: number
@@ -147,6 +160,8 @@ export interface LeppyLoopOptions {
   workerArtifactRecoveryDigest?: string
   /** Bind one recovery to the exact authenticated Windows structured-argv failure. */
   windowsArgvRecoveryDigest?: string
+  /** Bind one legacy ignored-baseline capability transition to its exact terminal and active attempt. */
+  ignoredBaselineRecovery?: IgnoredBaselineBridgeIdentity
 }
 
 export interface RunEvent<T = Record<string, unknown>> {

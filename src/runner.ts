@@ -27,10 +27,13 @@ import { windowsQuotedExecutableFailure } from './windows-command.js'
 import {
   quarantineWorkerNpmCache, recordWorkerNpmCacheBaseline, workerNpmCacheRecovery, workerNpmCacheTransactionPresent,
 } from './worker-artifacts.js'
-import { recordWorkerIgnoredPathBaseline, reconcileWorkerIgnoredPaths } from './ignored-artifacts.js'
+import {
+  recordWorkerIgnoredPathBaseline, reconcileWorkerIgnoredPaths, sameIgnoredBaselineBridge,
+  workerIgnoredBaselineBridgeIdentity,
+} from './ignored-artifacts.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import type {
-  ActiveTaskAttempt, ChecklistTask, LeppyLoopOptions, LifecycleAuthority, ModelCapability, PendingTaskValidation, RunDependencies, RunEvent,
+  ActiveTaskAttempt, ChecklistTask, IgnoredBaselineBridgeAdmission, LeppyLoopOptions, LifecycleAuthority, ModelCapability, PendingTaskValidation, RunDependencies, RunEvent,
   PublicationConflict, RunEventType, RunProgress, RunResult, WorkerOutcome, WorkerRequest,
 } from './types.js'
 
@@ -81,6 +84,7 @@ interface RunState {
   autoRecoveryBlocked?: boolean
   dependencyBridgeActive?: boolean
   windowsArgvBridgeActive?: boolean
+  ignoredBaselineBridge?: IgnoredBaselineBridgeAdmission
   updatedAt: string
 }
 
@@ -572,6 +576,19 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   }
 
   try {
+    const observedIgnoredBaselineBridge = workerIgnoredBaselineBridgeIdentity(recoveryError, state.activeTaskAttempt)
+    if (options.ignoredBaselineRecovery) {
+      if (!recovered || !sameIgnoredBaselineBridge(observedIgnoredBaselineBridge, options.ignoredBaselineRecovery)
+        || !sameIgnoredBaselineBridge(state.ignoredBaselineBridge, options.ignoredBaselineRecovery)
+        || state.ignoredBaselineBridge?.phase !== 'prepared') {
+        throw new Error('the authenticated ignored-baseline recovery condition changed or lacks its prepared admission marker')
+      }
+      state.ignoredBaselineBridge = { ...state.ignoredBaselineBridge, phase: 'consumed' }
+      writeState(join(stateDir, 'run.json'), state)
+      appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', { ignoredBaselineBridge: 'consumed' }))
+    } else if (observedIgnoredBaselineBridge) {
+      throw new Error('legacy ignored-baseline recovery requires lock-protected activation of the exact authenticated terminal and active attempt')
+    }
     if (options.windowsArgvRecoveryDigest) {
       const observedDigest = recoveryError ? createHash('sha256').update(recoveryError).digest('hex') : undefined
       if (observedDigest !== options.windowsArgvRecoveryDigest || !windowsQuotedExecutableFailure(recoveryError)

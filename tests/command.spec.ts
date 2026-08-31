@@ -15,6 +15,7 @@ import {
 import { selectControllerForPublication, selectControllerForStatus } from '../src/controller-auth.js'
 import type { AuthenticatedController } from '../src/controller-auth.js'
 import { HumanGrantStore } from '../src/human-grant.js'
+import { workerIgnoredBaselineBridgeIdentity } from '../src/ignored-artifacts.js'
 import { lifecycleCommonDir } from '../src/lifecycle-authority.js'
 import { parseLeppyLoopCommandInput, tokenizeLeppyLoopCommandInput } from '../src/options.js'
 import type { LeppyLoopRuntime } from '../src/command.js'
@@ -133,7 +134,7 @@ function context(jobs = new FakeJobs()): Context {
 
 function runtime(hooks: LeppyLoopRuntime['hooks'] = {}): LeppyLoopRuntime {
   return {
-    grants: new HumanGrantStore(), jobs: [], activeRepositories: new Set(), registeredAgents: new WeakSet(), lifetime: new AbortController(), hooks: { persistAuthority: async () => {}, ...hooks },
+    grants: new HumanGrantStore(), jobs: [], activeRepositories: new Set(), registeredAgents: new WeakSet(), lifetime: new AbortController(), hooks: { persistAuthority: async () => {}, activateIgnoredBaselineBridge: async () => {}, ...hooks },
   }
 }
 
@@ -889,6 +890,7 @@ describe('grant-validated background controller tool', () => {
     ['whitespace-normalized three-addition search', '\r\n worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints\t'],
     ['ignored-only four-addition search', 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints within 4 additions and 3 candidates'],
     ['tracked-promotion four-addition search', 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact newly tracked promotion inference within 4 additions and 3 candidates'],
+    ['base-ignore four-addition search', 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates'],
   ] as const)('status then reuses persisted authority once when the installed controller supersedes %s recovery', async (_label, detail) => {
     const owner = agent('ignored-baseline-owner')
     const updatedAt = Date.now() - 30_000
@@ -916,6 +918,108 @@ describe('grant-validated background controller tool', () => {
     expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ transitions: 6 })
   })
 
+  it('admits one ignored-baseline bridge job but blocks replay of its persisted condition marker', async () => {
+    const owner = agent('ignored-baseline-replay-owner')
+    const updatedAt = Date.now() - 30_000
+    const detail = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates'
+    const attempt = activeAttempt()
+    const lifecycleAuthority: LifecycleAuthority = {
+      sessionId: owner.id, allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+      maxTransitions: 16, transitions: 5, issuedAt: updatedAt - 30_000, expiresAt: Date.now() + 60_000,
+    }
+    let observed = controller({
+      autoRecoveryBlocked: true, detail, updatedAt: new Date(updatedAt).toISOString(),
+      activeTaskAttempt: attempt, lifecycleAuthority,
+    })
+    const jobs = new FakeJobs()
+    let received: LeppyLoopOptions | undefined
+    let activated: unknown
+    const rt = runtime({
+      inspectControllers: async () => [observed],
+      activateIgnoredBaselineBridge: async (_repoRoot, _runId, identity) => { activated = identity },
+      run: async options => {
+        expect(activated).toEqual(options.ignoredBaselineRecovery)
+        received = options
+        return { ...completed, runId: observed.runId }
+      },
+    })
+
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: observed.runId, tasks: observed.checklistRelative, syncBranch: observed.syncBranch,
+    })).resolves.toMatchObject({ status: 'running', runId: observed.runId })
+    await jobs.starts[0]!.hooks.done
+    const marker = workerIgnoredBaselineBridgeIdentity(detail, attempt)!
+    expect(received?.ignoredBaselineRecovery).toEqual(marker)
+    observed = { ...observed, ignoredBaselineBridge: { ...marker, phase: 'consumed', authorityEpoch: 1, authorityTransition: 6, requestDigest: 'c'.repeat(64) }, lifecycleAuthority: { ...lifecycleAuthority, transitions: 6 } }
+
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: observed.runId, tasks: observed.checklistRelative, syncBranch: observed.syncBranch,
+    })).rejects.toThrow('automatic recovery circuit is open')
+    expect(jobs.starts).toHaveLength(1)
+  })
+
+  it.each(['authority persistence', 'job registration'] as const)(
+    'retries one prepared ignored-baseline admission after %s fails before any job starts', async failureStage => {
+      const owner = agent(`ignored-baseline-${failureStage.replace(' ', '-')}-owner`)
+      const updatedAt = Date.now() - 30_000
+      const detail = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates'
+      const attempt = activeAttempt()
+      let observed = controller({
+        autoRecoveryBlocked: true, detail, updatedAt: new Date(updatedAt).toISOString(), activeTaskAttempt: attempt,
+        lifecycleAuthority: {
+          sessionId: owner.id, allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+          maxTransitions: 16, transitions: 15, issuedAt: updatedAt - 30_000, expiresAt: Date.now() + 60_000,
+        },
+      })
+      const jobs = new FakeJobs()
+      if (failureStage === 'job registration') {
+        const start = jobs.start.bind(jobs)
+        vi.spyOn(jobs, 'start').mockImplementationOnce(() => { throw new Error('job registry unavailable') })
+          .mockImplementation(spec => start(spec))
+      }
+      let persistenceCalls = 0
+      let received: LeppyLoopOptions | undefined
+      const rt = runtime({
+        inspectControllers: async () => [observed],
+        activateIgnoredBaselineBridge: async (_repoRoot, _runId, identity, lifecycleAuthority, requestDigest) => {
+          observed = {
+            ...observed,
+            ignoredBaselineBridge: {
+              ...identity, phase: 'prepared', authorityEpoch: lifecycleAuthority.epoch ?? 1,
+              authorityTransition: lifecycleAuthority.transitions, requestDigest,
+            },
+          }
+        },
+        persistAuthority: async (_repoRoot, _runId, lifecycleAuthority) => {
+          persistenceCalls += 1
+          if (failureStage === 'authority persistence' && persistenceCalls === 1) throw new Error('disk full')
+          observed = { ...observed, lifecycleAuthority }
+        },
+        run: async options => { received = options; return { ...completed, runId: observed.runId } },
+      })
+      const input = {
+        operation: 'continue' as const, runId: observed.runId,
+        tasks: observed.checklistRelative, syncBranch: observed.syncBranch,
+      }
+
+      await expect(executeLeppyLoopControl(context(jobs), rt, owner, input))
+        .rejects.toThrow(failureStage === 'authority persistence' ? 'disk full' : 'job registry unavailable')
+      expect(jobs.starts).toHaveLength(0)
+      expect(observed.ignoredBaselineBridge).toMatchObject({ phase: 'prepared' })
+      if (failureStage === 'job registration') {
+        await expect(executeLeppyLoopControl(context(jobs), rt, owner, { ...input, workerPolicy: 'sol-low' }))
+          .rejects.toThrow('human lifecycle transition budget exhausted')
+        expect(jobs.starts).toHaveLength(0)
+      }
+      await expect(executeLeppyLoopControl(context(jobs), rt, owner, input))
+        .resolves.toMatchObject({ status: 'running', runId: observed.runId })
+      await jobs.starts[0]!.hooks.done
+      expect(jobs.starts).toHaveLength(1)
+      expect(received?.lifecycleAuthority).toMatchObject({ transitions: 16, maxTransitions: 16 })
+      expect(persistenceCalls).toBe(failureStage === 'authority persistence' ? 2 : 1)
+    },
+  )
+
   it('fails closed when the legacy detail has no active attempt or is a current near-match', async () => {
     const owner = agent('ignored-baseline-negative-owner')
     const updatedAt = Date.now() - 30_000
@@ -931,8 +1035,23 @@ describe('grant-validated background controller tool', () => {
       operation: 'continue', runId: missingAttempt.runId, tasks: missingAttempt.checklistRelative, syncBranch: missingAttempt.syncBranch,
     })).rejects.toThrow('[condition=a8c80a08d394598c; bytes=101; activeAttempt=no]')
 
+    const consumedDetail = `${exact} after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates`
+    const consumedAttempt = activeAttempt()
+    const consumed = controller({
+      autoRecoveryBlocked: true, detail: consumedDetail,
+      updatedAt: new Date(updatedAt).toISOString(), activeTaskAttempt: consumedAttempt,
+      ignoredBaselineBridge: {
+        ...workerIgnoredBaselineBridgeIdentity(consumedDetail, consumedAttempt)!, phase: 'consumed',
+        authorityEpoch: 1, authorityTransition: authority.transitions, requestDigest: 'c'.repeat(64),
+      },
+      lifecycleAuthority: authority,
+    })
+    await expect(executeLeppyLoopControl(context(), runtime({ inspectControllers: async () => [consumed] }), owner, {
+      operation: 'continue', runId: consumed.runId, tasks: consumed.checklistRelative, syncBranch: consumed.syncBranch,
+    })).rejects.toThrow(/automatic recovery circuit is open.*\[condition=[0-9a-f]{16}; bytes=193; activeAttempt=yes\]/u)
+
     const nearMatch = controller({
-      autoRecoveryBlocked: true, detail: `${exact} after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates`,
+      autoRecoveryBlocked: true, detail: `${exact} after exact tracked and untracked base-ignore inference within 4 additions and 3 candidates`,
       updatedAt: new Date(updatedAt).toISOString(), activeTaskAttempt: activeAttempt(), lifecycleAuthority: authority,
     })
     await expect(executeLeppyLoopControl(context(), runtime({ inspectControllers: async () => [nearMatch] }), owner, {

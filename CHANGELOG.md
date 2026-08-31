@@ -2,6 +2,15 @@
 
 All notable changes are documented here.
 
+## [0.3.31] - 2026-08-31
+
+### Fixed
+
+- The exact `0.3.30` base-ignore terminal receives one final persisted-authority capability transition for paths that became tracked since the authenticated active-attempt base but are no longer ignored by current rules. Promotion discovery disables rename detection so an exact ignored preimage promoted as a tracked rename destination is still represented as Added, and accepts only paths ignored either now or under the byte-exact regular `.gitignore` rules from the immutable base.
+- Current bytes, type and path must still reconstruct the authenticated ordered-fingerprint SHA-256 digest exactly. Candidate discovery and a second stable snapshot repeat current/base ignore classification under the existing path/file/byte budgets before an inferred receipt; resumed attempts revalidate inferred fingerprints and filesystem identity.
+- Every legacy ignored-baseline capability transition now uses a two-phase admission. The command binds the normalized exact terminal and full active-attempt identity into an idempotent `prepared` marker, acquires the repository lock, reparses and HMAC-verifies current state, then atomically embeds that marker before lifecycle/job admission. The preparation also binds a digest of the normalized technical request and its target lifecycle epoch/transition: persistence failure retries the same target, while a persisted receipt followed by job-registration failure reuses that exact admission without incrementing the transition budget, including the final allowed transition. The runner requires the exact option and prepared marker, then HMAC-promotes it to `consumed` under the repository lock before reconciliation; only consumed state blocks replay.
+- Regression coverage promotes an ignored pre-existing file while narrowing `.gitignore` and deleting an identical tracked source, forcing Git rename detection without `--no-renames`. The integrated runner case proves the de-ignored tracked baseline is preserved, four generated outputs are quarantined, the committed candidate becomes clean, and exactly one isolated verifier is released.
+
 ## [0.3.30] - 2026-08-31
 
 ### Fixed

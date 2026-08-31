@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { parseChecklist, selectTask } from './checklist.js'
 import { branch as gitBranch, resolveRepoRoot } from './git.js'
+import { sameIgnoredBaselineBridge, workerIgnoredBaselineBridgeIdentity } from './ignored-artifacts.js'
 import { inspectLifecycleAuthority } from './lifecycle-authority.js'
 import { isAuthenticatedPublicationRebase } from './publish.js'
 import { runFile } from './process.js'
@@ -11,7 +12,7 @@ import {
   separateRunStateProofMatches, type EmbeddedRunStateProof,
 } from './run-state-proof.js'
 import { acquireLock, atomicWriteJson } from './state.js'
-import type { ActiveTaskAttempt, ChecklistTask, LifecycleAuthority, PendingTaskValidation, RunResult } from './types.js'
+import type { ActiveTaskAttempt, ChecklistTask, IgnoredBaselineBridgeAdmission, IgnoredBaselineBridgeIdentity, LifecycleAuthority, PendingTaskValidation, RunResult } from './types.js'
 
 interface StoredRunState {
   schemaVersion: 1
@@ -40,6 +41,7 @@ interface StoredRunState {
   autoRecoveryBlocked?: boolean
   dependencyBridgeActive?: boolean
   windowsArgvBridgeActive?: boolean
+  ignoredBaselineBridge?: IgnoredBaselineBridgeAdmission
   updatedAt: string
 }
 
@@ -68,6 +70,7 @@ export interface AuthenticatedController {
   autoRecoveryBlocked?: boolean
   dependencyBridgeActive?: boolean
   windowsArgvBridgeActive?: boolean
+  ignoredBaselineBridge?: IgnoredBaselineBridgeAdmission
 }
 
 function taskIdentity(task: ChecklistTask): string {
@@ -88,6 +91,18 @@ function validFailureStreak(value: unknown): boolean {
   return typeof streak.taskKey === 'string' && /^[0-9a-f]{64}$/u.test(streak.taskKey)
     && typeof streak.signature === 'string' && /^[0-9a-f]{64}$/u.test(streak.signature)
     && typeof streak.count === 'number' && Number.isSafeInteger(streak.count) && streak.count > 0
+}
+
+function validIgnoredBaselineBridge(value: unknown): value is IgnoredBaselineBridgeIdentity | undefined {
+  if (value === undefined) return true
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const bridge = value as Partial<IgnoredBaselineBridgeAdmission>
+  return bridge.schemaVersion === 1 && (bridge.phase === 'prepared' || bridge.phase === 'consumed')
+    && Number.isSafeInteger(bridge.authorityEpoch) && bridge.authorityEpoch! > 0
+    && Number.isSafeInteger(bridge.authorityTransition) && bridge.authorityTransition! > 0
+    && typeof bridge.requestDigest === 'string' && /^[0-9a-f]{64}$/u.test(bridge.requestDigest)
+    && typeof bridge.conditionDigest === 'string' && /^[0-9a-f]{64}$/u.test(bridge.conditionDigest)
+    && typeof bridge.activeAttemptDigest === 'string' && /^[0-9a-f]{64}$/u.test(bridge.activeAttemptDigest)
 }
 
 function validIgnoredArtifactTransaction(value: ActiveTaskAttempt['ignoredArtifactTransaction'] | unknown): boolean {
@@ -171,6 +186,7 @@ function parseStoredRun(path: string): StoredRunState | undefined {
       || (value.autoRecoveryBlocked !== undefined && typeof value.autoRecoveryBlocked !== 'boolean')
       || (value.dependencyBridgeActive !== undefined && typeof value.dependencyBridgeActive !== 'boolean')
       || (value.windowsArgvBridgeActive !== undefined && typeof value.windowsArgvBridgeActive !== 'boolean')
+      || !validIgnoredBaselineBridge(value.ignoredBaselineBridge)
       || typeof value.updatedAt !== 'string'
       || (value.lastError !== undefined && typeof value.lastError !== 'string')
       || (value.publicationTargetCommit !== undefined && (typeof value.publicationTargetCommit !== 'string' || !/^[0-9a-f]{40}$/u.test(value.publicationTargetCommit)))
@@ -216,6 +232,7 @@ export async function migrateRunStateSecurityProof(cwd: string, runId: string): 
     delete target.autoRecoveryBlocked
     delete target.dependencyBridgeActive
     delete target.windowsArgvBridgeActive
+    delete target.ignoredBaselineBridge
     if (status === 'invalid' && !separateRunStateProofMatches(stateDir, target, key)) {
       throw new Error(`run ${runId} has an invalid ownership proof`)
     }
@@ -225,6 +242,59 @@ export async function migrateRunStateSecurityProof(cwd: string, runId: string): 
     persistRunStateProof(stateDir, target, key)
     target.stateProof = createEmbeddedRunStateProof(target, key)
     atomicWriteJson(statePath, target)
+  } finally {
+    release()
+  }
+}
+
+/** Consume one exact legacy ignored-baseline capability before a controller job can start. */
+export async function activateIgnoredBaselineBridge(
+  cwd: string, runId: string, expected: IgnoredBaselineBridgeIdentity, authority: LifecycleAuthority,
+  requestDigest: string,
+): Promise<void> {
+  if (!/^[0-9a-f]{64}$/u.test(requestDigest)) throw new Error('ignored-baseline admission request digest is invalid')
+  const authorityEpoch = authority.epoch ?? 1
+  const authorityTransition = authority.transitions
+  if (!Number.isSafeInteger(authorityEpoch) || authorityEpoch <= 0
+    || !Number.isSafeInteger(authorityTransition) || authorityTransition <= 0) {
+    throw new Error('ignored-baseline admission requires a positive lifecycle transition identity')
+  }
+  const repoRoot = realpathSync(await resolveRepoRoot(cwd))
+  const commonRaw = (await runFile('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot })).stdout.trim()
+  const commonDir = resolve(repoRoot, commonRaw)
+  const stateDir = join(commonDir, 'leppy-loop', 'runs', runId)
+  const statePath = join(stateDir, 'run.json')
+  const keyPath = join(stateDir, 'lease.key')
+  const release = await acquireLock(commonDir, `ignored-baseline-bridge-${runId}`)
+  try {
+    const state = parseStoredRun(statePath)
+    if (!state || state.runId !== runId || realpathSync(state.repoRoot) !== repoRoot || !existsSync(keyPath)) {
+      throw new Error('cannot activate ignored-baseline bridge for an unauthenticated run')
+    }
+    const key = Buffer.from(readFileSync(keyPath, 'utf8').trim(), 'base64')
+    if (inspectRunStateProof(stateDir, state, key) !== 'current') {
+      throw new Error('cannot activate ignored-baseline bridge with a non-current run-state proof')
+    }
+    const observed = workerIgnoredBaselineBridgeIdentity(state.lastError, state.activeTaskAttempt)
+    if (!sameIgnoredBaselineBridge(observed, expected)) {
+      throw new Error('the authenticated ignored-baseline recovery condition changed before job admission')
+    }
+    if (sameIgnoredBaselineBridge(state.ignoredBaselineBridge, expected)) {
+      if (state.ignoredBaselineBridge?.phase === 'prepared'
+        && state.ignoredBaselineBridge.authorityEpoch === authorityEpoch
+        && state.ignoredBaselineBridge.authorityTransition === authorityTransition
+        && state.ignoredBaselineBridge.requestDigest === requestDigest) return
+      if (state.ignoredBaselineBridge?.phase === 'consumed') {
+        throw new Error('the authenticated ignored-baseline recovery condition was already consumed')
+      }
+      throw new Error('the prepared ignored-baseline admission is bound to a different lifecycle transition')
+    }
+    state.ignoredBaselineBridge = {
+      ...expected, phase: 'prepared', authorityEpoch, authorityTransition, requestDigest,
+    }
+    state.updatedAt = new Date().toISOString()
+    state.stateProof = createEmbeddedRunStateProof(state, key)
+    atomicWriteJson(statePath, state)
   } finally {
     release()
   }
@@ -326,6 +396,7 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       autoRecoveryBlocked: state.autoRecoveryBlocked,
       dependencyBridgeActive: state.dependencyBridgeActive,
       windowsArgvBridgeActive: state.windowsArgvBridgeActive,
+      ignoredBaselineBridge: state.ignoredBaselineBridge,
     })).digest('hex')
     controllers.push({
       runId: state.runId,
@@ -350,6 +421,7 @@ export async function inspectAuthenticatedControllers(cwd: string): Promise<Auth
       ...(state.autoRecoveryBlocked === undefined ? {} : { autoRecoveryBlocked: state.autoRecoveryBlocked }),
       ...(state.dependencyBridgeActive === undefined ? {} : { dependencyBridgeActive: state.dependencyBridgeActive }),
       ...(state.windowsArgvBridgeActive === undefined ? {} : { windowsArgvBridgeActive: state.windowsArgvBridgeActive }),
+      ...(state.ignoredBaselineBridge ? { ignoredBaselineBridge: state.ignoredBaselineBridge } : {}),
       ...(publicationRebase ? { publicationRebase: true } : {}),
     })
   }

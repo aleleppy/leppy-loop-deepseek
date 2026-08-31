@@ -6,7 +6,7 @@ import { ignoredPathSnapshot } from './git.js'
 import { runFile, runFileBuffer } from './process.js'
 import { scrubEnvironment } from './security.js'
 import { atomicWriteJson } from './state.js'
-import type { IgnoredArtifactTransactionRef } from './types.js'
+import type { ActiveTaskAttempt, IgnoredArtifactTransactionRef, IgnoredBaselineBridgeIdentity } from './types.js'
 
 const BASELINES = 'worker-ignored-path-baselines'
 const RECOVERIES = 'worker-ignored-path-recovery'
@@ -55,6 +55,7 @@ const LEGACY_BASELINE_MISSING_DETAIL = 'worker ignored artifact recovery lacks i
 const LEGACY_SUBSET_THREE_ADDITION_DETAIL = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'
 const LEGACY_SUBSET_FOUR_DETAIL = new RegExp(`^${LEGACY_SUBSET_THREE_ADDITION_DETAIL} within 4 additions and ([0-9]+) candidates$`, 'u')
 const LEGACY_TRACKED_PROMOTION_DETAIL = new RegExp(`^${LEGACY_SUBSET_THREE_ADDITION_DETAIL} after exact newly tracked promotion inference within 4 additions and ([0-9]+) candidates$`, 'u')
+const LEGACY_BASE_IGNORE_DETAIL = new RegExp(`^${LEGACY_SUBSET_THREE_ADDITION_DETAIL} after exact tracked-promotion and base-ignore inference within 4 additions and ([0-9]+) candidates$`, 'u')
 const LEGACY_SUBSET_FOUR_TERMINAL_CANDIDATES = new Set(Array.from({ length: 40 }, (_value, entries) => {
   let total = 0
   let combinations = 1
@@ -71,10 +72,35 @@ export function workerIgnoredBaselineRecovery(detail: string | undefined): boole
   if (normalized === LEGACY_BASELINE_MISSING_DETAIL || normalized === LEGACY_SUBSET_THREE_ADDITION_DETAIL) return true
   const fourAddition = normalized?.match(LEGACY_SUBSET_FOUR_DETAIL)
     ?? normalized?.match(LEGACY_TRACKED_PROMOTION_DETAIL)
+    ?? normalized?.match(LEGACY_BASE_IGNORE_DETAIL)
   if (!fourAddition) return false
   const candidates = Number(fourAddition[1])
   return Number.isSafeInteger(candidates) && fourAddition[1] === String(candidates)
     && LEGACY_SUBSET_FOUR_TERMINAL_CANDIDATES.has(candidates)
+}
+
+export function workerIgnoredBaselineBridgeIdentity(
+  detail: string | undefined, activeAttempt: ActiveTaskAttempt | undefined,
+): IgnoredBaselineBridgeIdentity | undefined {
+  const normalized = detail?.trim()
+  if (!normalized || !activeAttempt || !workerIgnoredBaselineRecovery(normalized)) return undefined
+  const attemptIdentity = JSON.stringify({
+    taskKey: activeAttempt.taskKey, taskIndex: activeAttempt.taskIndex, baseHead: activeAttempt.baseHead,
+    checklistDigest: activeAttempt.checklistDigest, ignoredPathsDigest: activeAttempt.ignoredPathsDigest,
+    attempt: activeAttempt.attempt,
+  })
+  return {
+    schemaVersion: 1,
+    conditionDigest: createHash('sha256').update(normalized).digest('hex'),
+    activeAttemptDigest: createHash('sha256').update(attemptIdentity).digest('hex'),
+  }
+}
+
+export function sameIgnoredBaselineBridge(
+  left: IgnoredBaselineBridgeIdentity | undefined, right: IgnoredBaselineBridgeIdentity | undefined,
+): boolean {
+  return left !== undefined && right !== undefined
+    && left.conditionDigest === right.conditionDigest && left.activeAttemptDigest === right.activeAttemptDigest
 }
 
 type Baseline = {
@@ -278,7 +304,7 @@ async function inferLegacyBaselineSubset(
   }
   if (!match) {
     const capability = inference === 'base-ignore'
-      ? ' after exact tracked-promotion and base-ignore inference'
+      ? ' after exact tracked and untracked base-ignore inference'
       : inference === 'tracked-promotion' ? ' after exact newly tracked promotion inference' : ''
     throw new Error(`worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints${capability} within ${maxAdditions} additions and ${examined} candidates`)
   }
@@ -337,7 +363,7 @@ async function boundedLegacyCandidateFingerprints(worktree: string, paths: reado
 async function newlyTrackedIgnoredFingerprints(worktree: string, baseHead: string): Promise<readonly string[]> {
   if (!/^[0-9a-f]{40,64}$/u.test(baseHead)) throw new Error('legacy ignored promotion base HEAD is invalid')
   const addedResult = await runFileBuffer('git', [
-    'diff', '--name-only', '--diff-filter=A', '-z', `${baseHead}..HEAD`, '--',
+    'diff', '--name-only', '--no-renames', '--diff-filter=A', '-z', `${baseHead}..HEAD`, '--',
   ], { cwd: worktree, env: scrubEnvironment(process.env) })
   const added = [...new Set(binaryNulRecords(addedResult, 'legacy ignored promotion tree')
     .map(path => canonicalGitPath(path, 'legacy ignored promotion tree')))].sort()
@@ -354,19 +380,16 @@ async function newlyTrackedIgnoredFingerprints(worktree: string, baseHead: strin
     }
     if (result.exitCode === 0) ignored.push(path)
   }
-  return await boundedLegacyCandidateFingerprints(worktree, ignored)
+  const baseIgnored = await baseIgnoredCandidatePaths(worktree, baseHead, added, 'newly tracked')
+  return await boundedLegacyCandidateFingerprints(worktree, [...new Set([...ignored, ...baseIgnored])].sort())
 }
 
-async function baseIgnoredCurrentUntrackedFingerprints(worktree: string, baseHead: string): Promise<readonly string[]> {
+async function baseIgnoredCandidatePaths(
+  worktree: string, baseHead: string, candidates: readonly string[], label: string,
+): Promise<readonly string[]> {
   if (!/^[0-9a-f]{40,64}$/u.test(baseHead)) throw new Error('legacy base-ignore HEAD is invalid')
-  const untrackedResult = await runFileBuffer('git', [
-    'ls-files', '--others', '--exclude-standard', '-z', '--', '.',
-    ':(exclude,glob)**/node_modules/**', ':(exclude,glob).npm-cache/**', ':(exclude,glob)**/.npm-cache/**',
-  ], { cwd: worktree, env: scrubEnvironment(process.env) })
-  const untracked = [...new Set(binaryNulRecords(untrackedResult, 'legacy base-ignore untracked state')
-    .map(path => canonicalGitPath(path, 'legacy base-ignore untracked state')))].sort()
-  if (untracked.length > LEGACY_SUBSET_MAX_ENTRIES) {
-    throw new Error(`legacy base-ignore inference exceeds ${LEGACY_SUBSET_MAX_ENTRIES} current untracked paths`)
+  if (candidates.length > LEGACY_SUBSET_MAX_ENTRIES) {
+    throw new Error(`legacy base-ignore inference exceeds ${LEGACY_SUBSET_MAX_ENTRIES} ${label} paths`)
   }
   const ignoreList = await runFileBuffer('git', [
     'ls-tree', '-r', '-z', baseHead,
@@ -424,7 +447,7 @@ async function baseIgnoredCurrentUntrackedFingerprints(worktree: string, baseHea
       writeFileSync(target, source)
     }
     const baseIgnored: string[] = []
-    for (const path of untracked) {
+    for (const path of candidates) {
       const result = await runFile('git', [
         `--work-tree=${scratch}`, 'check-ignore', '--no-index', '--', path,
       ], { cwd: worktree, env: baseEnvironment, allowFailure: true })
@@ -433,10 +456,21 @@ async function baseIgnoredCurrentUntrackedFingerprints(worktree: string, baseHea
       }
       if (result.exitCode === 0) baseIgnored.push(path)
     }
-    return await boundedLegacyCandidateFingerprints(worktree, baseIgnored)
+    return baseIgnored
   } finally {
     rmSync(scratch, { recursive: true, force: true })
   }
+}
+
+async function baseIgnoredCurrentUntrackedFingerprints(worktree: string, baseHead: string): Promise<readonly string[]> {
+  const untrackedResult = await runFileBuffer('git', [
+    'ls-files', '--others', '--exclude-standard', '-z', '--', '.',
+    ':(exclude,glob)**/node_modules/**', ':(exclude,glob).npm-cache/**', ':(exclude,glob)**/.npm-cache/**',
+  ], { cwd: worktree, env: scrubEnvironment(process.env) })
+  const untracked = [...new Set(binaryNulRecords(untrackedResult, 'legacy base-ignore untracked state')
+    .map(path => canonicalGitPath(path, 'legacy base-ignore untracked state')))].sort()
+  const baseIgnored = await baseIgnoredCandidatePaths(worktree, baseHead, untracked, 'current untracked')
+  return await boundedLegacyCandidateFingerprints(worktree, baseIgnored)
 }
 
 async function legacyRecoverySnapshot(worktree: string, baseHead: string | undefined): Promise<{ entries: readonly string[]; digest: string }> {
@@ -554,7 +588,7 @@ export async function reconcileWorkerIgnoredPaths(options: {
   taskIndex: number
   attempt: number
   expectedBaselineDigest: string
-  /** Authenticated pre-attempt HEAD; only exact newly tracked ignored paths may augment legacy inference. */
+  /** Authenticated pre-attempt HEAD; exact newly tracked or current ordinary paths ignored by current/base rules may augment inference. */
   legacyBaseHead?: string
   expectedTransaction?: IgnoredArtifactTransactionRef
   key: Buffer

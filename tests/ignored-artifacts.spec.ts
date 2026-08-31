@@ -73,7 +73,9 @@ describe('authenticated ignored artifact recovery', () => {
     expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 9007199254740993 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact newly tracked promotion inference within 4 additions and 3 candidates`)).toBe(true)
     expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact newly tracked promotion inference within 4 additions and 0003 candidates`)).toBe(false)
-    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates`)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates`)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked-promotion and base-ignore inference within 4 additions and 0003 candidates`)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked and untracked base-ignore inference within 4 additions and 3 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(undefined)).toBe(false)
   })
 
@@ -315,6 +317,29 @@ describe('authenticated ignored artifact recovery', () => {
     expect(readFileSync(promoted, 'utf8')).toBe('preserve\n')
     expect(existsSync(added)).toBe(false)
     expect(readFileSync(join(inferred.quarantine!, 'ignored', 'worker-output.txt'), 'utf8')).toBe('worker\n')
+  })
+
+  it('recovers a base-ignored tracked promotion that is now de-ignored and detected as a rename', async () => {
+    const repo = fixture()
+    writeFileSync(join(repo.root, 'source.txt'), 'preserve\n')
+    git(repo.root, 'add', '--', 'source.txt')
+    git(repo.root, 'commit', '-m', 'chore: add rename source')
+    const promoted = writeIgnored(repo.root, 'pre-existing.txt', 'preserve\n')
+    const recorded = await baseline(repo)
+    const baseHead = git(repo.root, 'rev-parse', 'HEAD')
+    rmSync(join(repo.stateDir, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    writeFileSync(join(repo.root, '.gitignore'), 'ignored/worker-output.txt\n')
+    rmSync(join(repo.root, 'source.txt'))
+    git(repo.root, 'add', '--', '.gitignore', 'source.txt')
+    git(repo.root, 'add', '-f', '--', 'ignored/pre-existing.txt')
+    git(repo.root, 'commit', '-m', 'feat: rename into a now de-ignored promotion')
+    const added = writeIgnored(repo.root, 'worker-output.txt', 'worker\n')
+
+    const inferred = await reconcile(repo, recorded.digest, { legacyBaseHead: baseHead })
+    expect(inferred).toMatchObject({ basis: 'authenticated-subset-digest', paths: ['ignored/worker-output.txt'] })
+    expect(git(repo.root, 'ls-files', '--', 'ignored/pre-existing.txt')).toBe('ignored/pre-existing.txt')
+    expect(readFileSync(promoted, 'utf8')).toBe('preserve\n')
+    expect(existsSync(added)).toBe(false)
   })
 
   it('reconstructs a legacy baseline from an unchanged path de-ignored since the active base', async () => {
@@ -605,7 +630,7 @@ describe('authenticated ignored artifact recovery', () => {
     }
     const unknownDigest = createHash('sha256').update('unmatched predecessor baseline').digest('hex')
 
-    await expect(reconcile(repo, unknownDigest)).rejects.toThrow('after exact tracked-promotion and base-ignore inference within 4 additions and 92170 candidates')
+    await expect(reconcile(repo, unknownDigest)).rejects.toThrow('after exact tracked and untracked base-ignore inference within 4 additions and 92170 candidates')
     expect(existsSync(join(repo.stateDir, 'worker-ignored-path-baselines', '0-1.json'))).toBe(false)
     expect(existsSync(join(repo.stateDir, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
   }, 30_000)

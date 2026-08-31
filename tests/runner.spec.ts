@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import * as gitModule from '../src/git.js'
+import { workerIgnoredBaselineBridgeIdentity } from '../src/ignored-artifacts.js'
 import { parseChecklist, selectTask } from '../src/checklist.js'
 import { awaitAuthenticatedLeaseSettlement, runLeppyLoop } from '../src/runner.js'
 import { createLeaseKey, signLease } from '../src/state.js'
@@ -402,10 +403,11 @@ describe('controller state machine', () => {
     expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'attempt-12.log'), 'utf8')).toBe('legacy worker output\n')
   }, 90_000)
 
-  it('recovers a committed legacy attempt with an exact tracked promotion plus four ignored additions', async () => {
-    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt,ignored-worker-output/pre-existing.env | Done: implementation committed\n')
-    writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
-    git(repo.root, 'add', '--', '.gitignore')
+  it('recovers a committed legacy attempt with an exact base-ignored tracked promotion plus four additions', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt,config | Done: implementation committed\n')
+    mkdirSync(join(repo.root, 'config'))
+    writeFileSync(join(repo.root, 'config', '.gitignore'), 'worker-output/\n')
+    git(repo.root, 'add', '--', 'config/.gitignore')
     git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
     const first = await runLeppyLoop(
       { tasks: repo.tasks, syncBranch: 'main', fetch: false },
@@ -415,14 +417,15 @@ describe('controller state machine', () => {
     const state = JSON.parse(readFileSync(statePath, 'utf8'))
     const checklistSource = readFileSync(join(first.worktree!, 'tasks.task.md'), 'utf8')
     const task = selectTask(parseChecklist(checklistSource, join(first.worktree!, 'tasks.task.md')))!
-    mkdirSync(join(first.worktree!, 'ignored-worker-output'), { recursive: true })
-    const preserved = join(first.worktree!, 'ignored-worker-output', 'pre-existing.env')
+    mkdirSync(join(first.worktree!, 'config', 'worker-output'), { recursive: true })
+    const preserved = join(first.worktree!, 'config', 'worker-output', 'pre-existing.env')
     writeFileSync(preserved, 'pre-existing ignored WIP\n')
     const authenticatedBaseline = await gitModule.ignoredPathSnapshot(first.worktree!)
     const baseHead = git(first.worktree!, 'rev-parse', 'HEAD')
     writeFileSync(join(first.worktree!, 'src', 'value.txt'), 'committed candidate\n')
-    git(first.worktree!, 'add', '--', 'src/value.txt')
-    git(first.worktree!, 'add', '-f', '--', 'ignored-worker-output/pre-existing.env')
+    writeFileSync(join(first.worktree!, 'config', '.gitignore'), 'worker-output/worker-report-*.json\n')
+    git(first.worktree!, 'add', '--', 'src/value.txt', 'config/.gitignore')
+    git(first.worktree!, 'add', '-f', '--', 'config/worker-output/pre-existing.env')
     git(first.worktree!, 'commit', '-m', 'feat: committed legacy candidate')
     state.activeTaskAttempt = {
       schemaVersion: 1,
@@ -432,12 +435,16 @@ describe('controller state machine', () => {
       ignoredPathsDigest: authenticatedBaseline.digest,
       attempt: state.attempt,
     }
+    state.lastError = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates'
+    state.autoRecoveryBlocked = true
+    const bridgeIdentity = workerIgnoredBaselineBridgeIdentity(state.lastError, state.activeTaskAttempt)!
+    state.ignoredBaselineBridge = { ...bridgeIdentity, phase: 'prepared', authorityEpoch: 1, authorityTransition: 1, requestDigest: 'c'.repeat(64) }
     delete state.stateProof
     writeFileSync(statePath, `${JSON.stringify(state)}\n`)
     persistRunStateProof(first.stateDir!, state, Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64'))
     rmSync(join(first.stateDir!, 'worker-ignored-path-baselines'), { recursive: true, force: true })
     const outputs = Array.from({ length: 4 }, (_value, index) => {
-      const path = join(first.worktree!, 'ignored-worker-output', `worker-report-${index}.json`)
+      const path = join(first.worktree!, 'config', 'worker-output', `worker-report-${index}.json`)
       writeFileSync(path, `{"worker":${index}}\n`)
       return path
     })
@@ -452,18 +459,20 @@ describe('controller state machine', () => {
     } }
     const recovered = await runLeppyLoop({
       tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      ignoredBaselineRecovery: bridgeIdentity,
     }, { ...modelDeps, worker: verifier })
     expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
     expect(verifierCalls).toBe(1)
     expect(readFileSync(preserved, 'utf8')).toBe('pre-existing ignored WIP\n')
+    expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({ ignoredBaselineBridge: { ...bridgeIdentity, phase: 'consumed', authorityEpoch: 1, authorityTransition: 1, requestDigest: 'c'.repeat(64) } })
     const baselineReceipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-baselines', `0-${state.attempt}.json`), 'utf8'))
     expect(baselineReceipt).toMatchObject({
       basis: 'authenticated-subset-digest', digest: authenticatedBaseline.digest,
-      entries: [{ path: 'ignored-worker-output/pre-existing.env' }],
+      entries: [{ path: 'config/worker-output/pre-existing.env' }],
     })
     const receipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`), 'utf8'))
     for (let index = 0; index < 4; index += 1) {
-      expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', `worker-report-${index}.json`), 'utf8')).toBe(`{"worker":${index}}\n`)
+      expect(readFileSync(join(receipt.quarantineRoot, 'config', 'worker-output', `worker-report-${index}.json`), 'utf8')).toBe(`{"worker":${index}}\n`)
     }
   }, 90_000)
 

@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { parseChecklist, selectTask } from '../src/checklist.js'
-import { inspectAuthenticatedControllers, migrateRunStateSecurityProof } from '../src/controller-auth.js'
+import { activateIgnoredBaselineBridge, inspectAuthenticatedControllers, migrateRunStateSecurityProof } from '../src/controller-auth.js'
+import { workerIgnoredBaselineBridgeIdentity } from '../src/ignored-artifacts.js'
 import { appendLifecycleAuthorityReceipt } from '../src/lifecycle-authority.js'
 import { ensureRunStateProofRequired, persistRunStateProof } from '../src/run-state-proof.js'
 import { createLeaseKey } from '../src/state.js'
@@ -120,20 +121,25 @@ describe('authenticated controller lifecycle authority integrity', () => {
   it('round-trips the authenticated legacy ignored bridge condition and active attempt after Host restart', async () => {
     const fixture = repository(true)
     const facts = taskFacts(fixture.root)
-    const detail = '\r\n worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact newly tracked promotion inference within 4 additions and 3 candidates\t'
+    const detail = '\r\n worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates\t'
+    const active: ActiveTaskAttempt = {
+      schemaVersion: 1, taskKey: facts.taskKey, taskIndex: 0,
+      baseHead: git(fixture.root, 'rev-parse', 'HEAD'), checklistDigest: facts.checklistDigest,
+      ignoredPathsDigest: 'd'.repeat(64), attempt: 1,
+    }
+    const bridge = workerIgnoredBaselineBridgeIdentity(detail, active)!
     authenticateState(fixture, state => {
       state.lastError = detail
       state.autoRecoveryBlocked = true
-      state.activeTaskAttempt = {
-        schemaVersion: 1, taskKey: facts.taskKey, taskIndex: 0,
-        baseHead: git(fixture.root, 'rev-parse', 'HEAD'), checklistDigest: facts.checklistDigest,
-        ignoredPathsDigest: 'd'.repeat(64), attempt: 1,
-      }
+      state.activeTaskAttempt = active
     })
+    await activateIgnoredBaselineBridge(fixture.root, fixture.runId, bridge, authority(), 'c'.repeat(64))
+    await expect(activateIgnoredBaselineBridge(fixture.root, fixture.runId, bridge, authority(), 'c'.repeat(64))).resolves.toBeUndefined()
 
     await expect(inspectAuthenticatedControllers(fixture.root)).resolves.toMatchObject([{
       runId: fixture.runId, detail, autoRecoveryBlocked: true,
       activeTaskAttempt: { taskKey: facts.taskKey, ignoredPathsDigest: 'd'.repeat(64), attempt: 1 },
+      ignoredBaselineBridge: { phase: 'prepared', authorityEpoch: 1, authorityTransition: 1, requestDigest: 'c'.repeat(64), conditionDigest: expect.stringMatching(/^[0-9a-f]{64}$/u), activeAttemptDigest: expect.stringMatching(/^[0-9a-f]{64}$/u) },
       lifecycleAuthority: { sessionId: 'session-a', transitions: 1 },
     }])
   })
@@ -141,11 +147,12 @@ describe('authenticated controller lifecycle authority integrity', () => {
   it('migrates legacy ownership once and rejects later recovery-state tampering', async () => {
     const legacy = repository(false)
     const statePath = join(legacy.stateDir, 'run.json')
-    const legacyState = JSON.parse(readFileSync(statePath, 'utf8')) as { stateProof?: { value?: string }; lastError?: string; autoRecoveryBlocked?: boolean; dependencyBridgeActive?: boolean; windowsArgvBridgeActive?: boolean }
+    const legacyState = JSON.parse(readFileSync(statePath, 'utf8')) as { stateProof?: { value?: string }; lastError?: string; autoRecoveryBlocked?: boolean; dependencyBridgeActive?: boolean; windowsArgvBridgeActive?: boolean; ignoredBaselineBridge?: { schemaVersion: 1; phase: 'prepared' | 'consumed'; authorityEpoch: number; authorityTransition: number; requestDigest: string; conditionDigest: string; activeAttemptDigest: string } }
     legacyState.lastError = 'forged legacy failure'
     legacyState.autoRecoveryBlocked = true
     legacyState.dependencyBridgeActive = true
     legacyState.windowsArgvBridgeActive = true
+    legacyState.ignoredBaselineBridge = { schemaVersion: 1, phase: 'consumed', authorityEpoch: 1, authorityTransition: 1, requestDigest: 'c'.repeat(64), conditionDigest: 'a'.repeat(64), activeAttemptDigest: 'b'.repeat(64) }
     writeFileSync(statePath, `${JSON.stringify(legacyState)}\n`)
 
     await migrateRunStateSecurityProof(legacy.root, legacy.runId)
@@ -155,6 +162,7 @@ describe('authenticated controller lifecycle authority integrity', () => {
     expect(migrated.autoRecoveryBlocked).toBeUndefined()
     expect(migrated.dependencyBridgeActive).toBeUndefined()
     expect(migrated.windowsArgvBridgeActive).toBeUndefined()
+    expect(migrated.ignoredBaselineBridge).toBeUndefined()
     expect(migrated.stateProof?.value).toMatch(/^[A-Za-z0-9_-]{43}$/u)
     unlinkSync(join(legacy.stateDir, 'ownership.hmac'))
     await expect(inspectAuthenticatedControllers(legacy.root)).resolves.toHaveLength(1)

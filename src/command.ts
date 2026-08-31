@@ -12,21 +12,21 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
 import { BUNDLED_SKILL_RANK, type SkillCandidate, type SkillDefinition, type SkillProvider } from '@deepseek-ai/dsh-skill'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { inspectAuthenticatedControllers, migrateRunStateSecurityProof, selectControllerForStatus } from './controller-auth.js'
+import { activateIgnoredBaselineBridge, inspectAuthenticatedControllers, migrateRunStateSecurityProof, selectControllerForStatus } from './controller-auth.js'
 import type { AuthenticatedController } from './controller-auth.js'
 import { resolveRepoRoot } from './git.js'
 import { acquireLifecycleAuthorityMutex, appendLifecycleAuthorityReceipt, lifecycleCommonDir, lifecycleStateDir } from './lifecycle-authority.js'
 import { harnessRunDependencies } from './harness-runtime.js'
 import { HumanGrantStore } from './human-grant.js'
 import { acquireLock } from './state.js'
-import type { RecoveryAuthority } from './human-grant.js'
+import type { GrantReservation, HumanGrant, RecoveryAuthority } from './human-grant.js'
 import { awaitAuthenticatedLeaseSettlement, runLeppyLoop } from './runner.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import { dependencyHydrationAvailable, dependencyResolutionMiss } from './worktree-dependencies.js'
 import { windowsQuotedExecutableFailure } from './windows-command.js'
 import { workerNpmCacheRecovery } from './worker-artifacts.js'
-import { workerIgnoredBaselineRecovery } from './ignored-artifacts.js'
-import type { LeppyLoopOptions, LifecycleAuthority, RunDependencies, RunProgress, RunResult, WorkerPolicy } from './types.js'
+import { sameIgnoredBaselineBridge, workerIgnoredBaselineBridgeIdentity } from './ignored-artifacts.js'
+import type { IgnoredBaselineBridgeIdentity, LeppyLoopOptions, LifecycleAuthority, RunDependencies, RunProgress, RunResult, WorkerPolicy } from './types.js'
 
 declare module '@deepseek-ai/dsh-commands/types' {
   interface CommandSourceMap {
@@ -78,6 +78,7 @@ export interface LeppyLoopCommandHooks {
   dependencies?: (ctx: Context, signal: AbortSignal) => RunDependencies
   inspectControllers?: (cwd: string) => Promise<AuthenticatedController[]>
   persistAuthority?: (repoRoot: string, runId: string, authority: LifecycleAuthority) => Promise<void>
+  activateIgnoredBaselineBridge?: (repoRoot: string, runId: string, identity: IgnoredBaselineBridgeIdentity, authority: LifecycleAuthority, requestDigest: string) => Promise<void>
 }
 
 export interface LeppyLoopControlArguments {
@@ -249,6 +250,21 @@ function lifecycleAuthority(grant: ReturnType<HumanGrantStore['reserve']>['grant
     maxRepairCycles: grant.maxRepairCycles, maxTransitions: grant.maxTransitions, transitions: grant.transitions,
     issuedAt: grant.issuedAt, expiresAt: grant.expiresAt,
     ...(grant.revokedAt === undefined ? {} : { revokedAt: grant.revokedAt }),
+  }
+}
+
+function preparedAdmissionGrant(
+  agent: Agent, repoRoot: string, runId: string, authority: LifecycleAuthority,
+): HumanGrant {
+  return {
+    id: `prepared-${runId}-${authority.epoch ?? 1}-${authority.transitions}`,
+    agent, sessionId: authority.sessionId, repoRoot, runId,
+    allowPublication: authority.allowPublication, epoch: authority.epoch ?? 1,
+    maxIterations: authority.maxIterations, maxRepairCycles: authority.maxRepairCycles,
+    maxTransitions: authority.maxTransitions, transitions: authority.transitions,
+    issuedAt: authority.issuedAt, expiresAt: authority.expiresAt,
+    ...(authority.revokedAt === undefined ? {} : { revokedAt: authority.revokedAt }),
+    reauthorizedAt: authority.issuedAt, inFlight: true,
   }
 }
 
@@ -498,8 +514,18 @@ export async function executeLeppyLoopControl(
   const windowsArgvRepair = args.operation === 'continue' && controller?.autoRecoveryBlocked === true
     && controller.windowsArgvBridgeActive !== true && windowsQuotedExecutableFailure(controller.detail)
   const workerArtifactRepair = args.operation === 'continue' && workerNpmCacheRecovery(controller?.detail)
-  const ignoredBaselineRepair = args.operation === 'continue' && controller?.activeTaskAttempt !== undefined
-    && workerIgnoredBaselineRecovery(controller.detail)
+  const ignoredBaselineRepairIdentity = args.operation === 'continue'
+    ? workerIgnoredBaselineBridgeIdentity(controller?.detail, controller?.activeTaskAttempt)
+    : undefined
+  const ignoredBaselineRequestDigest = ignoredBaselineRepairIdentity === undefined ? undefined : createHash('sha256').update(JSON.stringify({
+    tasks: resolve(cwd, requireString(args.tasks, 'tasks')), syncBranch: requireString(args.syncBranch, 'syncBranch'),
+    recovery: recoveryOf(args), taskMatch: args.taskMatch ?? null, publish: args.publish === true,
+    publicationTarget: args.publicationTarget ?? null, fetch: args.fetch !== false,
+    workerPolicy: args.workerPolicy ?? 'adaptive',
+  })).digest('hex')
+  const ignoredBaselineRepair = ignoredBaselineRepairIdentity !== undefined
+    && (!sameIgnoredBaselineBridge(ignoredBaselineRepairIdentity, controller?.ignoredBaselineBridge)
+      || controller?.ignoredBaselineBridge?.phase === 'prepared')
   if (args.operation === 'continue' && controller?.autoRecoveryBlocked === true
     && !dependencyRepair && !windowsArgvRepair && !workerArtifactRepair && !ignoredBaselineRepair
     && !durableReauthorizationFresh
@@ -508,14 +534,31 @@ export async function executeLeppyLoopControl(
     const condition = createHash('sha256').update(detail).digest('hex').slice(0, 16)
     throw new Error(`automatic recovery circuit is open; a fresh direct human /leppy-loop authorization is required before another unchanged attempt [condition=${condition}; bytes=${Buffer.byteLength(detail, 'utf8')}; activeAttempt=${controller.activeTaskAttempt ? 'yes' : 'no'}]`)
   }
-  if (args.operation === 'continue' && controller?.lifecycleAuthority && livePermits.length === 0) {
-    runtime.grants.hydrate({ agent, repoRoot, runId, authority: controller.lifecycleAuthority })
+  const preparedReceiptRetry = ignoredBaselineRepairIdentity !== undefined
+    && controller?.ignoredBaselineBridge?.phase === 'prepared'
+    && sameIgnoredBaselineBridge(ignoredBaselineRepairIdentity, controller.ignoredBaselineBridge)
+    && controller.lifecycleAuthority !== undefined
+    && controller.ignoredBaselineBridge.authorityEpoch === (controller.lifecycleAuthority.epoch ?? 1)
+    && controller.ignoredBaselineBridge.authorityTransition === controller.lifecycleAuthority.transitions
+    && controller.ignoredBaselineBridge.requestDigest === ignoredBaselineRequestDigest
+    && controller.lifecycleAuthority.revokedAt === undefined
+    && controller.lifecycleAuthority.expiresAt > Date.now()
+    && (args.publish !== true || controller.lifecycleAuthority.allowPublication)
+  let reservation: GrantReservation | undefined
+  let grant: HumanGrant
+  if (preparedReceiptRetry) {
+    grant = preparedAdmissionGrant(agent, repoRoot, runId, controller.lifecycleAuthority!)
+  } else {
+    if (args.operation === 'continue' && controller?.lifecycleAuthority && livePermits.length === 0) {
+      runtime.grants.hydrate({ agent, repoRoot, runId, authority: controller.lifecycleAuthority })
+    }
+    reservation = runtime.grants.reserve({
+      agent, repoRoot, runId, operation: args.operation, publishRemote: args.publish === true,
+    })
+    grant = reservation.grant
   }
-  const reservation = runtime.grants.reserve({
-    agent, repoRoot, runId, operation: args.operation, publishRemote: args.publish === true,
-  })
   const options: LeppyLoopOptions = {
-    ...controllerOptions(args, cwd, repoRoot, runId, reservation.grant, controller),
+    ...controllerOptions(args, cwd, repoRoot, runId, grant, controller),
     ...(dependencyHydration ? { dependencyHydrationRequired: true } : {}),
     ...(dependencyRepair && controller?.detail
       ? { dependencyRecoveryDigest: createHash('sha256').update(controller.detail).digest('hex') }
@@ -526,19 +569,31 @@ export async function executeLeppyLoopControl(
     ...(workerArtifactRepair && controller?.detail
       ? { workerArtifactRecoveryDigest: createHash('sha256').update(controller.detail).digest('hex') }
       : {}),
+    ...(ignoredBaselineRepairIdentity ? { ignoredBaselineRecovery: ignoredBaselineRepairIdentity } : {}),
   }
   let authorityPersisted = false
   try {
-    await persistLifecycleAuthority(runtime, repoRoot, runId, options.lifecycleAuthority!)
-    authorityPersisted = true
+    if (ignoredBaselineRepairIdentity) {
+      if (runtime.hooks.activateIgnoredBaselineBridge) {
+        await runtime.hooks.activateIgnoredBaselineBridge(repoRoot, runId, ignoredBaselineRepairIdentity, options.lifecycleAuthority!, ignoredBaselineRequestDigest!)
+      } else {
+        await activateIgnoredBaselineBridge(repoRoot, runId, ignoredBaselineRepairIdentity, options.lifecycleAuthority!, ignoredBaselineRequestDigest!)
+      }
+    }
+    if (!preparedReceiptRetry) {
+      await persistLifecycleAuthority(runtime, repoRoot, runId, options.lifecycleAuthority!)
+      authorityPersisted = true
+    }
     const jobId = startControllerJob(ctx, runtime, agent, options, repoRoot, runId, async () => {
-      runtime.grants.settle(reservation)
+      if (reservation) runtime.grants.settle(reservation)
       await scheduleLifecycleFollowup(runtime, agent, cwd, repoRoot, runId)
     })
     return { operation: args.operation, status: 'running', runId, jobId: String(jobId) }
   } catch (error) {
-    if (authorityPersisted) runtime.grants.settle(reservation)
-    else runtime.grants.restore(reservation)
+    if (reservation) {
+      if (authorityPersisted) runtime.grants.settle(reservation)
+      else runtime.grants.restore(reservation)
+    }
     throw error
   }
 }
