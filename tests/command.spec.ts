@@ -19,7 +19,7 @@ import { lifecycleCommonDir } from '../src/lifecycle-authority.js'
 import { parseLeppyLoopCommandInput, tokenizeLeppyLoopCommandInput } from '../src/options.js'
 import type { LeppyLoopRuntime } from '../src/command.js'
 import { acquireLock } from '../src/state.js'
-import type { LeppyLoopOptions, LifecycleAuthority, PendingTaskValidation, RunProgress, RunResult } from '../src/types.js'
+import type { ActiveTaskAttempt, LeppyLoopOptions, LifecycleAuthority, PendingTaskValidation, RunProgress, RunResult } from '../src/types.js'
 
 const cwd = process.cwd()
 
@@ -77,6 +77,14 @@ function pendingValidation(overrides: Partial<PendingTaskValidation> = {}): Pend
     createdAttempt: 15,
     verifierAttempts: 2,
     phase: 'pending',
+    ...overrides,
+  }
+}
+
+function activeAttempt(overrides: Partial<ActiveTaskAttempt> = {}): ActiveTaskAttempt {
+  return {
+    schemaVersion: 1, taskKey: 'a'.repeat(64), taskIndex: 11, baseHead: '1'.repeat(40),
+    checklistDigest: 'b'.repeat(64), ignoredPathsDigest: 'd'.repeat(64), attempt: 15,
     ...overrides,
   }
 }
@@ -217,6 +225,7 @@ describe('simple human slash surface', () => {
     expect(result).toMatchObject({ kind: 'success', text: expect.stringContaining('44c85fb806c6') })
     const prompt = JSON.stringify(messages[0])
     expect(prompt).toContain('leppy_loop_control')
+    expect(prompt).toContain('first tool call must be operation=status with its exact runId')
     expect(prompt).toContain('currentTask: 11')
     expect(prompt).toContain('attempt: 15')
     expect(prompt).toContain('examples/feature.task.md')
@@ -302,7 +311,7 @@ describe('simple human slash surface', () => {
     expect(selectControllerForStatus([publicationStall, oldOpen])?.runId).toBe('44c85fb806c6')
 
     const result = await executeLeppyLoopCommand(
-      context(), invocation(agent('status-agent'), 'status'), runtime({ inspectControllers: async () => [oldOpen, publicationStall] }),
+      context(), invocation(agent('status-agent'), ' status'), runtime({ inspectControllers: async () => [oldOpen, publicationStall] }),
     )
     expect(result).toMatchObject({ kind: 'success', text: expect.stringContaining('run=44c85fb806c6') })
     expect(result.text).toContain('detail=publication conflict repair failed')
@@ -542,7 +551,7 @@ describe('grant-validated background controller tool', () => {
   it('does not expose another session durable controller through global status', async () => {
     const owner = agent('session-a')
     const foreign = controller({
-      runId: 'foreign-run', detail: 'private failure detail',
+      runId: 'foreign-run', detail: 'private failure detail', autoRecoveryBlocked: true,
       lifecycleAuthority: {
         sessionId: 'session-b', allowPublication: true, maxIterations: 64, maxRepairCycles: 3,
         maxTransitions: 16, transitions: 4, issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
@@ -551,6 +560,9 @@ describe('grant-validated background controller tool', () => {
     const rt = runtime({ inspectControllers: async () => [foreign] })
     await expect(executeLeppyLoopControl(context(), rt, owner, { operation: 'status' })).resolves.toEqual({ operation: 'status', status: 'not-found' })
     await expect(executeLeppyLoopControl(context(), rt, owner, { operation: 'status', runId: foreign.runId })).resolves.toEqual({ operation: 'status', status: 'not-found' })
+    await expect(executeLeppyLoopControl(context(), rt, owner, {
+      operation: 'continue', runId: foreign.runId, tasks: foreign.checklistRelative, syncBranch: foreign.syncBranch,
+    })).rejects.toThrow('belongs to another session')
   })
 
   it('hydrates the same session-bound lifecycle permit and continues after a Host restart', async () => {
@@ -620,6 +632,23 @@ describe('grant-validated background controller tool', () => {
     expect(jobs.starts).toHaveLength(2)
     expect(rt.grants.permits(owner, cwd)[0]?.transitions).toBe(2)
     expect(followup).toHaveBeenCalled()
+  })
+
+  it('keeps read-only status available while the durable recovery circuit is open', async () => {
+    const owner = agent('blocked-status-agent')
+    const blocked = controller({
+      autoRecoveryBlocked: true, detail: 'scope missing',
+      lifecycleAuthority: {
+        sessionId: 'blocked-status-agent', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 5, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const rt = runtime({ inspectControllers: async () => [blocked] })
+
+    await expect(executeLeppyLoopControl(context(), rt, owner, {
+      operation: 'status', runId: blocked.runId,
+    })).resolves.toMatchObject({ operation: 'status', status: 'stalled', runId: blocked.runId, detail: 'scope missing' })
+    expect(rt.grants.permits(owner, cwd)).toHaveLength(0)
   })
 
   it('does not auto-loop a controller whose durable failure circuit is open', async () => {
@@ -857,13 +886,15 @@ describe('grant-validated background controller tool', () => {
   it.each([
     ['missing manifest', 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'],
     ['three-addition search', 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'],
-  ] as const)('reuses persisted authority once when the installed controller supersedes %s recovery', async (_label, detail) => {
+    ['whitespace-normalized three-addition search', '\r\n worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints\t'],
+  ] as const)('status then reuses persisted authority once when the installed controller supersedes %s recovery', async (_label, detail) => {
     const owner = agent('ignored-baseline-owner')
+    const updatedAt = Date.now() - 30_000
     const stalled = controller({
-      autoRecoveryBlocked: true, detail,
+      autoRecoveryBlocked: true, detail, updatedAt: new Date(updatedAt).toISOString(), activeTaskAttempt: activeAttempt(),
       lifecycleAuthority: {
         sessionId: 'ignored-baseline-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
-        maxTransitions: 16, transitions: 5, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+        maxTransitions: 16, transitions: 5, issuedAt: updatedAt - 30_000, expiresAt: Date.now() + 60_000,
       },
     })
     const jobs = new FakeJobs()
@@ -873,10 +904,46 @@ describe('grant-validated background controller tool', () => {
     })
 
     await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'status', runId: stalled.runId,
+    })).resolves.toMatchObject({ status: 'stalled', runId: stalled.runId, detail })
+    expect(rt.grants.permits(owner, cwd)).toHaveLength(0)
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
       operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative, syncBranch: stalled.syncBranch,
     })).resolves.toMatchObject({ status: 'running', runId: stalled.runId })
     await jobs.starts[0]!.hooks.done
     expect(rt.grants.permits(owner, cwd)[0]).toMatchObject({ transitions: 6 })
+  })
+
+  it('fails closed when the legacy detail has no active attempt or is a current near-match', async () => {
+    const owner = agent('ignored-baseline-negative-owner')
+    const updatedAt = Date.now() - 30_000
+    const authority: LifecycleAuthority = {
+      sessionId: 'ignored-baseline-negative-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+      maxTransitions: 16, transitions: 5, issuedAt: updatedAt - 30_000, expiresAt: Date.now() + 60_000,
+    }
+    const exact = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'
+    const missingAttempt = controller({
+      autoRecoveryBlocked: true, detail: exact, updatedAt: new Date(updatedAt).toISOString(), lifecycleAuthority: authority,
+    })
+    await expect(executeLeppyLoopControl(context(), runtime({ inspectControllers: async () => [missingAttempt] }), owner, {
+      operation: 'continue', runId: missingAttempt.runId, tasks: missingAttempt.checklistRelative, syncBranch: missingAttempt.syncBranch,
+    })).rejects.toThrow('[condition=a8c80a08d394598c; bytes=101; activeAttempt=no]')
+
+    const nearMatch = controller({
+      autoRecoveryBlocked: true, detail: `${exact} within 4 additions and 92170 candidates`,
+      updatedAt: new Date(updatedAt).toISOString(), activeTaskAttempt: activeAttempt(), lifecycleAuthority: authority,
+    })
+    await expect(executeLeppyLoopControl(context(), runtime({ inspectControllers: async () => [nearMatch] }), owner, {
+      operation: 'continue', runId: nearMatch.runId, tasks: nearMatch.checklistRelative, syncBranch: nearMatch.syncBranch,
+    })).rejects.toThrow(/\[condition=[0-9a-f]{16}; bytes=141; activeAttempt=yes\]/u)
+
+    const multibyte = controller({
+      autoRecoveryBlocked: true, detail: 'falha ç', updatedAt: new Date(updatedAt).toISOString(),
+      activeTaskAttempt: activeAttempt(), lifecycleAuthority: authority,
+    })
+    await expect(executeLeppyLoopControl(context(), runtime({ inspectControllers: async () => [multibyte] }), owner, {
+      operation: 'continue', runId: multibyte.runId, tasks: multibyte.checklistRelative, syncBranch: multibyte.syncBranch,
+    })).rejects.toThrow(/\[condition=[0-9a-f]{16}; bytes=8; activeAttempt=yes\]/u)
   })
 
   it('retries transient automatic follow-up handoff failures within the lifecycle', async () => {

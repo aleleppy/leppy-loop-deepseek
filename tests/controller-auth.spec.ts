@@ -117,6 +117,27 @@ describe('authenticated controller lifecycle authority integrity', () => {
     }])
   })
 
+  it('round-trips the authenticated legacy ignored bridge condition and active attempt after Host restart', async () => {
+    const fixture = repository(true)
+    const facts = taskFacts(fixture.root)
+    const detail = '\r\n worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints\t'
+    authenticateState(fixture, state => {
+      state.lastError = detail
+      state.autoRecoveryBlocked = true
+      state.activeTaskAttempt = {
+        schemaVersion: 1, taskKey: facts.taskKey, taskIndex: 0,
+        baseHead: git(fixture.root, 'rev-parse', 'HEAD'), checklistDigest: facts.checklistDigest,
+        ignoredPathsDigest: 'd'.repeat(64), attempt: 1,
+      }
+    })
+
+    await expect(inspectAuthenticatedControllers(fixture.root)).resolves.toMatchObject([{
+      runId: fixture.runId, detail, autoRecoveryBlocked: true,
+      activeTaskAttempt: { taskKey: facts.taskKey, ignoredPathsDigest: 'd'.repeat(64), attempt: 1 },
+      lifecycleAuthority: { sessionId: 'session-a', transitions: 1 },
+    }])
+  })
+
   it('migrates legacy ownership once and rejects later recovery-state tampering', async () => {
     const legacy = repository(false)
     const statePath = join(legacy.stateDir, 'run.json')

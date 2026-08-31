@@ -28,7 +28,8 @@ const LEGACY_SUBSET_THREE_ADDITION_DETAIL = 'worker ignored artifact recovery ca
 
 /** One bounded capability transition from a superseded legacy recovery failure. */
 export function workerIgnoredBaselineRecovery(detail: string | undefined): boolean {
-  return detail === LEGACY_BASELINE_MISSING_DETAIL || detail === LEGACY_SUBSET_THREE_ADDITION_DETAIL
+  const normalized = detail?.trim()
+  return normalized === LEGACY_BASELINE_MISSING_DETAIL || normalized === LEGACY_SUBSET_THREE_ADDITION_DETAIL
 }
 
 type Baseline = {

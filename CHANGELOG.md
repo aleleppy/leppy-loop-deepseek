@@ -2,6 +2,14 @@
 
 All notable changes are documented here.
 
+## [0.3.28] - 2026-08-31
+
+### Fixed
+
+- Existing-run lifecycle resolver instructions now require `operation=status` as the first tool call in every turn, then permit at most one transition from the exact returned controller facts when no live owner-fenced job exists. The bundled operator skill carries the same rule. Read-only status remains available while the anti-thrash circuit is open and returns before lifecycle permit hydration or reservation.
+- The two superseded ignored-baseline capability conditions now normalize only leading and trailing whitespace before full literal equality and require an authenticated active task attempt before bypassing anti-thrash. Prefixes, suffixes, current bounded-search diagnostics, unrelated failures, and exact legacy text without active attempt remain rejected. Regression coverage uses stale durable authority—not the fresh-reauthorization bypass—to perform status, Host-memory-empty hydration, and continuation for the exact, missing-manifest, and CRLF/tab-boundary variants.
+- A rejected unchanged continuation reports only a 64-bit SHA-256 condition identifier, UTF-8 byte count, and active-attempt presence so a deployed mismatch is diagnosable without exposing paths, fingerprints, content, or the baseline digest. Foreign-session lifecycle ownership is rejected before these diagnostics are constructed.
+
 ## [0.3.27] - 2026-08-31
 
 ### Fixed

@@ -50,7 +50,7 @@ export const inject = ['commands', 'tools', 'jobs', 'credentials', 'settings', '
 
 const LIFECYCLE_PROMPT = `The human invoked /leppy-loop and authorized one bounded Leppy lifecycle in this session and repository. The lifecycle permit survives controller transitions, so the human must not be asked to type separate continue, repair, or publish commands.
 
-Use leppy_loop_control for exactly one next lifecycle transition now. Read-only status/preflight calls do not consume that transition. Always call operation=status before claiming that a controller job is running; only a returned live jobId proves that claim. Choose technical recovery and publication behavior from the authenticated controller state and the human's conversation. The permit authorizes branch push and pull-request creation unless the Host says it is local-only; it never authorizes merge, deployment, scope widening, or another run. For a new run, resolve the tracked checklist and authoritative Git base, call operation=preflight, and start only after it returns ready. You may correct only explicit path/Done metadata in the tracked source checklist to resolve reported preflight diagnostics, then rerun preflight. For an existing run, use only the exact Host-provided run/checklist/base facts and never edit its controller. You may set publicationTarget only to a live replacement base justified by repository history when the original publication base was removed. Return after the background job starts. Never emulate the controller with shell, subagents, generic background jobs, or direct worktree edits. Never invent or remember a leppy-loop-* job id across turns.`
+Use leppy_loop_control for exactly one next lifecycle transition now. Read-only status/preflight calls do not consume that transition. Always call operation=status before claiming that a controller job is running; only a returned live jobId proves that claim. Choose technical recovery and publication behavior from the authenticated controller state and the human's conversation. The permit authorizes branch push and pull-request creation unless the Host says it is local-only; it never authorizes merge, deployment, scope widening, or another run. For a new run, resolve the tracked checklist and authoritative Git base, call operation=preflight, and start only after it returns ready. You may correct only explicit path/Done metadata in the tracked source checklist to resolve reported preflight diagnostics, then rerun preflight. For an existing run, your first tool call must be operation=status with its exact runId. If and only if that read-only call returns no live jobId, use the returned exact Host run/checklist/base facts for one transition and never edit its controller. You may set publicationTarget only to a live replacement base justified by repository history when the original publication base was removed. Return after the background job starts. Never emulate the controller with shell, subagents, generic background jobs, or direct worktree edits. Never invent or remember a leppy-loop-* job id across turns.`
 
 const SKILL_PROVIDER_NAME = 'leppy-loop-operator'
 const SKILL_BODY_URL = new URL('../skills/leppy-loop-operator/SKILL.md', import.meta.url)
@@ -486,6 +486,10 @@ export async function executeLeppyLoopControl(
   }
 
   const livePermits = runtime.grants.permits(agent, repoRoot).filter(permit => permit.runId === runId)
+  if (args.operation === 'continue' && controller?.lifecycleAuthority
+    && controller.lifecycleAuthority.sessionId !== agent.id) {
+    throw new Error(`lifecycle authority for run ${runId} belongs to another session`)
+  }
   const durableReauthorizationFresh = args.operation === 'continue' && controller?.lifecycleAuthority !== undefined
     && controller.lifecycleAuthority.transitions < controller.lifecycleAuthority.maxTransitions
     && controller.lifecycleAuthority.issuedAt > Date.parse(controller.updatedAt)
@@ -494,12 +498,15 @@ export async function executeLeppyLoopControl(
   const windowsArgvRepair = args.operation === 'continue' && controller?.autoRecoveryBlocked === true
     && controller.windowsArgvBridgeActive !== true && windowsQuotedExecutableFailure(controller.detail)
   const workerArtifactRepair = args.operation === 'continue' && workerNpmCacheRecovery(controller?.detail)
-  const ignoredBaselineRepair = args.operation === 'continue' && workerIgnoredBaselineRecovery(controller?.detail)
+  const ignoredBaselineRepair = args.operation === 'continue' && controller?.activeTaskAttempt !== undefined
+    && workerIgnoredBaselineRecovery(controller.detail)
   if (args.operation === 'continue' && controller?.autoRecoveryBlocked === true
     && !dependencyRepair && !windowsArgvRepair && !workerArtifactRepair && !ignoredBaselineRepair
     && !durableReauthorizationFresh
     && !livePermits.some(permit => permit.reauthorizedAt > Date.parse(controller.updatedAt))) {
-    throw new Error('automatic recovery circuit is open; a fresh direct human /leppy-loop authorization is required before another unchanged attempt')
+    const detail = controller.detail ?? ''
+    const condition = createHash('sha256').update(detail).digest('hex').slice(0, 16)
+    throw new Error(`automatic recovery circuit is open; a fresh direct human /leppy-loop authorization is required before another unchanged attempt [condition=${condition}; bytes=${Buffer.byteLength(detail, 'utf8')}; activeAttempt=${controller.activeTaskAttempt ? 'yes' : 'no'}]`)
   }
   if (args.operation === 'continue' && controller?.lifecycleAuthority && livePermits.length === 0) {
     runtime.grants.hydrate({ agent, repoRoot, runId, authority: controller.lifecycleAuthority })

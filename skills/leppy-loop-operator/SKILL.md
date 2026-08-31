@@ -12,7 +12,7 @@ The Host plugin—not this chat—is the controller of checklist mutation, worke
 ## Non-negotiable control rules
 
 1. Use `leppy_loop_control`; never emulate Leppy with shell commands, file edits, subagents, workflows, Ralph, or generic background jobs.
-2. Before saying a run or job is active, call `leppy_loop_control` with `operation: "status"`. Only a live `jobId` returned by that call proves a Host job exists.
+2. For every existing run, the first lifecycle tool call in the turn must be `leppy_loop_control` with `operation: "status"` and the exact `runId`. Only a live `jobId` returned by that call proves a Host job exists; if no live job is returned, use the same response's exact controller facts for at most one transition.
 3. Never invent, remember, or pass a `leppy-loop-*` job ID across turns. Job IDs are session-local observations, not durable run identity. The authenticated `runId` is durable.
 4. If status is `orphaned`, the durable controller exists but no owned Host job does. Continue the exact authenticated run through `operation: "continue"`; do not call `job_output` or start a subagent.
 5. A single `/leppy-loop` authorizes only one bounded lifecycle. Reuse its persisted same-session authority for controller transitions; never widen scope, merge, deploy, or start another run.

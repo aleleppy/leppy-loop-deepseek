@@ -62,6 +62,7 @@ describe('authenticated ignored artifact recovery', () => {
     const threeAddition = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'
     expect(workerIgnoredBaselineRecovery(missing)).toBe(true)
     expect(workerIgnoredBaselineRecovery(threeAddition)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(`\r\n ${threeAddition}\t`)).toBe(true)
     expect(workerIgnoredBaselineRecovery(`prefix: ${missing}`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 100 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(undefined)).toBe(false)
