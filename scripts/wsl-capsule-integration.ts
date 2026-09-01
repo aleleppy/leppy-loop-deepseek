@@ -102,25 +102,37 @@ test('confines a real browser and scrubs Host credentials', async ({ page }) => 
   })
   if (jsConfig.exitCode !== 0) throw new Error(`JavaScript Playwright config failed at runtime: ${jsConfig.stderr}`)
 
-  const genuineFailure = await executePlaywrightInWsl({
-    root: candidateRoot, repoRoot: root, commitHead, args: ['test', 'missing.spec.mjs'],
+  const mjsConfig = await executePlaywrightInWsl({
+    root: candidateRoot, repoRoot: root, commitHead, args: ['test', 'browser.spec.mjs'],
     profile: { ...profile, playwrightConfig: 'playwright.config.mjs', webServerTimeoutMs: 180_000 },
+  })
+  if (mjsConfig.exitCode !== 0) throw new Error(`MJS Playwright config failed at runtime: ${mjsConfig.stderr}`)
+  const tsConfig = await executePlaywrightInWsl({
+    root: candidateRoot, repoRoot: root, commitHead, args: ['test', 'browser.spec.mjs'],
+    profile: { ...profile, playwrightConfig: 'configs/custom.config.ts', webServerTimeoutMs: 180_000 },
+  })
+  if (tsConfig.exitCode !== 0) throw new Error(`custom TypeScript Playwright config failed at runtime: ${tsConfig.stderr}`)
+  const genuineFailure = await executePlaywrightInWsl({
+    root: candidateRoot, repoRoot: root, commitHead, args: ['test', 'missing.spec.mjs'], profile,
   })
   if (genuineFailure.exitCode === 0 || genuineFailure.stderr.includes('LEPPY_WSL_VALIDATION_UNAVAILABLE')) {
     throw new Error(`genuine test failure was misclassified: exit=${genuineFailure.exitCode} ${genuineFailure.stderr}`)
-  }
-  const tsConfigFailure = await executePlaywrightInWsl({
-    root: candidateRoot, repoRoot: root, commitHead, args: ['test', 'missing.spec.mjs'],
-    profile: { ...profile, playwrightConfig: 'configs/custom.config.ts', webServerTimeoutMs: 180_000 },
-  })
-  if (tsConfigFailure.exitCode === 0 || tsConfigFailure.stderr.includes('LEPPY_WSL_VALIDATION_UNAVAILABLE')) {
-    throw new Error(`custom TypeScript Playwright config failed to execute as a genuine test: ${tsConfigFailure.stderr}`)
   }
 
   const snapshot = (args: string[]): Set<string> => {
     const observed = spawnSync('wsl.exe', ['--distribution', distribution, '--exec', ...args], { encoding: 'utf8', windowsHide: true })
     if (observed.status !== 0 && observed.status !== 1) throw new Error(`cannot snapshot WSL teardown boundary: ${observed.stderr}`)
     return new Set(observed.stdout.split(/\r?\n/u).filter(Boolean))
+  }
+  const waitForNoNew = async (args: string[], baseline: Set<string>, label: string): Promise<void> => {
+    const deadline = Date.now() + 5_000
+    do {
+      const leaked = [...snapshot(args)].filter(value => !baseline.has(value))
+      if (leaked.length === 0) return
+      await new Promise(resolve => setTimeout(resolve, 100))
+    } while (Date.now() < deadline)
+    const leaked = [...snapshot(args)].filter(value => !baseline.has(value))
+    throw new Error(`canceled capsule left ${label}: ${leaked.join(', ')}`)
   }
   const capsulesBefore = snapshot(['find', '/tmp', '-maxdepth', '1', '-name', 'leppy-validation-*', '-print'])
   const bwrapBefore = snapshot(['pgrep', '-af', 'bwrap'])
@@ -141,10 +153,8 @@ test('confines a real browser and scrubs Host credentials', async ({ page }) => 
   })
   clearTimeout(watchdog)
   if (!testLaunchObserved) throw new Error('cancellation did not synchronize on the Host-only test-launch receipt')
-  const leakedCapsules = [...snapshot(['find', '/tmp', '-maxdepth', '1', '-name', 'leppy-validation-*', '-print'])].filter(value => !capsulesBefore.has(value))
-  if (leakedCapsules.length) throw new Error(`canceled capsule left private state: ${leakedCapsules.join(', ')}`)
-  const leakedBwrap = [...snapshot(['pgrep', '-af', 'bwrap'])].filter(value => !bwrapBefore.has(value))
-  if (leakedBwrap.length) throw new Error(`canceled capsule left bwrap descendants: ${leakedBwrap.join(', ')}`)
+  await waitForNoNew(['find', '/tmp', '-maxdepth', '1', '-name', 'leppy-validation-*', '-print'], capsulesBefore, 'private state')
+  await waitForNoNew(['pgrep', '-af', 'bwrap'], bwrapBefore, 'bwrap descendants')
   console.log('WSL capsule integration and cancellation passed')
 } finally {
   delete process.env.LEPPY_SECRET_CANARY
