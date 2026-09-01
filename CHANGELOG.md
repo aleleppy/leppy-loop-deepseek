@@ -2,6 +2,15 @@
 
 All notable changes are documented here.
 
+## [0.3.32] - 2026-08-31
+
+### Fixed
+
+- The exact `0.3.31` tracked-and-untracked base-ignore terminal receives one last persisted-authority capability transition that may use every current ordinary untracked path solely as an exact historical-baseline candidate. This covers a baseline ignored at dispatch by mutable repository-local or global excludes that no longer classify it today.
+- The authenticated ordered-fingerprint SHA-256 remains the only baseline authority. Candidate enumeration is capped, canonical and deduplicated; one shared 512 MiB content budget spans ignored, tracked and ordinary classes per collection; and a second complete ordinary/ignored/tracked snapshot must remain stable before persistence. Base `.gitignore` classification runs in a fresh isolated Git dir with empty repository/global/system excludes, so mutable `.git/info/exclude` and `core.excludesFile` cannot authorize quarantine.
+- Ordinary untracked candidates outside the proven baseline are never classified as worker output and never enter quarantine unless the immutable base `.gitignore` rules independently authenticate them. Preserved baseline and unproven ordinary WIP therefore remain in place and the existing clean-tree gate blocks adoption and verifier release. Only the exact `0.3.31` tracked-and-untracked terminal can authorize this transition; older terminals cannot skip capability stages, and the new baseline-only terminal cannot authorize itself.
+- Regressions reproduce a removed `.git/info/exclude` rule, reprove the exact baseline, quarantine only a currently ignored generated file, preserve unrelated ordinary WIP, and reject dirty candidate adoption with zero verifier calls.
+
 ## [0.3.31] - 2026-08-31
 
 ### Fixed

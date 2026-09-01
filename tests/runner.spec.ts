@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import * as gitModule from '../src/git.js'
 import { workerIgnoredBaselineBridgeIdentity } from '../src/ignored-artifacts.js'
@@ -435,7 +435,7 @@ describe('controller state machine', () => {
       ignoredPathsDigest: authenticatedBaseline.digest,
       attempt: state.attempt,
     }
-    state.lastError = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates'
+    state.lastError = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked and untracked base-ignore inference within 4 additions and 3 candidates'
     state.autoRecoveryBlocked = true
     const bridgeIdentity = workerIgnoredBaselineBridgeIdentity(state.lastError, state.activeTaskAttempt)!
     state.ignoredBaselineBridge = { ...bridgeIdentity, phase: 'prepared', authorityEpoch: 1, authorityTransition: 1, requestDigest: 'c'.repeat(64) }
@@ -476,29 +476,30 @@ describe('controller state machine', () => {
     }
   }, 90_000)
 
-  it('quarantines exact base-ignored outputs but does not adopt a candidate with preserved de-ignored WIP', async () => {
-    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt,config | Done: implementation committed\n')
-    mkdirSync(join(repo.root, 'config'))
-    writeFileSync(join(repo.root, 'config', '.gitignore'), 'ignored-worker-output/\n')
-    git(repo.root, 'add', '--', 'config/.gitignore')
-    git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
+  it('quarantines proven ignored output but preserves baseline-only and unproven ordinary WIP', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'generated/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore generated output')
     const first = await runLeppyLoop(
       { tasks: repo.tasks, syncBranch: 'main', fetch: false },
-      { ...modelDeps, runId: () => 'legacydeignore1', worker: new FakeWorker([blockedNotRunOutcome('seed legacy state')]) },
+      { ...modelDeps, runId: () => 'legacyordinary1', worker: new FakeWorker([blockedNotRunOutcome('seed legacy state')]) },
     )
     const statePath = join(first.stateDir!, 'run.json')
     const state = JSON.parse(readFileSync(statePath, 'utf8'))
     const checklistSource = readFileSync(join(first.worktree!, 'tasks.task.md'), 'utf8')
     const task = selectTask(parseChecklist(checklistSource, join(first.worktree!, 'tasks.task.md')))!
-    mkdirSync(join(first.worktree!, 'config', 'ignored-worker-output'), { recursive: true })
-    const preserved = join(first.worktree!, 'config', 'ignored-worker-output', 'pre-existing.env')
+    const exclude = resolve(first.worktree!, git(first.worktree!, 'rev-parse', '--git-path', 'info/exclude'))
+    writeFileSync(exclude, 'private/\n')
+    mkdirSync(join(first.worktree!, 'private'))
+    const preserved = join(first.worktree!, 'private', 'pre-existing.env')
     writeFileSync(preserved, 'pre-existing ignored WIP\n')
     const authenticatedBaseline = await gitModule.ignoredPathSnapshot(first.worktree!)
     const baseHead = git(first.worktree!, 'rev-parse', 'HEAD')
-    writeFileSync(join(first.worktree!, 'config', '.gitignore'), 'ignored-worker-output/still-ignored.json\n')
+    writeFileSync(exclude, '')
     writeFileSync(join(first.worktree!, 'src', 'value.txt'), 'committed candidate\n')
-    git(first.worktree!, 'add', '--', 'config/.gitignore', 'src/value.txt')
-    git(first.worktree!, 'commit', '-m', 'feat: committed de-ignore candidate')
+    git(first.worktree!, 'add', '--', 'src/value.txt')
+    git(first.worktree!, 'commit', '-m', 'feat: committed candidate')
     state.activeTaskAttempt = {
       schemaVersion: 1,
       taskKey: createHash('sha256').update(JSON.stringify({ index: task.index, phase: task.phase, kind: task.kind, raw: task.raw })).digest('hex'),
@@ -507,27 +508,36 @@ describe('controller state machine', () => {
       ignoredPathsDigest: authenticatedBaseline.digest,
       attempt: state.attempt,
     }
+    state.lastError = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked and untracked base-ignore inference within 4 additions and 3 candidates'
+    state.autoRecoveryBlocked = true
+    const bridgeIdentity = workerIgnoredBaselineBridgeIdentity(state.lastError, state.activeTaskAttempt)!
+    state.ignoredBaselineBridge = {
+      ...bridgeIdentity, phase: 'prepared', authorityEpoch: 1, authorityTransition: 1, requestDigest: 'c'.repeat(64),
+    }
     delete state.stateProof
     writeFileSync(statePath, `${JSON.stringify(state)}\n`)
     persistRunStateProof(first.stateDir!, state, Buffer.from(readFileSync(join(first.stateDir!, 'lease.key'), 'utf8').trim(), 'base64'))
     rmSync(join(first.stateDir!, 'worker-ignored-path-baselines'), { recursive: true, force: true })
-    const deignoredOutput = join(first.worktree!, 'config', 'ignored-worker-output', 'worker-report.json')
-    const ignoredOutput = join(first.worktree!, 'config', 'ignored-worker-output', 'still-ignored.json')
-    writeFileSync(deignoredOutput, '{"worker":"ordinary"}\n')
+    mkdirSync(join(first.worktree!, 'generated'))
+    const ignoredOutput = join(first.worktree!, 'generated', 'worker-report.json')
+    const ordinaryOutput = join(first.worktree!, 'private', 'unproven-worker-report.json')
     writeFileSync(ignoredOutput, '{"worker":"ignored"}\n')
+    writeFileSync(ordinaryOutput, '{"worker":"ordinary-unproven"}\n')
     const verifier = new FakeWorker([completedOutcome('must not verify dirty preserved WIP')])
 
     await expect(runLeppyLoop({
       tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      ignoredBaselineRecovery: bridgeIdentity,
     }, { ...modelDeps, worker: verifier })).rejects.toThrow('worker must leave a clean tree')
     expect(verifier.calls).toHaveLength(0)
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).ignoredBaselineBridge).toMatchObject({
+      ...bridgeIdentity, phase: 'consumed',
+    })
     expect(readFileSync(preserved, 'utf8')).toBe('pre-existing ignored WIP\n')
-    expect(existsSync(deignoredOutput)).toBe(false)
+    expect(readFileSync(ordinaryOutput, 'utf8')).toBe('{"worker":"ordinary-unproven"}\n')
     expect(existsSync(ignoredOutput)).toBe(false)
     const receipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`), 'utf8'))
-    expect(receipt.entries.map((entry: { path: string }) => entry.path)).toEqual([
-      'config/ignored-worker-output/still-ignored.json', 'config/ignored-worker-output/worker-report.json',
-    ])
+    expect(receipt.entries.map((entry: { path: string }) => entry.path)).toEqual(['generated/worker-report.json'])
   }, 90_000)
 
   it('does not infer or move legacy ignored state while an authenticated lease remains live', async () => {

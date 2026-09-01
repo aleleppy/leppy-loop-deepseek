@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   EMPTY_IGNORED_PATHS_DIGEST, recordWorkerIgnoredPathBaseline, reconcileWorkerIgnoredPaths, workerIgnoredBaselineRecovery,
@@ -61,21 +61,23 @@ describe('authenticated ignored artifact recovery', () => {
   it('recognizes only exact superseded legacy capability failures', () => {
     const missing = 'worker ignored artifact recovery lacks its authenticated pre-attempt baseline'
     const threeAddition = 'worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints'
-    expect(workerIgnoredBaselineRecovery(missing)).toBe(true)
-    expect(workerIgnoredBaselineRecovery(threeAddition)).toBe(true)
-    expect(workerIgnoredBaselineRecovery(`\r\n ${threeAddition}\t`)).toBe(true)
-    expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 3 candidates`)).toBe(true)
-    expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 92170 candidates`)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(missing)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(threeAddition)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(`\r\n ${threeAddition}\t`)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 3 candidates`)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 92170 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(`prefix: ${missing}`)).toBe(false)
-    expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 0 candidates`)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 0 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 100 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 0003 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(`${threeAddition} within 4 additions and 9007199254740993 candidates`)).toBe(false)
-    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact newly tracked promotion inference within 4 additions and 3 candidates`)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact newly tracked promotion inference within 4 additions and 3 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact newly tracked promotion inference within 4 additions and 0003 candidates`)).toBe(false)
-    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates`)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked-promotion and base-ignore inference within 4 additions and 0003 candidates`)).toBe(false)
-    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked and untracked base-ignore inference within 4 additions and 3 candidates`)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked and untracked base-ignore inference within 4 additions and 3 candidates`)).toBe(true)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact tracked and untracked base-ignore inference within 4 additions and 0003 candidates`)).toBe(false)
+    expect(workerIgnoredBaselineRecovery(`${threeAddition} after exact baseline-only ordinary-untracked inference within 4 additions and 3 candidates`)).toBe(false)
     expect(workerIgnoredBaselineRecovery(undefined)).toBe(false)
   })
 
@@ -366,6 +368,31 @@ describe('authenticated ignored artifact recovery', () => {
     expect(readFileSync(join(inferred.quarantine!, 'ignored', 'still-ignored.txt'), 'utf8')).toBe('ignored worker output\n')
   })
 
+  it('isolates base rules from mutable repository excludes while preserving ordinary unproven WIP', async () => {
+    const repo = fixture()
+    const exclude = resolve(repo.root, git(repo.root, 'rev-parse', '--git-path', 'info/exclude'))
+    writeFileSync(exclude, 'private/\n')
+    const preserved = join(repo.root, 'private', 'pre-existing.env')
+    mkdirSync(join(repo.root, 'private'))
+    writeFileSync(preserved, 'baseline\n')
+    const recorded = await baseline(repo)
+    const baseHead = git(repo.root, 'rev-parse', 'HEAD')
+    expect(recorded.entries).toHaveLength(1)
+    rmSync(join(repo.stateDir, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    writeFileSync(exclude, 'victim.txt\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'ignored/\n!victim.txt\n')
+    const generated = writeIgnored(repo.root, 'worker-output.txt', 'worker\n')
+    const ordinaryWip = join(repo.root, 'victim.txt')
+    writeFileSync(ordinaryWip, 'human WIP\n')
+
+    const inferred = await reconcile(repo, recorded.digest, { legacyBaseHead: baseHead })
+    expect(inferred).toMatchObject({ basis: 'authenticated-subset-digest', paths: ['ignored/worker-output.txt'] })
+    expect(readFileSync(preserved, 'utf8')).toBe('baseline\n')
+    expect(readFileSync(ordinaryWip, 'utf8')).toBe('human WIP\n')
+    expect(existsSync(generated)).toBe(false)
+    expect(readFileSync(join(inferred.quarantine!, 'ignored', 'worker-output.txt'), 'utf8')).toBe('worker\n')
+  })
+
   it('never materializes a symlink .gitignore blob as an active base rule', async () => {
     const repo = fixture()
     mkdirSync(join(repo.root, 'safe'))
@@ -477,6 +504,20 @@ describe('authenticated ignored artifact recovery', () => {
     expect(existsSync(join(repo.stateDir, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
   })
 
+  it('shares one 512 MiB proof budget across ignored and ordinary candidate classes', async () => {
+    const repo = fixture()
+    writeIgnored(repo.root, 'small.txt', 'x')
+    const ordinary = join(repo.root, 'ordinary-large.bin')
+    writeFileSync(ordinary, '')
+    truncateSync(ordinary, 512 * 1024 * 1024)
+
+    await expect(reconcile(repo, createHash('sha256').update('unknown').digest('hex'), {
+      legacyBaseHead: git(repo.root, 'rev-parse', 'HEAD'),
+    })).rejects.toThrow('worker ignored artifact fingerprinting exceeds 512 MiB of file content')
+    expect(existsSync(ordinary)).toBe(true)
+    expect(existsSync(join(repo.stateDir, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
+  })
+
   it('rejects oversized promoted content from metadata before streaming or persisting recovery', async () => {
     const repo = fixture()
     const baseHead = git(repo.root, 'rev-parse', 'HEAD')
@@ -544,7 +585,7 @@ describe('authenticated ignored artifact recovery', () => {
     await expect(reconcile(repo, recorded.digest, {
       legacyBaseHead: baseHead,
       afterLegacySnapshot: async () => { writeFileSync(promoted, 'raced\n') },
-    })).rejects.toThrow('ignored artifacts, tracked promotions, or base-ignored paths changed during legacy baseline inference')
+    })).rejects.toThrow('ignored artifacts, tracked promotions, or ordinary untracked paths changed during legacy baseline inference')
     expect(readFileSync(promoted, 'utf8')).toBe('raced\n')
     expect(readFileSync(added, 'utf8')).toBe('worker\n')
     expect(existsSync(join(repo.stateDir, 'worker-ignored-path-baselines', '0-1.json'))).toBe(false)
@@ -630,7 +671,7 @@ describe('authenticated ignored artifact recovery', () => {
     }
     const unknownDigest = createHash('sha256').update('unmatched predecessor baseline').digest('hex')
 
-    await expect(reconcile(repo, unknownDigest)).rejects.toThrow('after exact tracked and untracked base-ignore inference within 4 additions and 92170 candidates')
+    await expect(reconcile(repo, unknownDigest)).rejects.toThrow('after exact baseline-only ordinary-untracked inference within 4 additions and 92170 candidates')
     expect(existsSync(join(repo.stateDir, 'worker-ignored-path-baselines', '0-1.json'))).toBe(false)
     expect(existsSync(join(repo.stateDir, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
   }, 30_000)

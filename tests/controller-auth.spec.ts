@@ -121,7 +121,7 @@ describe('authenticated controller lifecycle authority integrity', () => {
   it('round-trips the authenticated legacy ignored bridge condition and active attempt after Host restart', async () => {
     const fixture = repository(true)
     const facts = taskFacts(fixture.root)
-    const detail = '\r\n worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked-promotion and base-ignore inference within 4 additions and 3 candidates\t'
+    const detail = '\r\n worker ignored artifact recovery cannot prove its legacy non-empty baseline from current fingerprints after exact tracked and untracked base-ignore inference within 4 additions and 3 candidates\t'
     const active: ActiveTaskAttempt = {
       schemaVersion: 1, taskKey: facts.taskKey, taskIndex: 0,
       baseHead: git(fixture.root, 'rev-parse', 'HEAD'), checklistDigest: facts.checklistDigest,
