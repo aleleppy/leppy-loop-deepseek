@@ -498,10 +498,7 @@ async function currentOrdinaryUntrackedPaths(worktree: string): Promise<readonly
   ], { cwd: worktree, env: scrubEnvironment(process.env) })
   const untracked = [...new Set(binaryNulRecords(untrackedResult, 'legacy ordinary-untracked state')
     .map(path => canonicalGitPath(path, 'legacy ordinary-untracked state')))].sort()
-  if (untracked.length > LEGACY_SUBSET_MAX_ENTRIES) {
-    throw new Error(`legacy ordinary-untracked inference exceeds ${LEGACY_SUBSET_MAX_ENTRIES} paths`)
-  }
-  return untracked
+  return untracked.length > LEGACY_SUBSET_MAX_ENTRIES ? [] : untracked
 }
 
 async function ordinaryUntrackedFingerprints(

@@ -368,6 +368,24 @@ describe('authenticated ignored artifact recovery', () => {
     expect(readFileSync(join(inferred.quarantine!, 'ignored', 'still-ignored.txt'), 'utf8')).toBe('ignored worker output\n')
   })
 
+  it('skips optional ordinary inference over 128 paths when ignored baseline authority is sufficient', async () => {
+    const repo = fixture()
+    const preserved = writeIgnored(repo.root, 'pre-existing.txt', 'preserve\n')
+    const recorded = await baseline(repo)
+    const baseHead = git(repo.root, 'rev-parse', 'HEAD')
+    rmSync(join(repo.stateDir, 'worker-ignored-path-baselines'), { recursive: true, force: true })
+    const ordinary = join(repo.root, 'ordinary')
+    mkdirSync(ordinary)
+    for (let index = 0; index < 129; index += 1) writeFileSync(join(ordinary, `${index}.txt`), `${index}\n`)
+    const generated = writeIgnored(repo.root, 'worker-output.txt', 'worker\n')
+
+    const inferred = await reconcile(repo, recorded.digest, { legacyBaseHead: baseHead })
+    expect(inferred).toMatchObject({ basis: 'authenticated-subset-digest', paths: ['ignored/worker-output.txt'] })
+    expect(readFileSync(preserved, 'utf8')).toBe('preserve\n')
+    expect(existsSync(generated)).toBe(false)
+    expect(readFileSync(join(ordinary, '128.txt'), 'utf8')).toBe('128\n')
+  })
+
   it('isolates base rules from mutable repository excludes while preserving ordinary unproven WIP', async () => {
     const repo = fixture()
     const exclude = resolve(repo.root, git(repo.root, 'rev-parse', '--git-path', 'info/exclude'))

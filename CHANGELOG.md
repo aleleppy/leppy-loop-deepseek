@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.34] - 2026-08-31
+
+### Fixed
+
+- Legacy ignored-baseline recovery now skips optional ordinary-untracked subset inference when more than 128 paths are present. Authenticated ignored/tracked evidence must still prove the baseline digest, so wide generated workspaces no longer stall fresh runs while unprovable recovery remains fail-closed.
+
 ## [0.3.33] - 2026-08-31
 
 ### Fixed
