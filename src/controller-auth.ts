@@ -118,7 +118,13 @@ function validActiveTaskAttempt(value: unknown): value is ActiveTaskAttempt | un
   if (value === undefined) return true
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const attempt = value as Partial<ActiveTaskAttempt>
-  return attempt.schemaVersion === 1 && typeof attempt.taskKey === 'string' && /^[0-9a-f]{64}$/u.test(attempt.taskKey)
+  const terminal = attempt.terminalOutcome
+  const validTerminal = terminal === undefined || (terminal.schemaVersion === 1
+    && (terminal.disposition === 'validation-unavailable' || terminal.disposition === 'failed-or-unknown')
+    && typeof terminal.outcomeDigest === 'string' && /^[0-9a-f]{64}$/u.test(terminal.outcomeDigest))
+  return (attempt.schemaVersion === 1 || attempt.schemaVersion === 2)
+    && (attempt.schemaVersion === 2 ? validTerminal : terminal === undefined)
+    && typeof attempt.taskKey === 'string' && /^[0-9a-f]{64}$/u.test(attempt.taskKey)
     && Number.isSafeInteger(attempt.taskIndex) && attempt.taskIndex! >= 0
     && typeof attempt.baseHead === 'string' && /^[0-9a-f]{40}$/u.test(attempt.baseHead)
     && typeof attempt.checklistDigest === 'string' && /^[0-9a-f]{64}$/u.test(attempt.checklistDigest)

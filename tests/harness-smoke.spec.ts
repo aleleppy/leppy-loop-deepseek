@@ -38,7 +38,7 @@ describe('real Harness keyless composition', () => {
       },
     })
     const outcome = await adapter.run({
-      runId: 'keyless', task, attempt: 1, worktree: root, checklistPath: 'tasks.task.md',
+      runId: 'keyless', task, attempt: 1, worktree: root, repoRoot: root, checklistPath: 'tasks.task.md',
       allowedPaths: ['src/value.txt'], model: 'replay-model', effort: 'high', provider: 'replay',
       timeoutMs: 90_000, outputLimitBytes: 64 * 1024, transcriptLimitBytes: 512 * 1024,
       stateDir, instructions: [],

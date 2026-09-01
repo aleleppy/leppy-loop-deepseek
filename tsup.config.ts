@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-  entry: ['src/index.ts', 'src/startup.ts', 'src/command.ts', 'src/worker-tool.ts', 'src/worker-host.ts'],
+  entry: ['src/index.ts', 'src/startup.ts', 'src/command.ts', 'src/worker-tool.ts', 'src/worker-host.ts', 'src/wsl-validation.ts'],
   format: ['esm'],
   dts: true,
   sourcemap: true,

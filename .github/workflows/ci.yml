@@ -28,6 +28,14 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Provision required WSL2 release boundary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $distros = @(wsl.exe --list --quiet | ForEach-Object { $_.Trim([char]0).Trim() })
+          if ($distros -notcontains 'Ubuntu') { wsl.exe --install --distribution Ubuntu --no-launch }
+          wsl.exe --distribution Ubuntu --user root --exec bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bubblewrap util-linux nodejs npm"
+          wsl.exe --distribution Ubuntu --exec bash -lc "command -v bwrap && command -v findmnt && command -v node && command -v npm"
       - run: pnpm gate
 
   node-24-smoke:

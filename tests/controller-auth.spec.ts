@@ -229,6 +229,23 @@ describe('authenticated controller lifecycle authority integrity', () => {
     await expect(inspectAuthenticatedControllers(modern.root)).resolves.toHaveLength(0)
   })
 
+  it('discovers authenticated schema-v2 active attempts with or without a terminal receipt', async () => {
+    for (const terminalOutcome of [undefined, {
+      schemaVersion: 1 as const, disposition: 'validation-unavailable' as const, outcomeDigest: 'a'.repeat(64),
+    }]) {
+      const active = repository(false)
+      const facts = taskFacts(active.root)
+      authenticateState(active, state => {
+        state.activeTaskAttempt = {
+          schemaVersion: 2, taskKey: facts.taskKey, taskIndex: 0, baseHead: git(active.root, 'rev-parse', 'HEAD'),
+          checklistDigest: facts.checklistDigest, ignoredPathsDigest: createHash('sha256').update('[]').digest('hex'), attempt: 1,
+          ...(terminalOutcome ? { terminalOutcome } : {}),
+        }
+      })
+      await expect(inspectAuthenticatedControllers(active.root)).resolves.toMatchObject([{ runId: active.runId }])
+    }
+  })
+
   it('rejects malformed or mutually exclusive active-attempt and pending-validation state even with a fresh HMAC', async () => {
     const malformed = repository(false)
     const facts = taskFacts(malformed.root)

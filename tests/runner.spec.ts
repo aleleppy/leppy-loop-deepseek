@@ -203,6 +203,36 @@ describe('controller state machine', () => {
     expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
   }, 90_000)
 
+  it('never promotes a committed completion whose own validation failed after restart', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: focused validation passes\n')
+    const contradictory: WorkerAdapter = { async run(request) {
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'known-failed\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: known failed candidate')
+      return {
+        status: 'completed', output: 'contradictory completion',
+        report: { status: 'completed', summary: 'contradictory', validation: { status: 'failed', evidence: 'focused suite failed' } },
+      }
+    } }
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker: contradictory })
+    expect(first).toMatchObject({ status: 'stalled', completedTasks: 0 })
+    const failedState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
+    expect(failedState).not.toHaveProperty('activeTaskAttempt')
+    expect(failedState).not.toHaveProperty('pendingTaskValidation')
+
+    const recoveryModes: string[] = []
+    const failedAgain: WorkerAdapter = { async run(request) {
+      recoveryModes.push(request.mode ?? 'task')
+      return { status: 'failed', output: 'still failed', error: 'still failed', report: { status: 'failed', summary: 'still failed', validation: { status: 'failed', evidence: 'still failing' } } }
+    } }
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker: failedAgain })
+    expect(recovered).toMatchObject({ status: 'stalled', completedTasks: 0 })
+    expect(recoveryModes).toEqual(['task'])
+    expect(readFileSync(join(recovered.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
+  }, 90_000)
+
   it('verifies a blocked committed candidate in a disposable root and adopts it exactly once', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
     const calls: WorkerRequest[] = []
@@ -669,7 +699,28 @@ describe('controller state machine', () => {
     expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
   }, 90_000)
 
-  it('promotes an active committed attempt on exact recovery and verifies before any task worker', async () => {
+  it('never promotes a generic failed committed attempt in the same process', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    const calls: WorkerRequest[] = []
+    const worker: WorkerAdapter = { async run(request) {
+      calls.push(request)
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'failed-candidate\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: failed candidate must remain unadopted')
+      return { status: 'failed', output: '', error: 'ordinary worker failure' }
+    } }
+
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result).toMatchObject({ status: 'stalled', completedTasks: 0, currentTask: 0 })
+    expect(calls).toHaveLength(1)
+    const state = JSON.parse(readFileSync(join(result.stateDir!, 'run.json'), 'utf8'))
+    expect(state).not.toHaveProperty('pendingTaskValidation')
+    expect(state).not.toHaveProperty('activeTaskAttempt')
+    expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
+    expect(git(result.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('1')
+  }, 90_000)
+
+  it('refuses to promote a committed active attempt whose authenticated terminal receipt was not validation-unavailable', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
     const control = new AbortController()
     let firstRequest: WorkerRequest | undefined
@@ -696,23 +747,49 @@ describe('controller state machine', () => {
     expect(readFileSync(join(firstRequest!.worktree, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
     expect(git(firstRequest!.worktree, 'rev-list', '--count', 'main..HEAD')).toBe('1')
 
-    const recoveryCalls: WorkerRequest[] = []
-    const verificationWorker: WorkerAdapter = { async run(request) {
-      recoveryCalls.push(request)
-      expect(request.mode).toBe('verification')
-      return completedOutcome('recovered candidate independently validated')
+    expect(interruptedState.activeTaskAttempt).toMatchObject({
+      schemaVersion: 2,
+      terminalOutcome: { disposition: 'failed-or-unknown', outcomeDigest: expect.any(String) },
+    })
+    const verificationWorker = { run: vi.fn(async () => completedOutcome('must not run')) }
+    await expect(runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: firstRequest!.runId,
+    }, { ...modelDeps, worker: verificationWorker })).rejects.toThrow('lacks an authenticated validation-unavailable terminal receipt')
+    expect(verificationWorker.run).not.toHaveBeenCalled()
+    expect(existsSync(join(stateDir, 'verification-worktree'))).toBe(false)
+    expect(readFileSync(join(firstRequest!.worktree, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
+  }, 90_000)
+
+  it('promotes only a committed active attempt with a persisted validation-unavailable receipt', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
+    const control = new AbortController()
+    let firstRequest: WorkerRequest | undefined
+    const unavailableWorker: WorkerAdapter = { async run(request) {
+      firstRequest = request
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'committed-before-unavailable\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'feat: committed before unavailable validation')
+      control.abort(new Error('simulated host interruption after unavailable validation'))
+      return { status: 'unavailable', output: '', error: 'LEPPY_WINDOWS_NAMED_PIPE_UNAVAILABLE' }
     } }
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, worker: unavailableWorker, signal: control.signal },
+    )).rejects.toThrow('simulated host interruption')
+    const stateDir = firstRequest!.stateDir
+    const interrupted = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(interrupted.activeTaskAttempt).toMatchObject({
+      schemaVersion: 2,
+      terminalOutcome: { disposition: 'validation-unavailable', outcomeDigest: expect.any(String) },
+    })
+
+    const calls: WorkerRequest[] = []
+    const verifier: WorkerAdapter = { async run(request) { calls.push(request); return completedOutcome('recovered safely') } }
     const recovered = await runLeppyLoop({
       tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: firstRequest!.runId,
-    }, { ...modelDeps, worker: verificationWorker })
+    }, { ...modelDeps, worker: verifier })
     expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
-    expect(recoveryCalls).toHaveLength(1)
-    expect(recoveryCalls[0]!.mode).toBe('verification')
-    expect(existsSync(join(stateDir, 'verification-worktree'))).toBe(false)
-    const recoveredState = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
-    expect(recoveredState).not.toHaveProperty('activeTaskAttempt')
-    expect(recoveredState).not.toHaveProperty('pendingTaskValidation')
-    expect(readFileSync(join(recovered.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [x] Change')
+    expect(calls.map(call => call.mode)).toEqual(['verification'])
   }, 90_000)
 
   it('finishes a validated recovery exactly once when checklist bytes were already written and separately staged', async () => {
@@ -1120,6 +1197,34 @@ describe('controller state machine', () => {
       ['task-done', 1, 1],
     ])
     expect(git(result.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('1')
+  }, 90_000)
+
+  it('replaces and persists the terminal receipt returned by a no-commit retry', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
+    const control = new AbortController()
+    let calls = 0
+    let stateDir = ''
+    const worker: WorkerAdapter = { async run(request) {
+      calls += 1
+      stateDir = request.stateDir
+      if (calls === 1) return completedOutcome('first attempt produced no commit')
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'retry candidate\n')
+      git(request.worktree, 'add', '--', 'src/value.txt')
+      git(request.worktree, 'commit', '-m', 'fix: retry candidate before unavailable validation')
+      control.abort(new Error('crash after no-commit retry outcome'))
+      return { status: 'unavailable', output: '', error: 'LEPPY_WINDOWS_NAMED_PIPE_UNAVAILABLE' }
+    } }
+
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...adaptiveDeps, worker, signal: control.signal },
+    )).rejects.toThrow('crash after no-commit retry outcome')
+    expect(calls).toBe(2)
+    const state = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(state.activeTaskAttempt).toMatchObject({
+      schemaVersion: 2, attempt: 2,
+      terminalOutcome: { disposition: 'validation-unavailable', outcomeDigest: expect.any(String) },
+    })
   }, 90_000)
 
   it('records a fresh ignored baseline before a no-commit retry', async () => {

@@ -1,9 +1,10 @@
-import { mkdtempSync, readFileSync, readdirSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { get } from 'node:http'
 import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import { clearTimeout, setTimeout } from 'node:timers'
 
 const project = resolve(import.meta.dirname, '..')
@@ -77,6 +78,9 @@ async function bootInstalledWeb(env) {
 }
 
 const requestedSpec = process.env.LEPPY_INSTALL_SPEC
+if (requestedSpec && process.env.LEPPY_ALLOW_EXTERNAL_INSTALL_SMOKE !== '1') {
+  throw new Error('LEPPY_INSTALL_SPEC requires explicit LEPPY_ALLOW_EXTERNAL_INSTALL_SMOKE=1 and cannot silently bypass the local release smoke')
+}
 let installSpec = requestedSpec
 let installedLabel = requestedSpec
 if (!installSpec) {
@@ -92,5 +96,13 @@ const composition = run(process.execPath, [dshBin, '--profile', 'web', '--dump-c
 if (!composition.includes('leppy-loop-deepseek') || !composition.includes('leppy-loop-command')) {
   throw new Error('installed Web profile did not compose the Leppy Loop command producer')
 }
+const installedRoot = realpathSync(join(home, 'profiles', 'web', 'node_modules', 'leppy-loop-deepseek'))
+const wslRuntime = await import(pathToFileURL(join(installedRoot, 'dist', 'wsl-validation.js')).href)
+if (typeof wslRuntime.executePlaywrightInWsl !== 'function') throw new Error('installed WSL validation runtime did not load')
+const workerTools = await import(pathToFileURL(join(installedRoot, 'dist', 'worker-tool.js')).href)
+if (typeof workerTools.apply !== 'function') throw new Error('installed worker tool runtime did not load')
+run(process.execPath, ['--check', join(installedRoot, 'dist', 'worker-host.js')], env)
+const workerComposition = readFileSync(join(installedRoot, 'worker.cordis.yml'), 'utf8')
+if (!workerComposition.includes('./dist/worker-tool.js')) throw new Error('installed worker composition does not reference the shipped worker tool')
 await bootInstalledWeb(env)
 process.stdout.write(`clean Web-profile install and boot smoke passed: ${installedLabel}\n`)

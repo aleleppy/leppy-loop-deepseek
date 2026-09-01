@@ -1,6 +1,6 @@
 {
   "name": "leppy-loop-deepseek",
-  "version": "0.3.32",
+  "version": "0.3.33",
   "description": "Checklist-driven isolated worker loop for DeepSeek Harness",
   "type": "module",
   "license": "Apache-2.0",
@@ -87,10 +87,14 @@
     "typecheck": "tsc --noEmit",
     "test": "pnpm build && vitest run",
     "test:smoke": "pnpm build && vitest run tests/harness-smoke.spec.ts",
+    "test:wsl-capsule": "pnpm build:host && node --experimental-strip-types scripts/wsl-capsule-integration.ts",
     "pack:check": "npm pack --dry-run",
     "install:smoke": "node scripts/install-smoke.mjs",
     "secret:scan": "node scripts/secret-scan.mjs",
-    "gate": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm pack:check && pnpm install:smoke && pnpm secret:scan"
+    "release:source-check": "node scripts/release-source-check.mjs",
+    "gate": "pnpm release:source-check && pnpm lint && pnpm typecheck && pnpm test && pnpm test:wsl-capsule && pnpm build && pnpm pack:check && pnpm install:smoke && pnpm secret:scan",
+    "prepack": "pnpm build",
+    "prepublishOnly": "pnpm gate"
   },
   "dependencies": {
     "@deepseek-ai/dsh-agent-spine-demo": "0.1.1-rc.2",

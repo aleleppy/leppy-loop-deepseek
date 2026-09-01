@@ -60,21 +60,43 @@ function signalError(signal: AbortSignal): Error {
   return new Error(typeof signal.reason === 'string' ? signal.reason : 'command aborted')
 }
 
-function terminateProcessTree(pid: number, fallback: () => void): void {
+export function terminateProcessTreeAndWait(pid: number, fallback: () => void): Promise<void> {
   if (process.platform === 'win32') {
-    const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
-      windowsHide: true,
-      shell: false,
-      stdio: 'ignore',
+    return new Promise(resolvePromise => {
+      const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        shell: false,
+        stdio: 'ignore',
+      })
+      let settled = false
+      const finish = (failed: boolean): void => {
+        if (settled) return
+        settled = true
+        if (failed) fallback()
+        resolvePromise()
+      }
+      killer.once('error', () => finish(true))
+      killer.once('close', code => finish(code !== 0))
     })
-    killer.once('error', fallback)
-    return
   }
-  try {
-    process.kill(-pid, 'SIGTERM')
-  } catch {
-    fallback()
-  }
+  return new Promise(resolvePromise => {
+    try {
+      process.kill(-pid, 'SIGTERM')
+    } catch {
+      fallback()
+      resolvePromise()
+      return
+    }
+    const force = setTimeout(() => {
+      try { process.kill(-pid, 'SIGKILL') } catch { /* the process group already settled */ }
+      resolvePromise()
+    }, 2_000)
+    force.unref()
+  })
+}
+
+export function terminateProcessTree(pid: number, fallback: () => void): void {
+  void terminateProcessTreeAndWait(pid, fallback)
 }
 
 export async function runFileTree(
@@ -92,10 +114,11 @@ export async function runFileTree(
     const stderr: Buffer[] = []
     let outputBytes = 0
     let localFailure: Error | undefined
+    let termination: Promise<void> | undefined
     let settled = false
     const abortTree = (reason?: Error): void => {
       if (reason) localFailure = reason
-      if (child.pid !== undefined) terminateProcessTree(child.pid, () => { child.kill('SIGTERM') })
+      if (child.pid !== undefined) termination = terminateProcessTreeAndWait(child.pid, () => { child.kill('SIGTERM') })
       else child.kill('SIGTERM')
     }
     const collect = (target: Buffer[], chunk: unknown): void => {
@@ -113,16 +136,18 @@ export async function runFileTree(
       options.signal.removeEventListener('abort', abort)
       if (timeout) clearTimeout(timeout)
     }
-    child.once('error', error => {
+    child.once('error', async error => {
       if (settled) return
       settled = true
       cleanup()
+      await termination
       reject(error)
     })
-    child.once('close', code => {
+    child.once('close', async code => {
       if (settled) return
       settled = true
       cleanup()
+      await termination
       if (localFailure) { reject(localFailure); return }
       if (options.signal.aborted) { reject(signalError(options.signal)); return }
       resolvePromise({ stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8'), exitCode: code ?? 1 })
@@ -144,22 +169,25 @@ export async function runOpaqueShell(command: string, cwd: string, signal: Abort
       stdio: ['ignore', 'pipe', 'pipe'],
     }
     const child = spawn(file, args, options)
+    let termination: Promise<void> | undefined
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     child.stdout?.on('data', chunk => stdout.push(Buffer.from(chunk)))
     child.stderr?.on('data', chunk => stderr.push(Buffer.from(chunk)))
     const abort = (): void => {
-      if (child.pid !== undefined) terminateProcessTree(child.pid, () => { child.kill('SIGTERM') })
+      if (child.pid !== undefined) termination = terminateProcessTreeAndWait(child.pid, () => { child.kill('SIGTERM') })
       else child.kill('SIGTERM')
     }
     signal.addEventListener('abort', abort, { once: true })
     if (signal.aborted) abort()
-    child.once('error', error => {
+    child.once('error', async error => {
       signal.removeEventListener('abort', abort)
+      await termination
       reject(error)
     })
-    child.once('close', code => {
+    child.once('close', async code => {
       signal.removeEventListener('abort', abort)
+      await termination
       if (signal.aborted) {
         reject(signalError(signal))
         return

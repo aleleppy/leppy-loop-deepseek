@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { runFileTree, runOpaqueShell } from '../src/process.js'
+import { describe, expect, it, vi } from 'vitest'
+import { runFileTree, runOpaqueShell, terminateProcessTreeAndWait } from '../src/process.js'
 
 describe('opaque gate process cancellation', () => {
   it('rejects a pre-aborted signal before spawning the shell', async () => {
@@ -24,4 +24,10 @@ describe('opaque gate process cancellation', () => {
     setTimeout(() => control.abort(new Error('gate canceled')), 100)
     await expect(running).rejects.toThrow('gate canceled')
   }, 10_000)
+
+  it.runIf(process.platform === 'win32')('falls back when taskkill starts but returns nonzero', async () => {
+    const fallback = vi.fn()
+    await terminateProcessTreeAndWait(2_147_483_647, fallback)
+    expect(fallback).toHaveBeenCalledOnce()
+  })
 })

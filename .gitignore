@@ -5,3 +5,5 @@ coverage/
 .leppy-loop/
 .sessions/
 *.log
+.tmp/
+/.leppy-loop.local.json

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { runFile, runFileBuffer } from './process.js'
+import { loadWslValidationProfile } from './wsl-validation.js'
 
 export interface GitSetup {
   repoRoot: string
@@ -17,8 +18,21 @@ export async function resolveRepoRoot(start: string, signal?: AbortSignal): Prom
 }
 
 export async function assertSourceReady(repoRoot: string, checklistPath: string, signal?: AbortSignal): Promise<void> {
-  const status = (await runFile('git', ['status', '--porcelain=v1', '--untracked-files=normal'], { cwd: repoRoot, signal })).stdout
-  if (status.trim() !== '') throw new Error('source checkout must be clean before Leppy Loop starts')
+  const status = (await runFile('git', ['status', '--porcelain=v1', '-z', '--untracked-files=normal'], { cwd: repoRoot, signal })).stdout
+  const records = status.split('\0').filter(Boolean)
+  const trackedLocalProfile = await runFile('git', ['ls-files', '--error-unmatch', '--', '.leppy-loop.local.json'], { cwd: repoRoot, allowFailure: true, signal })
+  if (trackedLocalProfile.exitCode === 0) throw new Error('Host-local .leppy-loop.local.json must remain untracked; use tracked .leppy-loop.json for portable authority')
+  const localProfileRecord = '?? .leppy-loop.local.json'
+  if (records.some(record => record !== localProfileRecord)) throw new Error('source checkout must be clean before Leppy Loop starts')
+  if (records.includes(localProfileRecord)) {
+    const localProfile = resolve(repoRoot, '.leppy-loop.local.json')
+    const stat = lstatSync(localProfile)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 64 * 1024
+      || !inside(realpathSync(repoRoot), realpathSync(localProfile))) {
+      throw new Error('Host-local .leppy-loop.local.json must be one private regular file inside the source checkout and at most 64 KiB')
+    }
+    loadWslValidationProfile(repoRoot)
+  }
   const tracked = await runFile('git', ['ls-files', '--error-unmatch', '--', checklistPath], { cwd: repoRoot, allowFailure: true, signal })
   if (tracked.exitCode !== 0) throw new Error('controlling checklist must be tracked by Git')
 }

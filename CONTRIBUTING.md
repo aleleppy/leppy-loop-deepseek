@@ -4,13 +4,10 @@ Open an issue before changing the public checklist/event contract. Keep compatib
 
 ```sh
 pnpm install
-pnpm lint
-pnpm typecheck
-pnpm test
-pnpm build
-pnpm pack:check
-pnpm secret:scan
+pnpm gate
 ```
+
+The canonical gate includes lint, typecheck, unit/integration tests, the real WSL2 capsule boundary on supported Windows release Hosts, build, pack inspection, clean-profile install/boot smoke, and secret scanning. Non-Windows runs record the explicit WSL platform skip.
 
 Use small conventional commits. Add regression coverage for behavior that was already supposed to work. Do not add broad decorative tests. Never include credentials, private transcripts, or generated run state.
 

@@ -10,12 +10,15 @@ import { safePathEnvironment, validateArgv } from './security.js'
 import { isConventional } from './git.js'
 import type { WorkerMode } from './types.js'
 import { normalizeExecCommand } from './windows-command.js'
+import { executePlaywrightInWsl, loadWslValidationProfile, namedPipeUnavailableDetail, validationRouting } from './wsl-validation.js'
 
 export const name = 'leppy-loop-worker-tools'
 export const inject = ['tools', 'subprocess', 'sandbox', 'sandboxPolicy', 'systemPrompt']
 
 export interface WorkerPolicy {
   root: string
+  repoRoot: string
+  verificationCommitHead?: string
   checklist: string
   allowed: string[]
   mode?: WorkerMode
@@ -24,12 +27,22 @@ export interface WorkerPolicy {
 
 function loadPolicy(): WorkerPolicy {
   const root = realpathSync(requiredEnv('LEPPY_WORKTREE'))
+  const repoRoot = realpathSync(requiredEnv('LEPPY_REPO_ROOT'))
   const checklist = resolve(root, requiredEnv('LEPPY_CHECKLIST'))
   const allowed = JSON.parse(requiredEnv('LEPPY_ALLOWED_PATHS')) as unknown
   if (!Array.isArray(allowed) || !allowed.every(item => typeof item === 'string')) throw new Error('LEPPY_ALLOWED_PATHS must be a string array')
   const mode = process.env.LEPPY_WORKER_MODE ?? 'task'
   if (!['task', 'verification', 'publication-conflict'].includes(mode)) throw new Error('LEPPY_WORKER_MODE is invalid')
-  return { root, checklist, allowed: allowed.map(item => resolve(root, item)), mode: mode as WorkerMode, ...(process.env.LEPPY_GATE_FINGERPRINT ? { gateFingerprint: process.env.LEPPY_GATE_FINGERPRINT } : {}) }
+  const verificationCommitHead = process.env.LEPPY_VERIFICATION_COMMIT_HEAD
+  if (mode === 'verification' && (!verificationCommitHead || !/^[0-9a-f]{40}$/u.test(verificationCommitHead))) {
+    throw new Error('verification requires one authenticated SHA-1 commit head')
+  }
+  if (mode !== 'verification' && verificationCommitHead) throw new Error('verification commit authority cannot enter a mutable worker')
+  return {
+    root, repoRoot, checklist, allowed: allowed.map(item => resolve(root, item)), mode: mode as WorkerMode,
+    ...(verificationCommitHead ? { verificationCommitHead } : {}),
+    ...(process.env.LEPPY_GATE_FINGERPRINT ? { gateFingerprint: process.env.LEPPY_GATE_FINGERPRINT } : {}),
+  }
 }
 
 function requiredEnv(name: string): string {
@@ -169,6 +182,7 @@ export async function commitTaskChanges(policy: WorkerPolicy, message: string, r
 
 export function apply(ctx: Context): void {
   const policy = loadPolicy()
+  const wslValidationProfile = loadWslValidationProfile(policy.root, policy.repoRoot)
   ctx.systemPrompt.variable('leppy_prompt', () => requiredEnv('LEPPY_SYSTEM_PROMPT'))
   ctx.tools.register(defineTool({
     name: 'leppy_read',
@@ -293,6 +307,14 @@ export function apply(ctx: Context): void {
       const execution = ctx.sandboxPolicy.resolve(exec.agent?.session ? { session: exec.agent.session } : {})
       if (execution.mode !== 'workspace-write') throw new Error(`worker requires workspace-write, got ${execution.mode}`)
       if (realpathSync(execution.workspaceRoot) !== policy.root) throw new Error('worker sandbox root does not match the authenticated worktree')
+      const validationRoute = validationRouting(policy.mode ?? 'task', command, wslValidationProfile)
+      if (validationRoute === 'named-pipe-unavailable') throw new Error(namedPipeUnavailableDetail(wslValidationProfile))
+      if (validationRoute === 'capsule') {
+        if (cwd !== policy.root) throw new Error('WSL Playwright validation requires repository-root cwd')
+        if (!wslValidationProfile) throw new Error('WSL Playwright validation profile disappeared after routing')
+        const result = await executePlaywrightInWsl({ root: policy.root, repoRoot: policy.repoRoot, commitHead: policy.verificationCommitHead!, args: args.args, profile: wslValidationProfile, signal: exec.signal })
+        return validatedExecOutput(result.exitCode, result.stdout, result.stderr)
+      }
       const confined = ctx.sandbox.confine([command, ...args.args], execution as SandboxPolicy)
       const handle = ctx.subprocess.spawn({
         argv: confined.argv,

@@ -4,17 +4,17 @@
 
 Leppy Loop is a native external Cordis bundle that executes a tracked Markdown checklist with a fresh DeepSeek Harness process and session for each worker line. The controller owns Git synchronization, the worktree, checklist transitions, closure, gates, durable recovery state, and process leases. Workers receive only the current line, its `Done:` contract, writable paths, applicable repository instructions, and explicit prohibitions; ordinary workers may inspect the worktree but cannot write outside those paths or read the controlling checklist.
 
-Version `0.3.32` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). It registers a Host-side `/leppy-loop` command, an always-discoverable grant-validated controller tool, a model-only `leppy-loop-operator` lifecycle skill that cannot collide with the human command, and browser cards without patching Harness.
+Version `0.3.33` is pinned to DeepSeek Harness `0.1.1-rc.2`, upstream commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). It registers a Host-side `/leppy-loop` command, an always-discoverable grant-validated controller tool, a model-only `leppy-loop-operator` lifecycle skill that cannot collide with the human command, and browser cards without patching Harness.
 
 ## Install
 
-Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.3.32`. Configure the credential for the model provider selected in the Harness Models page, then build and install the tarball into the profile used by the Web host. Workers reuse that provider, model profile, and credential automatically; `DEEPSEEK_API_KEY` is not required when another provider is selected:
+Node `22.19+`, Git, and pnpm `10.28.1` are required. DeepSeek Harness forwards plugin management to the `pnpm` found on `PATH`; pnpm 11 requires a separate native-build approval step and is not claimed as an install-compatible combination for `0.3.33`. Configure the credential for the model provider selected in the Harness Models page, then build and install the tarball into the profile used by the Web host. Workers reuse that provider, model profile, and credential automatically; `DEEPSEEK_API_KEY` is not required when another provider is selected:
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm build
+pnpm gate
 pnpm pack
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.3.32.tgz
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.3.33.tgz
 ```
 
 Restart the existing `dsh web` process after changing its profile. A browser refresh cannot compose a newly installed Host plugin. A published GitHub Release tarball may replace the local `.tgz` path; there is no claim of publication in a plugin registry.
@@ -39,7 +39,30 @@ The default `adaptive` worker policy uses `gpt-5.6-terra` at `high` for ordinary
 
 Every worker must end with one structured `LEPPY_OUTCOME`. `completed` requires concrete `validation.status=passed` evidence. Missing/malformed reports, `blocked`, failed validation, or contradictory terminal prose such as `BLOQUEADO` stall with the row open even if Git looks clean. Three identical failed tool calls or eight total failures stop the worker turn; blocked/unavailable/repeated failures also open a durable automatic-recovery circuit instead of burning lifecycle transitions. A deterministic npm `ENOTCACHED`/`only-if-cached` miss or `MODULE_NOT_FOUND` below `node_modules` stops after its first tool failure. The global attempt is persisted before every retry worker starts.
 
-When an ordinary task worker creates exactly one clean in-scope commit but cannot run focused validation, the controller preserves that material progress as an HMAC-authenticated pending validation instead of opening the unchanged-work circuit or launching another implementation worker. It verifies the exact commit in a detached disposable worktree with read/search/exec tools but no write/edit/commit/delete capability. Verification denies package managers, repository scripts, shells and interpreter frontends; a bare validation binary must resolve from the authenticated root `node_modules/.bin`. Before adoption, the controller proves the disposable HEAD/index/tracked tree is unchanged and that preserved WIP, ignored-byte digest and checklist still match. A passed report is embedded in the same atomic `run.json` generation, then adopted exactly once through a crash-reconcilable checklist-only amend. Failed validation remains failed, and unavailable/repeated verification remains fail-closed. Interrupted-after-commit recovery enters this path only while authenticated task, checklist, base, commit and scope still match.
+When an ordinary task worker creates exactly one clean in-scope commit but cannot run focused validation, the controller preserves that material progress as an HMAC-authenticated pending validation instead of opening the unchanged-work circuit or launching another implementation worker. It verifies the exact commit in a detached disposable worktree with read/search/exec tools but no write/edit/commit/delete capability. Verification denies package managers, repository scripts, shells and interpreter frontends; a bare validation binary must resolve from the authenticated root `node_modules/.bin`. Before adoption, the controller proves the disposable HEAD/index/tracked tree is unchanged and that preserved WIP, ignored-byte digest and checklist still match. A passed report is embedded in the same atomic `run.json` generation, then adopted exactly once through a crash-reconcilable checklist-only amend. Failed validation remains failed, and unavailable/repeated verification remains fail-closed. A schema-v2 interrupted-after-commit recovery enters this path only when an HMAC-bound terminal receipt was synchronously persisted as validation-unavailable and task, checklist, base, commit and scope still match; failed or missing receipts stall fail-closed. Schema-v1 state retains a bounded compatibility path for already-existing runs.
+
+On Windows, direct Playwright validation cannot create its nested libuv named pipes inside the Harness `WRITE_RESTRICTED` token. Leppy reports `LEPPY_WINDOWS_NAMED_PIPE_UNAVAILABLE` after the first authenticated `playwright` call instead of retrying or hiding the argv. If that task left one clean exact-scope commit, the detached verification worker may run `playwright test` in a WSL2 + bubblewrap capsule. This route is opt-in and has no unconfined fallback. Configure either portable tracked `.leppy-loop.json` or Host-local uncommitted `.leppy-loop.local.json` (the local file takes precedence). Fresh-run source cleanliness admits only that exact bounded private untracked file; every other WIP entry still blocks startup:
+
+```json
+{
+  "validationExecutor": {
+    "kind": "wsl2",
+    "distribution": "Ubuntu",
+    "envFile": ".env",
+    "envAllowlist": ["E2E_BACKEND_URL", "E2E_SYSTEM_KEY", "E2E_TENANT_URI"],
+    "envPrefixes": ["PUBLIC_"],
+    "envAliases": { "BACKEND_URL": "E2E_BACKEND_URL" },
+    "prepareScripts": ["prepare"],
+    "seedPaths": ["src/reflector/backup.json", "src/reflector/controllers", "src/reflector/enums.ts", "src/reflector/fields.ts", "src/reflector/mocked-params.svelte.ts"],
+    "webServerTimeoutMs": 600000,
+    "playwrightConfig": "playwright.config.ts"
+  }
+}
+```
+
+The config names environment variables but never contains their values. The env source must resolve physically to one private regular file inside the exact `repoRoot` and be at most 64 KiB. The executor archives the authenticated pending commit OID and proves the candidate root/HEAD exactly; it does not mount the Windows worktree. Optional `seedPaths` accept only explicit Host-generated baselines ignored by tracked repository `.gitignore` authority and untracked in both candidate and source roots, then copy one stable handle-bound snapshot before archive extraction after rejecting destination symlink topology, links, hardlinks, special files, escapes, more than 10,000 files or more than 256 MiB; the result emits a SHA-256 receipt. Dependency install always uses `npm ci --ignore-scripts`; the canonical-registry lock entries, package identities, dependency edges and direct Playwright launcher are authenticated before the dependency tree becomes read-only, except for exact private Vite cache mounts, and before any explicitly named `prepareScripts` or `prepareBins` run. A bounded `webServerTimeoutMs` (180000–900000) requires the exact `playwrightConfig` path and creates a private wrapper for slower clean Linux builds without assuming TypeScript or editing candidate files. The selected distro's own `wslpath` resolves staging paths instead of assuming `/mnt/<drive>`. Inside WSL the capsule masks Host mounts, homes, mutable distro state and WSL interop, gives the candidate only private writable workspace/home/temp/cache, authenticates the live mount table and exposes only a minimal read-only distro runtime (`/usr`, toolchain libraries and `/etc`) with WSL submounts masked, and runs npm, the web server, Playwright workers and Chromium there. `wsl.exe`, the named distribution, Linux Node/npm, `findmnt`, and `bubblewrap` are explicit Host prerequisites. Network remains shared, matching the existing network non-goal.
+
+`pnpm gate` runs the real Chromium/isolation/cancellation boundary automatically on Windows release Hosts with WSL2; non-Windows CI records an explicit platform skip. Run `pnpm test:wsl-capsule` directly for that boundary alone. The integration source remains excluded from the published runtime tarball.
 
 Before every ordinary worker dispatch, the controller also records an immutable HMAC-bound snapshot of ignored paths and bytes for that exact run/task/attempt. After the worker settles, it classifies the full delta before mutation: unchanged pre-existing ignored WIP is preserved, changed/deleted/replaced WIP fails closed without moving anything, tracked promotion remains subject to normal candidate scope validation, and only baseline-absent regular-file leaves may be atomically renamed into private quarantine. The transaction reference enters authenticated active state before its first move. Crash recovery revalidates every source/destination pair, physical private root and parent, link count, fingerprint and same-device constraint before moving any entry. Legacy attempts without a stored snapshot recover only when the canonical empty digest applies or a bounded search finds an exact current fingerprint subset whose SHA-256 equals the authenticated non-empty baseline digest. Only an authenticated active task/attempt/baseline identity may use the anti-thrash migration bridge. Before a bridge job starts, the normalized terminal and full attempt identity enter an idempotent lock-protected HMAC `prepared` admission. The preparation binds its normalized request digest and target lifecycle epoch/transition, so pre-job failures retry without a worker and a receipt already at the final budget slot is reused rather than incremented; the runner requires it and atomically promotes it to `consumed` before reconciliation, after which replay is denied. The final baseline-only migration may include all current ordinary untracked paths in the exact historical subset proof, but never treats unproven ordinary paths as worker output: they stay in place and the clean-tree gate blocks adoption. Its base-rule classifier uses an isolated Git dir with empty mutable/global excludes, and one shared content budget covers all candidate classes. The exact predecessor no-match failure proves at most 39 fingerprints and may receive one four-addition/100,000-candidate migration; its canonical terminal can receive one promotion-aware migration that augments candidates only with exact paths newly tracked since the authenticated active-attempt base that remain ignored. That terminal can receive one base-ignore migration for current ordinary untracked paths proven ignored under byte-exact regular `.gitignore` blobs from the authenticated base. The base-ignore terminal receives one final migration for newly tracked paths that were ignored by those base rules but are no longer ignored now; rename detection is disabled so exact rename destinations remain Added candidates. Symlink/gitlink rules, checkout-transforming attributes, noncanonical path bytes and platform-ambiguous separators fail closed. Wider snapshots retain three additions/10,000 candidates. Input is capped at 128 KiB UTF-8 and cumulative candidate serialization/hashing at 512 MiB; candidate and quarantine content is independently capped at 512 MiB per streamed phase. Every mismatch or limit fails closed before receipts or movement.
 
@@ -149,7 +172,7 @@ The official sandbox does not confine network access. A malicious repository scr
 
 ## Costs and limitations
 
-Each line starts an independent context, so shared conversational cache is intentionally lost and model cost may be higher. Version `0.3.32` supports only the tested Harness pin. Network confinement, automatic push, PR mutation, release publication, package publication, and deployment are not provided. No remote action is automatic.
+Each line starts an independent context, so shared conversational cache is intentionally lost and model cost may be higher. Version `0.3.33` supports only the tested Harness pin. Network confinement, automatic push, PR mutation, release publication, package publication, and deployment are not provided. No remote action is automatic.
 
 ## Uninstall
 
@@ -172,13 +195,10 @@ Restart the Web host after removal. Remove a dedicated CLI profile separately if
 
 ```sh
 pnpm install
-pnpm lint
-pnpm typecheck
-pnpm test
-pnpm build
-pnpm pack:check
-pnpm secret:scan
+pnpm gate
 ```
+
+The canonical gate includes the supported-host WSL capsule boundary, package inspection, and clean-profile `install:smoke` in addition to lint, typecheck, tests, build, and secret scan.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md).
 

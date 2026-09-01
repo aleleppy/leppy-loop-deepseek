@@ -841,6 +841,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       task,
       attempt: state.attempt,
       worktree: state.worktree,
+      repoRoot: state.repoRoot,
       checklistPath: checklistRelative,
       allowedPaths,
       mode: 'publication-conflict',
@@ -1110,6 +1111,9 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         if (liveHead === active.baseHead) {
           delete state.activeTaskAttempt
         } else {
+          if (active.schemaVersion >= 2 && active.terminalOutcome?.disposition !== 'validation-unavailable') {
+            throw new Error('committed active attempt lacks an authenticated validation-unavailable terminal receipt; detached verification is denied')
+          }
           await assertTaskCommit(state.worktree, active.baseHead, state.branch)
           await assertTaskCommitScope(state.worktree, active.baseHead, checklistRelative, task.metadata.paths, signal)
           state.pendingTaskValidation = {
@@ -1227,7 +1231,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       ]
       const effectiveGateFingerprint = workerGateFingerprint(parsed, task, options.phaseGateCommand)
       const request: WorkerRequest = {
-        runId: state.runId, task, attempt: state.attempt, worktree: state.worktree,
+        runId: state.runId, task, attempt: state.attempt, worktree: state.worktree, repoRoot: state.repoRoot,
         checklistPath: checklistRelative, allowedPaths,
         model: model.model, provider: model.provider, ...(model.effort ? { effort: model.effort } : {}),
         timeoutMs: options.workerTimeoutMs, outputLimitBytes: options.workerOutputLimitBytes,
@@ -1263,6 +1267,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           const verificationRequest: WorkerRequest = {
             ...request,
             mode: 'verification',
+            verificationCommitHead: pending.commitHead,
             worktree: isolatedRoot,
             allowedPaths: [],
             model: verifierModel.model,
@@ -1317,6 +1322,18 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       let retryUsed = state.pendingTaskValidation !== undefined
       let verifyingNoCommit = false
       let outcome: WorkerOutcome
+      const persistReturnedTaskOutcome = (returned: WorkerOutcome, attempt: number): void => {
+        const active = state.activeTaskAttempt
+        if (!active || active.attempt !== attempt) return
+        const validationUnavailable = returned.status === 'unavailable'
+          || (returned.status === 'blocked' && returned.report?.validation.status === 'not-run')
+        active.terminalOutcome = {
+          schemaVersion: 1,
+          disposition: validationUnavailable ? 'validation-unavailable' : 'failed-or-unknown',
+          outcomeDigest: digest(JSON.stringify({ status: returned.status, error: returned.error ?? null, report: returned.report ?? null })),
+        }
+        writeState(join(stateDir, 'run.json'), state)
+      }
       if (state.pendingTaskValidation) {
         outcome = await runCommittedVerification(state.pendingTaskValidation, outcomeAttempt)
       } else {
@@ -1327,7 +1344,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             key: createLeaseKey(stateDir),
           })
           state.activeTaskAttempt = {
-            schemaVersion: 1, taskKey: selectedTaskKey, taskIndex: task.index,
+            schemaVersion: 2, taskKey: selectedTaskKey, taskIndex: task.index,
             baseHead: previousHead, checklistDigest: controllerHash,
             ignoredPathsDigest: ignoredBaseline.digest, attempt: state.attempt,
           }
@@ -1340,6 +1357,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: model.model, effort: model.effort ?? null, paths: allowedPaths }, task, state.attempt))
         if (signal.aborted) throw abortReason(signal)
         outcome = await runAuthorizedWorker(request)
+        persistReturnedTaskOutcome(outcome, state.attempt)
         await reconcileGeneratedWorkerCache(state.attempt, workerCacheBaseline.cacheState === 'absent', outcome)
         if (state.activeTaskAttempt) durableIgnoredDigest = await reconcileIgnoredAttempt(state.activeTaskAttempt)
       }
@@ -1365,6 +1383,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
               ignoredPathsDigest: retryIgnoredBaseline.digest,
             }
             delete state.activeTaskAttempt.ignoredArtifactTransaction
+            delete state.activeTaskAttempt.terminalOutcome
           }
           writeState(join(stateDir, 'run.json'), state)
           const retryRequest: WorkerRequest = {
@@ -1380,6 +1399,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           })
           appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'availability' }, task, outcomeAttempt))
           outcome = await runAuthorizedWorker(retryRequest)
+          persistReturnedTaskOutcome(outcome, outcomeAttempt)
           await reconcileGeneratedWorkerCache(outcomeAttempt, retryCacheBaseline.cacheState === 'absent', outcome)
           if (state.activeTaskAttempt) durableIgnoredDigest = await reconcileIgnoredAttempt(state.activeTaskAttempt)
           retryUsed = true
@@ -1408,6 +1428,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             ignoredPathsDigest: retryIgnoredBaseline.digest,
           }
           delete state.activeTaskAttempt.ignoredArtifactTransaction
+          delete state.activeTaskAttempt.terminalOutcome
         }
         writeState(join(stateDir, 'run.json'), state)
         const retryRequest: WorkerRequest = {
@@ -1428,20 +1449,25 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         appendEvent(eventsPath, event(state.runId, 'start', 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'no-commit' }, task, outcomeAttempt))
         verifyingNoCommit = true
         outcome = await runAuthorizedWorker(retryRequest)
+        persistReturnedTaskOutcome(outcome, outcomeAttempt)
         await reconcileGeneratedWorkerCache(outcomeAttempt, retryCacheBaseline.cacheState === 'absent', outcome)
         if (state.activeTaskAttempt) durableIgnoredDigest = await reconcileIgnoredAttempt(state.activeTaskAttempt)
         retryUsed = true
         if (signal.aborted) throw abortReason(signal)
         if (digest(readFileSync(checklistPath, 'utf8')) !== controllerHash) throw new Error('worker altered the controlling checklist')
       }
+      if (outcome.status === 'completed' && outcome.report?.validation.status === 'failed') {
+        outcome = { ...outcome, status: 'failed', error: 'worker completion contradicts its failed validation report' }
+      }
+      const active = state.activeTaskAttempt
       const materialCandidate = state.pendingTaskValidation === undefined
         && task.kind === 'task'
+        && active?.terminalOutcome?.disposition === 'validation-unavailable'
         && outcome.status !== 'completed'
         && outcome.report?.validation.status !== 'failed'
         && await commitCount(state.worktree, previousHead) === 1
         && (await gitStatus(state.worktree)).trim() === ''
       if (materialCandidate) {
-        const active = state.activeTaskAttempt
         if (!active || active.baseHead !== previousHead || active.taskKey !== selectedTaskKey
           || active.checklistDigest !== controllerHash || !durableIgnoredDigest) {
           throw new Error('material worker commit lacks its authenticated active attempt')

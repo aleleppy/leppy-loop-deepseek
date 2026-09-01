@@ -48,12 +48,15 @@ function registeredRuntime(
   spawnEnvironments: NodeJS.ProcessEnv[]
   promptVariables: Array<{ name: string; value: string }>
 } {
-  const variables = ['LEPPY_WORKTREE', 'LEPPY_CHECKLIST', 'LEPPY_ALLOWED_PATHS', 'LEPPY_WORKER_MODE', 'LEPPY_SYSTEM_PROMPT'] as const
+  const variables = ['LEPPY_WORKTREE', 'LEPPY_REPO_ROOT', 'LEPPY_CHECKLIST', 'LEPPY_ALLOWED_PATHS', 'LEPPY_WORKER_MODE', 'LEPPY_VERIFICATION_COMMIT_HEAD', 'LEPPY_SYSTEM_PROMPT'] as const
   const previous = Object.fromEntries(variables.map(name => [name, process.env[name]]))
   process.env.LEPPY_WORKTREE = root
+  process.env.LEPPY_REPO_ROOT = root
   process.env.LEPPY_CHECKLIST = 'tasks.task.md'
   process.env.LEPPY_ALLOWED_PATHS = JSON.stringify(['prisma/schemas/auth.prisma'])
   process.env.LEPPY_WORKER_MODE = mode
+  if (mode === 'verification') process.env.LEPPY_VERIFICATION_COMMIT_HEAD = git(root, 'rev-parse', 'HEAD')
+  else delete process.env.LEPPY_VERIFICATION_COMMIT_HEAD
   process.env.LEPPY_SYSTEM_PROMPT = 'preserve literal {{ duration: 200 }}'
   const tools: string[] = []
   const definitions: RegisteredWorkerTool[] = []
@@ -101,7 +104,7 @@ describe('worker commit capability', () => {
 
   it('normalizes an explicit dot cwd to the repository root without widening file scope', () => {
     const root = repository()
-    const policy: WorkerPolicy = { root, checklist: join(root, 'tasks.task.md'), allowed: [join(root, 'prisma', 'schemas')] }
+    const policy: WorkerPolicy = { root, repoRoot: root, checklist: join(root, 'tasks.task.md'), allowed: [join(root, 'prisma', 'schemas')] }
     expect(resolveExecCwd(policy)).toBe(root)
     expect(resolveExecCwd(policy, '.')).toBe(root)
     expect(resolveExecCwd(policy, './')).toBe(root)
@@ -117,6 +120,7 @@ describe('worker commit capability', () => {
     const exact = join(root, 'prisma', 'schemas', 'auth.prisma')
     const policy: WorkerPolicy = {
       root,
+      repoRoot: root,
       checklist: join(root, 'tasks.task.md'),
       allowed: [exact],
       mode: 'publication-conflict',
@@ -132,6 +136,7 @@ describe('worker commit capability', () => {
     const root = repository()
     const policy: WorkerPolicy = {
       root,
+      repoRoot: root,
       checklist: join(root, 'tasks.task.md'),
       allowed: [join(root, 'prisma', 'schemas', 'auth.prisma')],
       mode: 'verification',
@@ -164,6 +169,31 @@ describe('worker commit capability', () => {
     const expected = join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
     expect(runtime.resolutions).toHaveLength(1)
     expect(runtime.commands).toEqual([[expected, '--noEmit']])
+  })
+
+  it.runIf(process.platform === 'win32')('rejects snapshot mutation before launching the verification capsule', async () => {
+    const root = repository()
+    const playwright = join(root, 'node_modules', '.bin', 'playwright.cmd')
+    mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(playwright, '@echo off\r\n')
+    writeFileSync(join(root, '.leppy-loop.json'), `${JSON.stringify({ validationExecutor: { kind: 'wsl2', distribution: 'Ubuntu', envAllowlist: [] } })}\n`)
+    const runtime = registeredRuntime(root, 'verification', { resolvedCommand: playwright })
+    const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    await expect(execute({ command: 'playwright', args: ['test', '--update-snapshots=all'] }, { signal: new AbortController().signal }))
+      .rejects.toThrow('snapshot-update')
+    expect(runtime.commands).toHaveLength(0)
+  })
+
+  it.runIf(process.platform === 'win32')('classifies Playwright named-pipe validation before any doomed confined spawn', async () => {
+    const root = repository()
+    const playwright = join(root, 'node_modules', '.bin', 'playwright.cmd')
+    mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(playwright, '@echo off\r\n')
+    const runtime = registeredRuntime(root, 'task', { resolvedCommand: playwright })
+    const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    await expect(execute({ command: 'playwright', args: ['test', 'tests/e2e/auth'] }, { signal: new AbortController().signal }))
+      .rejects.toThrow('LEPPY_WINDOWS_NAMED_PIPE_UNAVAILABLE')
+    expect(runtime.commands).toHaveLength(0)
   })
 
   it('preserves task and publication conflict capability boundaries', () => {
@@ -312,6 +342,7 @@ describe('worker commit capability', () => {
     }
     const policy: WorkerPolicy = {
       root,
+      repoRoot: root,
       checklist: join(root, 'tasks.task.md'),
       allowed: [join(root, 'prisma', 'schemas', 'auth.prisma')],
       mode: 'task',
@@ -329,6 +360,7 @@ describe('worker commit capability', () => {
     writeFileSync(join(root, '.env.secret'), 'must-not-stage\n')
     const policy: WorkerPolicy = {
       root,
+      repoRoot: root,
       checklist: join(root, 'tasks.task.md'),
       allowed: [join(root, 'prisma', 'schemas'), join(root, 'prisma', 'migrations')],
       mode: 'task',

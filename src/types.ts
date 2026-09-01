@@ -69,13 +69,18 @@ export interface IgnoredArtifactTransactionRef {
 }
 
 export interface ActiveTaskAttempt {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
   taskKey: string
   taskIndex: number
   baseHead: string
   checklistDigest: string
   ignoredPathsDigest: string
   attempt: number
+  terminalOutcome?: {
+    schemaVersion: 1
+    disposition: 'validation-unavailable' | 'failed-or-unknown'
+    outcomeDigest: string
+  }
   ignoredArtifactTransaction?: IgnoredArtifactTransactionRef
 }
 
@@ -204,6 +209,8 @@ export interface WorkerRequest {
   task: ChecklistTask
   attempt: number
   worktree: string
+  repoRoot: string
+  verificationCommitHead?: string
   checklistPath: string
   allowedPaths: string[]
   mode?: WorkerMode

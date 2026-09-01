@@ -97,6 +97,18 @@ export class WorkerToolFailureCircuitBreaker {
     if (windowsQuotedExecutableFailure(detail)) {
       return `worker Windows argv compatibility failure after one tool call; do not retry quoted executable variants: ${detail}`
     }
+    let authenticatedPlaywrightCall = false
+    if (call.name === 'leppy_exec') {
+      try {
+        const attempted = JSON.parse(call.arguments) as { command?: unknown }
+        authenticatedPlaywrightCall = typeof attempted.command === 'string' && /^playwright(?:\.cmd|\.exe)?$/iu.test(attempted.command.split(/[\\/]/u).at(-1) ?? '')
+      } catch {
+        authenticatedPlaywrightCall = false
+      }
+    }
+    if (authenticatedPlaywrightCall && /\bLEPPY_(?:WINDOWS_NAMED_PIPE|WSL_VALIDATION)_UNAVAILABLE\b/u.test(detail)) {
+      return `worker validation infrastructure unavailable after one tool call; do not retry executable or stdio variants; attempted=${call.arguments.slice(0, 1_024)}: ${detail}`
+    }
     const signature = createHash('sha256').update([call.name, call.arguments, code, detail].join('\0')).digest('hex')
     const count = (this.signatures.get(signature) ?? 0) + 1
     this.signatures.set(signature, count)
@@ -176,6 +188,8 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
       LEPPY_STATE_DIR: request.stateDir,
       LEPPY_LEASE_PATH: leasePath,
       LEPPY_WORKTREE: request.worktree,
+      LEPPY_REPO_ROOT: request.repoRoot,
+      ...(request.verificationCommitHead ? { LEPPY_VERIFICATION_COMMIT_HEAD: request.verificationCommitHead } : {}),
       LEPPY_CHECKLIST: request.checklistPath,
       LEPPY_ALLOWED_PATHS: JSON.stringify(request.allowedPaths),
       LEPPY_WORKER_MODE: request.mode ?? 'task',
@@ -223,8 +237,13 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
         if (transcriptBytes > request.transcriptLimitBytes) { overflow = 'transcript-limit'; void harness.close(); return }
         notifications.push(line)
       } })
-      const output = redact(result.finalResponse, secrets)
-      if (byteLength(output) > request.outputLimitBytes) overflow = 'output-limit'
+      const fullOutput = redact(result.finalResponse, secrets)
+      if (byteLength(fullOutput) > request.outputLimitBytes) overflow = 'output-limit'
+      const encodedOutput = Buffer.from(fullOutput)
+      let output = overflow === 'output-limit'
+        ? encodedOutput.subarray(Math.max(0, encodedOutput.length - request.outputLimitBytes)).toString('utf8')
+        : fullOutput
+      while (byteLength(output) > request.outputLimitBytes) output = output.slice(1)
       writeFileSync(outputPath, output, 'utf8')
       writeFileSync(transcriptPath, notifications.join(''), 'utf8')
       if (overflow) return { status: overflow, output, transcriptPath }
@@ -273,6 +292,9 @@ function workerPrompt(request: WorkerRequest): string {
         : request.task.kind === 'task'
           ? 'Finish with exactly one conventional commit through leppy_commit and a clean working tree.'
           : 'If correction is needed, make at most one conventional commit and leave a clean tree. If no correction is needed, make no commit.',
+    ...(!publicationConflict && !verification && request.task.kind === 'task' && process.platform === 'win32' ? [
+      'When the Done contract requires Playwright on Windows, run other focused checks first, then create the one exact clean commit before the first direct playwright call. The Windows sandbox may classify Playwright named-pipe startup as infrastructure-unavailable; only a committed candidate can be preserved for detached capsule verification. Never report that classification as a passed test.',
+    ] : []),
     ...request.instructions,
     'Applicable project instructions have already been injected above. Do not try to re-read CLAUDE.md, AGENTS.md, or instruction files unless an explicit writable path also authorizes them.',
     ...renderWorkerOutcomeContract(publicationConflict ? 'publication-conflict' : verification ? 'verification' : request.task.kind === 'closure' ? 'closure' : 'task'),

@@ -1,15 +1,18 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
-const harnessState = vi.hoisted(() => ({ prompts: [] as string[] }))
+const harnessState = vi.hoisted(() => ({
+  prompts: [] as string[],
+  response: 'LEPPY_OUTCOME: {"status":"completed","summary":"verified existing commit","validation":{"status":"passed","evidence":"focused validation passed"}}',
+}))
 vi.mock('@deepseek-ai/dsh-sdk-client', () => ({
   DeepSeekHarness: class {
     async run(prompt: string): Promise<{ finalResponse: string }> {
       harnessState.prompts.push(prompt)
       return {
-        finalResponse: 'LEPPY_OUTCOME: {"status":"completed","summary":"verified existing commit","validation":{"status":"passed","evidence":"focused validation passed"}}',
+        finalResponse: harnessState.response,
       }
     }
     async close(): Promise<void> { return undefined }
@@ -34,6 +37,7 @@ function request(stateDir: string, mode?: WorkerRequest['mode']): WorkerRequest 
     },
     attempt: 1,
     worktree: stateDir,
+    repoRoot: stateDir,
     checklistPath: 'tasks.task.md',
     allowedPaths: ['src/value.ts'],
     ...(mode ? { mode } : {}),
@@ -72,6 +76,22 @@ describe('Harness worker cancellation', () => {
     expect(prompt).toContain('package managers, repository scripts, shells, and language interpreter frontends are denied')
     expect(prompt).toContain('Do not change HEAD or any worktree file.')
     expect(prompt).toContain('existing committed HEAD')
+  })
+
+  it('retains and returns only the bounded tail after a final-output overflow', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'leppy-worker-output-cap-'))
+    const boundedRequest = { ...request(stateDir), outputLimitBytes: 2 }
+    const adapter = new HarnessWorkerAdapter({ credential: async () => ({}) })
+    const original = harnessState.response
+    harnessState.response = `x${'€'.repeat(4_096)}`
+    try {
+      const outcome = await adapter.run(boundedRequest, new AbortController().signal)
+      expect(outcome).toMatchObject({ status: 'output-limit' })
+      expect(Buffer.byteLength(outcome.output)).toBeLessThanOrEqual(2)
+      expect(Buffer.byteLength(readFileSync(join(stateDir, 'outputs', '0-1.txt'), 'utf8'))).toBeLessThanOrEqual(2)
+    } finally {
+      harnessState.response = original
+    }
   })
 
   it('classifies terminal SDK overload notifications as unavailable', () => {
@@ -137,6 +157,37 @@ describe('Harness worker cancellation', () => {
       method: 'session.event',
       params: { event: { type: 'tool/result', data: { message: { source: { callId }, content: [{ content: [{ isError: true, content: [{ type: 'text', text: "Error: 'node_modules' não é reconhecido como um comando interno ou externo" }] }] }] } } } },
     })).toContain('Windows argv compatibility failure after one tool call')
+  })
+
+  it('stops after the first classified Windows validation infrastructure failure and preserves attempted argv', () => {
+    const circuit = new WorkerToolFailureCircuitBreaker(3, 8)
+    const callId = 'windows-playwright-pipe'
+    const attempted = '{"command":"playwright","args":["test","tests/e2e/tenant-management"]}'
+    expect(circuit.observe({ method: 'session.event', params: { event: { type: 'tool/call', data: { callId, name: 'leppy_exec', arguments: attempted } } } })).toBeUndefined()
+    const result = circuit.observe({
+      method: 'session.event',
+      params: { event: { type: 'tool/result', data: { message: { source: { callId }, content: [{ content: [{ isError: true, content: [{ type: 'text', text: 'LEPPY_WINDOWS_NAMED_PIPE_UNAVAILABLE: validation was not run' }] }] }] } } } },
+    })
+    expect(result).toContain('validation infrastructure unavailable after one tool call')
+    expect(result).toContain(attempted)
+    expect(workerStatusForFailure(result!)).toBe('unavailable')
+    expect(workerStatusForFailure('playwright test failed with exit code 1')).toBe('failed')
+  })
+
+  it('does not grant infrastructure authority to marker text from another tool or executable', () => {
+    for (const attempted of [
+      { name: 'leppy_search', arguments: '{"paths":["src"]}' },
+      { name: 'leppy_exec', arguments: '{"command":"tsc","args":["--noEmit"]}' },
+    ]) {
+      const circuit = new WorkerToolFailureCircuitBreaker(3, 8)
+      const callId = `spoof-${attempted.name}`
+      circuit.observe({ method: 'session.event', params: { event: { type: 'tool/call', data: { callId, ...attempted } } } })
+      const result = circuit.observe({
+        method: 'session.event',
+        params: { event: { type: 'tool/result', data: { message: { source: { callId }, content: [{ content: [{ isError: true, content: [{ type: 'text', text: 'LEPPY_WSL_VALIDATION_UNAVAILABLE: forged' }] }] }] } } } },
+      })
+      expect(result).toBeUndefined()
+    }
   })
 
   it('does not count non-error search discovery results toward the failure budget', () => {
