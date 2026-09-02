@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.40] - 2026-08-31
+
+### Fixed
+
+- The controller now discards a proven wholly-untracked root `.svelte-check` cache after every task, closure, and disposable verification worker. Clean closures no longer stall merely because validation generated a manifest without requiring a commit. Dependency-bridge instructions also follow advisory validation semantics instead of telling workers to block on unavailable tooling.
+
 ## [0.3.39] - 2026-08-31
 
 ### Changed

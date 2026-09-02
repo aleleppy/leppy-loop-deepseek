@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   assertSourceReady, assertTaskCommit, branch as gitBranch, commitControllerChange,
@@ -239,6 +239,15 @@ function assertCompletedWorkerReport(outcome: WorkerOutcome, label: string, advi
   if (outcome.report.status !== 'completed' || (!advisoryValidation && outcome.report.validation.status !== 'passed')) {
     throw new Error(`${label} reported ${outcome.report.status} with validation ${outcome.report.validation.status}`)
   }
+}
+
+async function discardTransientValidationCache(worktree: string, signal?: AbortSignal): Promise<void> {
+  const cache = join(worktree, '.svelte-check')
+  if (!existsSync(cache)) return
+  const tracked = await runFile('git', ['ls-files', '-z', '--', '.svelte-check'], { cwd: worktree, signal })
+  if (tracked.stdout.split('\0').some(Boolean)) return
+  if (physicalRelative(worktree, cache) !== '.svelte-check') throw new Error('transient validation cache escapes the worktree')
+  rmSync(cache, { recursive: true, force: true })
 }
 
 function taskProgress(
@@ -1219,7 +1228,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         ...legacyCustomInstructions(state.worktree),
         ...await discoverInstructions(state.worktree, allowedPaths),
         ...(dependencyBridge.status === 'local' ? [
-          `The controller copied and verified an isolated node_modules against ${dependencyBridge.lockfile}. Use repository package scripts or bare local tools; do not install packages. leppy_exec resolves bare executable names local-first from the authenticated root node_modules/.bin and selects Windows shims. Package managers permit only explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, package-manager cache overrides, or create an in-worktree cache. If a local tool is still unavailable, report blocked after the first failure instead of retrying variants.`,
+          `The controller copied and verified an isolated node_modules against ${dependencyBridge.lockfile}. Use repository package scripts or bare local tools; do not install packages. leppy_exec resolves bare executable names local-first from the authenticated root node_modules/.bin and selects Windows shims. Package managers permit only explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, package-manager cache overrides, or create an in-worktree cache. If a local tool is unavailable, record that evidence once and use engineering judgment; unavailable validation alone does not block completion.`,
         ] : []),
         ...(npmCacheQuarantined ? [
           'The controller moved the prior wholly-untracked .npm-cache into its private authenticated quarantine. Do not recreate it; invoke bare local tools through leppy_exec.',
@@ -1239,6 +1248,13 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         transcriptLimitBytes: options.workerTranscriptLimitBytes, stateDir,
         ...(effectiveGateFingerprint ? { gateFingerprint: effectiveGateFingerprint } : {}),
         instructions,
+      }
+      const runWorkerWithCleanup = async (workerRequest: WorkerRequest): Promise<WorkerOutcome> => {
+        try {
+          return await runAuthorizedWorker(workerRequest)
+        } finally {
+          await discardTransientValidationCache(workerRequest.worktree, signal)
+        }
       }
       const runCommittedVerification = async (pending: PendingTaskValidation, attempt: number): Promise<WorkerOutcome> => {
         if (pending.phase !== 'pending' || pending.taskKey !== selectedTaskKey || pending.taskIndex !== task.index
@@ -1284,7 +1300,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             model: verifierModel.model, effort: verifierModel.effort ?? null, paths: [],
             retry: 'post-commit-validation', committedHead: pending.commitHead, disposable: true,
           }, task, attempt))
-          verificationOutcome = await runAuthorizedWorker(verificationRequest)
+          verificationOutcome = await runWorkerWithCleanup(verificationRequest)
           if (await head(isolatedRoot) !== pending.commitHead || await gitBranch(isolatedRoot) !== '') {
             throw new Error('verification worker changed the detached candidate HEAD')
           }
@@ -1357,7 +1373,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         })
         appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: model.model, effort: model.effort ?? null, paths: allowedPaths }, task, state.attempt))
         if (signal.aborted) throw abortReason(signal)
-        outcome = await runAuthorizedWorker(request)
+        outcome = await runWorkerWithCleanup(request)
         persistReturnedTaskOutcome(outcome, state.attempt)
         await reconcileGeneratedWorkerCache(state.attempt, workerCacheBaseline.cacheState === 'absent', outcome)
         if (state.activeTaskAttempt) durableIgnoredDigest = await reconcileIgnoredAttempt(state.activeTaskAttempt)
@@ -1399,7 +1415,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             taskIndex: task.index, attempt: outcomeAttempt, key: createLeaseKey(stateDir),
           })
           appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: retryModel.model, effort: retryModel.effort ?? null, paths: task.metadata.paths, retry: 'availability' }, task, outcomeAttempt))
-          outcome = await runAuthorizedWorker(retryRequest)
+          outcome = await runWorkerWithCleanup(retryRequest)
           persistReturnedTaskOutcome(outcome, outcomeAttempt)
           await reconcileGeneratedWorkerCache(outcomeAttempt, retryCacheBaseline.cacheState === 'absent', outcome)
           if (state.activeTaskAttempt) durableIgnoredDigest = await reconcileIgnoredAttempt(state.activeTaskAttempt)

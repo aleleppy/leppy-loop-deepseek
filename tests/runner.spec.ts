@@ -169,6 +169,20 @@ describe('controller state machine', () => {
     ])
   }, 90_000)
 
+  it('discards untracked svelte-check cache after a clean closure without a commit', async () => {
+    const repo = repository('- [?] Closure: inspect `src` | paths=src\n')
+    const worker: WorkerAdapter = { async run(request) {
+      mkdirSync(join(request.worktree, '.svelte-check'))
+      writeFileSync(join(request.worktree, '.svelte-check', 'manifest.json'), '{"generated":true}\n')
+      return completedOutcome('closure inspected with advisory validation')
+    } }
+
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(existsSync(join(result.worktree!, '.svelte-check'))).toBe(false)
+    expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [x] Closure')
+  }, 90_000)
+
   it('stalls a blocked closure without marking the controller row done', async () => {
     const repo = repository('- [?] Closure: inspect `src` | paths=src\n')
     const worker = new FakeWorker([{
