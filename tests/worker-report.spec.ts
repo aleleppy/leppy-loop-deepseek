@@ -12,13 +12,30 @@ describe('worker outcome protocol', () => {
 
   it('lets ordinary workers complete with advisory validation while keeping verification strict', () => {
     const taskContract = renderWorkerOutcomeContract('task').join('\n')
-    expect(taskContract).toContain('Validation is advisory')
+    expect(taskContract).toContain('Validation and Git ceremony are advisory')
     expect(parseWorkerReport('Tests failed: spawn EPERM\nLEPPY_OUTCOME: {"status":"completed","summary":"implementation satisfied by inspection","validation":{"status":"failed","evidence":"Vitest startup failed with spawn EPERM"}}', true)).toMatchObject({
       status: 'completed', validation: { status: 'failed' },
     })
     expect(parseWorkerReport('LEPPY_OUTCOME: {"status":"completed","summary":"implementation satisfied by inspection","validation":{"status":"not-run","evidence":"validator unavailable in sandbox"}}', true)).toMatchObject({
       status: 'completed', validation: { status: 'not-run' },
     })
+  })
+
+  it('infers advisory ordinary completion from missing or malformed structured reports', () => {
+    expect(parseWorkerReport('Implemented the scoped change.', true)).toMatchObject({
+      status: 'completed', validation: { status: 'not-run' },
+    })
+    expect(parseWorkerReport('LEPPY_OUTCOME: not-json', true)).toMatchObject({
+      status: 'completed', validation: { status: 'not-run' },
+    })
+    expect(parseWorkerReport('BLOQUEADO: missing implementation detail', true)).toMatchObject({ status: 'blocked' })
+  })
+
+  it('accepts only the explicit implementation-impossible disposition as ordinary stop authority', () => {
+    expect(parseWorkerReport('LEPPY_OUTCOME: {"status":"blocked","disposition":"implementation-impossible","summary":"scope cannot include required file","validation":{"status":"not-run","evidence":"authenticated scope excludes dependency"}}', true)).toMatchObject({
+      status: 'blocked', disposition: 'implementation-impossible',
+    })
+    expect(parseWorkerReport('LEPPY_OUTCOME: {"status":"blocked","disposition":"something-else","summary":"scope missing","validation":{"status":"not-run","evidence":"missing"}}', true)).not.toHaveProperty('disposition')
   })
 
   it('requires passed focused validation before verification can report completed', () => {

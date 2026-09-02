@@ -291,10 +291,10 @@ function workerPrompt(request: WorkerRequest): string {
       : verification
         ? 'Do not change HEAD or any worktree file. Report completed only if focused validation passes and the existing commit satisfies the Done contract; report failed for a real validation failure and blocked with validation not-run when the environment still cannot execute it.'
         : request.task.kind === 'task'
-          ? 'Finish with exactly one conventional commit through leppy_commit and a clean working tree.'
-          : 'If correction is needed, make at most one conventional commit and leave a clean tree. If no correction is needed, make no commit.',
+          ? 'Implement the Done contract inside scope. You may use leppy_commit, but the controller will safely adopt uncommitted in-scope changes when you finish.'
+          : 'Inspect and repair only inside scope. You may commit, but the controller also accepts uncommitted in-scope corrections and normalizes commit structure.',
     ...(!publicationConflict && !verification ? [
-      'Validation informs your engineering decision but does not control the lifecycle. Attempt the focused checks, record every failure exactly, and distinguish implementation defects from unavailable tooling, sandbox limitations, or unrelated baseline failures. If the Done contract is satisfied in your judgment, commit and report completed even when validation is failed or not-run. Block only for a real unresolved implementation/scope/authority problem.',
+      'Validation informs your engineering decision but does not control the lifecycle. Attempt the focused checks, record every failure exactly, and distinguish implementation defects from unavailable tooling, sandbox limitations, or unrelated baseline failures. If the Done contract is satisfied in your judgment, finish the implementation and preferably report completed even when validation is failed or not-run. Block only for a real unresolved implementation/scope/authority problem.',
     ] : []),
     ...request.instructions,
     'Applicable project instructions have already been injected above. Do not try to re-read CLAUDE.md, AGENTS.md, or instruction files unless an explicit writable path also authorizes them.',

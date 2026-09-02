@@ -2,6 +2,19 @@
 
 All notable changes are documented here.
 
+## [0.3.46] - 2026-09-02
+
+### Changed
+
+- Ordinary tasks and closures now use one advisory disposition policy. Missing or malformed outcome records, validation failures, clean no-op completion, manual commit omission, and commit-message/count ceremony no longer control lifecycle advancement. The controller parses complete Git porcelain state, discards out-of-scope side effects, adopts dirty in-scope work, consolidates ordinary commits, and advances unless the worker emits the explicit `implementation-impossible` disposition.
+- Runtime outcomes without an AI disposition receive up to three fresh autonomous recovery workers in the same controller job. Repeated runtime unavailability may still stall with evidence; it no longer opens the durable ordinary-worker circuit.
+- Legacy committed ordinary candidates are adopted from authenticated Git and ignored-artifact invariants without detached validation workers. Strict validation remains for gates and publication conflict/final-gate paths.
+- Invalid or interrupted dependency trees are repaired automatically under the existing controller lock instead of requiring error digests and a separate recovery transition.
+
+### Fixed
+
+- Dirty-path discovery now uses the same NUL-delimited porcelain source as the cleanliness decision, including intent-to-add, renames, and special index states. Unmerged indexes and any controller-owned checklist status remain hard stops before cleanup can mutate them. Post-worker cleanup no longer masks an authenticated abort reason, and tracked out-of-scope deletions are restored from the index before untracked artifacts are removed.
+
 ## [0.3.45] - 2026-08-31
 
 ### Fixed

@@ -227,6 +227,7 @@ export interface WorkerRequest {
 
 export interface WorkerReport {
   status: 'completed' | 'blocked' | 'failed'
+  disposition?: 'implementation-impossible'
   summary: string
   validation: {
     status: 'passed' | 'failed' | 'not-run'
