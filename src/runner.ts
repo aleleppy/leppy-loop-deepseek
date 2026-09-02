@@ -20,7 +20,7 @@ import {
   lifecycleAuthoritiesEqual, lifecycleAuthorityMatchesOrAdvances,
 } from './lifecycle-authority.js'
 import {
-  DEPENDENCY_REPLACEMENT_PENDING_CODE, dependencyReplacementTransactionPending, dependencyResolutionMiss,
+  DEPENDENCY_REPLACEMENT_PENDING_CODE, INVALID_WORKTREE_TREE_REASON, dependencyReplacementTransactionPending, dependencyResolutionMiss,
   inspectWorktreeDependencies, provisionWorktreeDependencies,
 } from './worktree-dependencies.js'
 import { windowsQuotedExecutableFailure } from './windows-command.js'
@@ -643,7 +643,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       }))
     }
     const initialDependencyState = inspectWorktreeDependencies(state.repoRoot, state.worktree)
-    if (options.dependencyHydrationRequired && initialDependencyState.status !== 'copyable' && initialDependencyState.status !== 'installable') {
+    if (options.dependencyHydrationRequired && initialDependencyState.status !== 'copyable' && initialDependencyState.status !== 'installable'
+      && !(initialDependencyState.status === 'unavailable' && initialDependencyState.reason === INVALID_WORKTREE_TREE_REASON)) {
       throw new Error('the admitted dependency hydration condition changed before lock-protected publication')
     }
     const repairingDependencyMiss = dependencyResolutionMiss(recoveryError)

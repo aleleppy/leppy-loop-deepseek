@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.36] - 2026-08-31
+
+### Fixed
+
+- The lock-protected dependency hydration recheck now accepts the same exact invalid-tree state admitted by the controller, allowing authenticated replacement to proceed instead of stalling before publication.
+
 ## [0.3.35] - 2026-08-31
 
 ### Fixed

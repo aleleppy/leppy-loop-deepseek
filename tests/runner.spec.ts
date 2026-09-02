@@ -1912,6 +1912,7 @@ describe('controller state machine', () => {
 
     const recovered = await runLeppyLoop({
       tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+      dependencyHydrationRequired: true,
       dependencyRecoveryDigest: createHash('sha256').update(markerState.lastError).digest('hex'),
     }, { ...modelDeps, installNpmDependencies: fakeNpmInstall, worker: new FakeWorker() })
     expect(recovered.status).toBe('completed')

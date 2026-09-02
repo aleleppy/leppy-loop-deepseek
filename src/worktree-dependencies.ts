@@ -9,7 +9,7 @@ import { atomicWriteJson } from './state.js'
 const LOCKFILES = ['npm-shrinkwrap.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'] as const
 const MAX_DEPENDENCY_FILES = 500_000
 const MAX_DEPENDENCY_BYTES = 8 * 1024 * 1024 * 1024
-const INVALID_WORKTREE_TREE_REASON = 'worktree node_modules exists but is not a physical npm tree matching its lockfile'
+export const INVALID_WORKTREE_TREE_REASON = 'worktree node_modules exists but is not a physical npm tree matching its lockfile'
 export const DEPENDENCY_REPLACEMENT_PENDING_CODE = 'LEPPY_DEPENDENCY_REPLACEMENT_PENDING'
 
 export type WorktreeDependencyInspection =
