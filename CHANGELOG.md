@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.41] - 2026-08-31
+
+### Fixed
+
+- Ordinary command observation now reports tool `exitCode: 0` plus the real `commandExitCode` and `advisory` flag, so Harness tool-failure budgets do not misclassify expected validation failures. Workers are told not to repeat unchanged nonzero commands and to run `npm run prepare` once when Svelte diagnostics specifically lack `.svelte-kit/tsconfig.json`.
+
 ## [0.3.40] - 2026-08-31
 
 ### Fixed

@@ -4,17 +4,17 @@
 
 Leppy Loop é um bundle Cordis externo e nativo que executa uma checklist Markdown rastreada com um processo e uma sessão novos do DeepSeek Harness por linha de worker. O controller é dono do Git, worktree, transições da checklist, closure, gates, recuperação durável e leases de processo.
 
-A versão `0.3.40` é fixada no DeepSeek Harness `0.1.1-rc.2`, commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). Ela registra o comando Host, uma tool durável de controller sempre descobrível, a skill model-only `leppy-loop-operator`, sem colisão com o comando humano, e cards Web sem patch do Harness.
+A versão `0.3.41` é fixada no DeepSeek Harness `0.1.1-rc.2`, commit [`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`](https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e). Ela registra o comando Host, uma tool durável de controller sempre descobrível, a skill model-only `leppy-loop-operator`, sem colisão com o comando humano, e cards Web sem patch do Harness.
 
 ## Instalação
 
-Requer Node `22.19+`, Git e pnpm `10.28.1`. O DeepSeek Harness repassa a gestão de plugins ao `pnpm` encontrado no `PATH`; pnpm 11 exige aprovação separada de builds nativos e não é uma combinação de instalação afirmada para `0.3.40`. Configure a credencial do provedor selecionado na página Models do Harness, gere o pacote e instale no profile usado pelo Web host. Os workers reutilizam automaticamente o provedor, o perfil do modelo e a credencial selecionados; `DEEPSEEK_API_KEY` não é necessária quando outro provedor está ativo:
+Requer Node `22.19+`, Git e pnpm `10.28.1`. O DeepSeek Harness repassa a gestão de plugins ao `pnpm` encontrado no `PATH`; pnpm 11 exige aprovação separada de builds nativos e não é uma combinação de instalação afirmada para `0.3.41`. Configure a credencial do provedor selecionado na página Models do Harness, gere o pacote e instale no profile usado pelo Web host. Os workers reutilizam automaticamente o provedor, o perfil do modelo e a credencial selecionados; `DEEPSEEK_API_KEY` não é necessária quando outro provedor está ativo:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm gate
 pnpm pack
-npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.3.40.tgz
+npx @deepseek-ai/dsh@0.1.1-rc.2 plugin --profile web add ./leppy-loop-deepseek-0.3.41.tgz
 ```
 
 Reinicie o processo `dsh web` existente depois de alterar o profile. Refresh do navegador não compõe um plugin Host recém-instalado. Um tarball publicado no GitHub Release pode substituir o path do `.tgz` local; não há afirmação de publicação em registry de plugins.

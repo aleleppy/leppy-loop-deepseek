@@ -126,6 +126,16 @@ export function validatedExecOutput(exitCode: number, stdout: string, stderr: st
   return { exitCode, stdout, stderr }
 }
 
+function advisoryExecOutput(commandExitCode: number, stdout: string, stderr: string): {
+  exitCode: 0
+  commandExitCode: number
+  advisory: boolean
+  stdout: string
+  stderr: string
+} {
+  return { exitCode: 0, commandExitCode, advisory: commandExitCode !== 0, stdout, stderr }
+}
+
 async function gitCommand(ctx: Context, policy: WorkerPolicy, args: readonly string[]): Promise<GitResult> {
   const env = Object.fromEntries(Object.entries(safePathEnvironment(process.env)).filter((entry): entry is [string, string] => entry[1] !== undefined))
   const executable = await ctx.subprocess.resolveExecutable('git', env)
@@ -289,14 +299,14 @@ export function apply(ctx: Context): void {
     name: 'leppy_exec',
     description: policy.mode === 'verification'
       ? 'Run one direct already-materialized validation binary in the disposable verification worktree. Package managers, repository scripts, shells, interpreter frontends, remote clients, publication and dynamic evaluation are denied.'
-      : 'Run an exact local argv without a shell. Bare commands resolve local-first from the authenticated root node_modules/.bin; Windows shims select .cmd automatically. Keep command and args separate. Package managers permit only explicit run/test scripts; npx/dlx/corepack and alternate package frontends, install, cache overrides, remote, publication and dynamic-eval commands are denied.',
+      : 'Run an exact local argv without a shell. Bare commands resolve local-first from the authenticated root node_modules/.bin; Windows shims select .cmd automatically. Keep command and args separate. The tool call itself returns exitCode 0 when observation succeeded; commandExitCode and advisory report the actual command result for your decision. Never repeat an unchanged nonzero command. Package managers permit only explicit run/test scripts; npx/dlx/corepack and alternate package frontends, install, cache overrides, remote, publication and dynamic-eval commands are denied.',
     parameters: {
       command: { type: 'string', required: true },
       args: { type: 'array', items: { type: 'string' }, required: true },
       cwd: { type: 'string', description: 'Repo-relative working directory; omit it or use "." for repository root.' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { exitCode: { type: 'number', required: true }, stdout: { type: 'string', required: true }, stderr: { type: 'string', required: true } } },
+      schema: { type: 'object', additionalProperties: false, properties: { exitCode: { type: 'number', required: true }, commandExitCode: { type: 'number' }, advisory: { type: 'boolean' }, stdout: { type: 'string', required: true }, stderr: { type: 'string', required: true } } },
       render: (_args, value) => textOutput(value),
     },
     async execute(args, exec) {
@@ -321,7 +331,7 @@ export function apply(ctx: Context): void {
       if (validationRoute === 'named-pipe-unavailable') {
         const detail = namedPipeUnavailableDetail(wslValidationProfile)
         if (policy.mode === 'verification') throw new Error(detail)
-        return { exitCode: 126, stdout: '', stderr: detail }
+        return advisoryExecOutput(126, '', detail)
       }
       if (validationRoute === 'capsule') {
         if (cwd !== policy.root) throw new Error('WSL Playwright validation requires repository-root cwd')
@@ -344,11 +354,11 @@ export function apply(ctx: Context): void {
         const stderr = handle.collected.stderr?.readFrom(0).text ?? ''
         return policy.mode === 'verification'
           ? validatedExecOutput(outcome.exitCode ?? -1, stdout, stderr)
-          : { exitCode: outcome.exitCode ?? -1, stdout, stderr }
+          : advisoryExecOutput(outcome.exitCode ?? -1, stdout, stderr)
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error)
         if (policy.mode !== 'verification' && process.platform === 'win32' && /\b(?:spawn\s+)?EPERM\b/iu.test(detail)) {
-          return { exitCode: 126, stdout: '', stderr: `validation process unavailable in Windows sandbox: ${detail}` }
+          return advisoryExecOutput(126, '', `validation process unavailable in Windows sandbox: ${detail}`)
         }
         throw error
       }
