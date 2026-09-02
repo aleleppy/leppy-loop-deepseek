@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.45] - 2026-08-31
+
+### Fixed
+
+- A closure that reports completed no longer stalls merely because it left valid changes dirty inside its authenticated scope. The controller stages those exact paths and creates or amends one conventional closure commit, then performs the existing clean-tree, branch, commit-count, and scope checks before adopting the checklist row.
+
 ## [0.3.44] - 2026-08-31
 
 ### Fixed

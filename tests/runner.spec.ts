@@ -183,6 +183,22 @@ describe('controller state machine', () => {
     expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [x] Closure')
   }, 90_000)
 
+  it('automatically commits completed closure changes left dirty inside authenticated scope', async () => {
+    const repo = repository('- [?] Closure: repair `src` | paths=src\n')
+    const worker: WorkerAdapter = { async run(request) {
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'closure repair\n')
+      return completedOutcome('closure repair complete; controller owns adoption')
+    } }
+
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(readFileSync(join(result.worktree!, 'src', 'value.txt'), 'utf8')).toBe('closure repair\n')
+    expect(git(result.worktree!, 'status', '--short')).toBe('')
+    expect(git(result.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('1')
+    expect(git(result.worktree!, 'log', '-1', '--pretty=%s')).toContain('fix(leppy-loop): apply')
+    expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).toContain('completed-closure-changes')
+  }, 90_000)
+
   it('restores out-of-scope validation side effects before and after a recovered closure worker', async () => {
     const repo = repository('- [?] Closure: inspect `src` | paths=src\n')
     mkdirSync(join(repo.root, 'generated'), { recursive: true })

@@ -258,13 +258,21 @@ function workerScopeContains(scopes: readonly string[], candidate: string): bool
   })
 }
 
-async function discardOutOfScopeWorkerChanges(worktree: string, scopes: readonly string[], signal?: AbortSignal): Promise<string[]> {
+async function workerChangedPaths(worktree: string, signal?: AbortSignal): Promise<{ tracked: string[]; untracked: string[] }> {
   const [trackedResult, untrackedResult] = await Promise.all([
     runFile('git', ['diff', '--name-only', '-z', 'HEAD', '--'], { cwd: worktree, signal }),
     runFile('git', ['ls-files', '--others', '--exclude-standard', '-z', '--'], { cwd: worktree, signal }),
   ])
-  const tracked = trackedResult.stdout.split('\0').filter(path => path && !workerScopeContains(scopes, path))
-  const untracked = untrackedResult.stdout.split('\0').filter(path => path && !workerScopeContains(scopes, path))
+  return {
+    tracked: trackedResult.stdout.split('\0').filter(Boolean),
+    untracked: untrackedResult.stdout.split('\0').filter(Boolean),
+  }
+}
+
+async function discardOutOfScopeWorkerChanges(worktree: string, scopes: readonly string[], signal?: AbortSignal): Promise<string[]> {
+  const pending = await workerChangedPaths(worktree, signal)
+  const tracked = pending.tracked.filter(path => !workerScopeContains(scopes, path))
+  const untracked = pending.untracked.filter(path => !workerScopeContains(scopes, path))
   const changed = [...new Set([...tracked, ...untracked])].sort()
   if (changed.length > 4_096) throw new Error('out-of-scope validation cleanup exceeds 4096 paths')
   for (let index = 0; index < tracked.length; index += 64) {
@@ -276,6 +284,27 @@ async function discardOutOfScopeWorkerChanges(worktree: string, scopes: readonly
     rmSync(candidate, { recursive: true, force: true })
   }
   return changed
+}
+
+async function adoptCompletedClosureChanges(
+  worktree: string, previousHead: string, scopes: readonly string[], phase: string, signal?: AbortSignal,
+): Promise<{ paths: string[]; amended: boolean } | undefined> {
+  if ((await gitStatus(worktree)).trim() === '') return undefined
+  const pending = await workerChangedPaths(worktree, signal)
+  const paths = [...new Set([...pending.tracked, ...pending.untracked])].sort()
+  if (paths.length === 0) throw new Error('closure has an unclassified dirty worktree')
+  if (paths.length > 4_096) throw new Error('closure adoption exceeds 4096 paths')
+  const outside = paths.filter(path => !workerScopeContains(scopes, path))
+  if (outside.length > 0) throw new Error(`closure left changes outside authenticated scope after cleanup: ${outside.join(', ')}`)
+  const count = await commitCount(worktree, previousHead)
+  if (count > 1) throw new Error(`closure may create at most one commit; observed ${count}`)
+  for (let index = 0; index < paths.length; index += 64) {
+    await runFile('git', ['add', '--', ...paths.slice(index, index + 64)], { cwd: worktree, signal })
+  }
+  if (count === 1) await runFile('git', ['commit', '--amend', '--no-edit'], { cwd: worktree, signal })
+  else await runFile('git', ['commit', '-m', `fix(leppy-loop): apply ${safeSlug(phase)} closure repair`], { cwd: worktree, signal })
+  if ((await gitStatus(worktree)).trim() !== '') throw new Error('controller could not adopt completed closure changes into a clean tree')
+  return { paths, amended: count === 1 }
 }
 
 function taskProgress(
@@ -1616,6 +1645,12 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         if (await gitBranch(state.worktree) !== state.branch) throw new Error('verification worker changed the run branch')
       } else {
         if (await gitBranch(state.worktree) !== state.branch) throw new Error('closure changed the run branch')
+        const adopted = await adoptCompletedClosureChanges(state.worktree, previousHead, allowedPaths, task.phase, signal)
+        if (adopted) {
+          appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
+            workerArtifact: 'completed-closure-changes', paths: adopted.paths, amended: adopted.amended, automatic: true,
+          }, task, outcomeAttempt))
+        }
         const count = await commitCount(state.worktree, previousHead)
         if (count > 1) throw new Error(`closure may create at most one commit; observed ${count}`)
         if (count === 1 && !isConventional(await commitSubject(state.worktree))) throw new Error('closure commit is not conventional')
