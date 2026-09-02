@@ -701,6 +701,28 @@ describe('grant-validated background controller tool', () => {
     expect(persisted!.expiresAt).toBeGreaterThan(stalled.lifecycleAuthority!.expiresAt)
   })
 
+  it('lets explicit local-only resume use persisted bounded authority without a fresh circuit command', async () => {
+    const owner = agent('local-resume-owner')
+    const stalled = controller({
+      autoRecoveryBlocked: true, detail: 'unchanged local validation failure',
+      lifecycleAuthority: {
+        sessionId: 'local-resume-owner', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 2, issuedAt: Date.now() - 60_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    const jobs = new FakeJobs()
+    const rt = runtime({
+      inspectControllers: async () => [stalled],
+      run: async () => ({ ...completed, runId: stalled.runId }),
+    })
+
+    await expect(executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: stalled.runId, tasks: stalled.checklistRelative,
+      syncBranch: stalled.syncBranch, publish: false,
+    })).resolves.toMatchObject({ status: 'running', runId: stalled.runId })
+    expect(jobs.starts).toHaveLength(1)
+  })
+
   it('hydrates a freshly persisted zero-consumption epoch before evaluating an open recovery circuit', async () => {
     const owner = agent('epoch-restart-owner')
     const updatedAt = Date.now() - 10_000

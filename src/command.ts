@@ -527,6 +527,7 @@ export async function executeLeppyLoopControl(
     && (!sameIgnoredBaselineBridge(ignoredBaselineRepairIdentity, controller?.ignoredBaselineBridge)
       || controller?.ignoredBaselineBridge?.phase === 'prepared')
   if (args.operation === 'continue' && controller?.autoRecoveryBlocked === true
+    && args.publish !== false
     && !dependencyRepair && !windowsArgvRepair && !workerArtifactRepair && !ignoredBaselineRepair
     && !durableReauthorizationFresh
     && !livePermits.some(permit => permit.reauthorizedAt > Date.parse(controller.updatedAt))) {

@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.42] - 2026-08-31
+
+### Changed
+
+- Explicit local-only `continue` (`publish: false`) may reuse the same session-bound, bounded persisted lifecycle authority even when the unchanged-failure circuit is open. Publication-capable recovery still requires fresh human reauthorization, and transition/iteration limits remain enforced.
+
 ## [0.3.41] - 2026-08-31
 
 ### Fixed
