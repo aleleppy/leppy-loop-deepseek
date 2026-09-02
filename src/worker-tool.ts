@@ -318,7 +318,11 @@ export function apply(ctx: Context): void {
       if (execution.mode !== 'workspace-write') throw new Error(`worker requires workspace-write, got ${execution.mode}`)
       if (realpathSync(execution.workspaceRoot) !== policy.root) throw new Error('worker sandbox root does not match the authenticated worktree')
       const validationRoute = validationRouting(policy.mode ?? 'task', command, wslValidationProfile)
-      if (validationRoute === 'named-pipe-unavailable') throw new Error(namedPipeUnavailableDetail(wslValidationProfile))
+      if (validationRoute === 'named-pipe-unavailable') {
+        const detail = namedPipeUnavailableDetail(wslValidationProfile)
+        if (policy.mode === 'verification') throw new Error(detail)
+        return { exitCode: 126, stdout: '', stderr: detail }
+      }
       if (validationRoute === 'capsule') {
         if (cwd !== policy.root) throw new Error('WSL Playwright validation requires repository-root cwd')
         if (!wslValidationProfile) throw new Error('WSL Playwright validation profile disappeared after routing')
@@ -326,18 +330,28 @@ export function apply(ctx: Context): void {
         return validatedExecOutput(result.exitCode, result.stdout, result.stderr)
       }
       const confined = ctx.sandbox.confine([command, ...args.args], execution as SandboxPolicy)
-      const handle = ctx.subprocess.spawn({
-        argv: confined.argv,
-        cwd,
-        env: environment,
-        stdio: { stdin: 'ignore', stdout: { maxBytes: 256 * 1024 }, stderr: { maxBytes: 256 * 1024 } },
-        graceMs: 2_000,
-        signal: exec.signal,
-      })
-      const outcome = await handle.done
-      const stdout = handle.collected.stdout?.readFrom(0).text ?? ''
-      const stderr = handle.collected.stderr?.readFrom(0).text ?? ''
-      return validatedExecOutput(outcome.exitCode ?? -1, stdout, stderr)
+      try {
+        const handle = ctx.subprocess.spawn({
+          argv: confined.argv,
+          cwd,
+          env: environment,
+          stdio: { stdin: 'ignore', stdout: { maxBytes: 256 * 1024 }, stderr: { maxBytes: 256 * 1024 } },
+          graceMs: 2_000,
+          signal: exec.signal,
+        })
+        const outcome = await handle.done
+        const stdout = handle.collected.stdout?.readFrom(0).text ?? ''
+        const stderr = handle.collected.stderr?.readFrom(0).text ?? ''
+        return policy.mode === 'verification'
+          ? validatedExecOutput(outcome.exitCode ?? -1, stdout, stderr)
+          : { exitCode: outcome.exitCode ?? -1, stdout, stderr }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        if (policy.mode !== 'verification' && process.platform === 'win32' && /\b(?:spawn\s+)?EPERM\b/iu.test(detail)) {
+          return { exitCode: 126, stdout: '', stderr: `validation process unavailable in Windows sandbox: ${detail}` }
+        }
+        throw error
+      }
     },
   }))
 }

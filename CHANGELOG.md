@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.39] - 2026-08-31
+
+### Changed
+
+- Ordinary `leppy_exec` validation failures return structured exit code/stdout/stderr evidence instead of consuming the worker tool-error budget. Windows `spawn EPERM` and task-mode Playwright named-pipe unavailability are likewise advisory results; verification remains strict and security/argument/scope failures still reject the call.
+
 ## [0.3.38] - 2026-08-31
 
 ### Changed

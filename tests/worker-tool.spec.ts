@@ -39,7 +39,7 @@ interface RegisteredWorkerTool {
 function registeredRuntime(
   root: string,
   mode: 'task' | 'verification' | 'publication-conflict',
-  output: { stdoutLossy?: boolean; stderrLossy?: boolean; workspaceRoot?: string; resolvedCommand?: string } = {},
+  output: { stdoutLossy?: boolean; stderrLossy?: boolean; workspaceRoot?: string; resolvedCommand?: string; spawnError?: string } = {},
 ): {
   tools: string[]
   definitions: RegisteredWorkerTool[]
@@ -80,6 +80,7 @@ function registeredRuntime(
         spawn: ({ argv, env }: { argv: string[]; env: NodeJS.ProcessEnv }) => {
           commands.push(argv)
           spawnEnvironments.push(env)
+          if (output.spawnError) throw new Error(output.spawnError)
           return { done: Promise.resolve({ exitCode: 1 }), collected: { stdout, stderr } }
         },
       },
@@ -100,6 +101,18 @@ describe('worker commit capability', () => {
   it('surfaces nonzero argv outcomes as real tool errors', () => {
     expect(validatedExecOutput(0, 'ok', '')).toEqual({ exitCode: 0, stdout: 'ok', stderr: '' })
     expect(() => validatedExecOutput(127, '', 'missing executable')).toThrow('command failed with exit 127: missing executable')
+  })
+
+  it.runIf(process.platform === 'win32')('returns Windows spawn EPERM as advisory task evidence', async () => {
+    const root = repository()
+    mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(join(root, 'node_modules', '.bin', 'vitest.cmd'), '@echo off\r\n')
+    const runtime = registeredRuntime(root, 'task', { resolvedCommand: join(root, 'node_modules', '.bin', 'vitest.cmd'), spawnError: 'spawn EPERM' })
+    const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
+    await expect(execute({ command: 'vitest', args: ['run'] }, { signal: new AbortController().signal })).resolves.toMatchObject({
+      exitCode: 126,
+      stderr: expect.stringContaining('spawn EPERM'),
+    })
   })
 
   it('normalizes an explicit dot cwd to the repository root without widening file scope', () => {
@@ -192,7 +205,7 @@ describe('worker commit capability', () => {
     const runtime = registeredRuntime(root, 'task', { resolvedCommand: playwright })
     const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
     await expect(execute({ command: 'playwright', args: ['test', 'tests/e2e/auth'] }, { signal: new AbortController().signal }))
-      .rejects.toThrow('LEPPY_WINDOWS_NAMED_PIPE_UNAVAILABLE')
+      .resolves.toMatchObject({ exitCode: 126, stderr: expect.stringContaining('LEPPY_WINDOWS_NAMED_PIPE_UNAVAILABLE') })
     expect(runtime.commands).toHaveLength(0)
   })
 
@@ -212,7 +225,7 @@ describe('worker commit capability', () => {
     if (process.platform !== 'win32') writeFileSync(join(root, 'node_modules', '.bin', 'tsc'), '#!/bin/sh\n')
     const runtime = registeredRuntime(root, 'task')
     const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
-    await expect(execute({ command: "'node_modules/.bin/tsc'", args: ['--noEmit'] }, { signal: new AbortController().signal })).rejects.toThrow('command failed')
+    await expect(execute({ command: "'node_modules/.bin/tsc'", args: ['--noEmit'] }, { signal: new AbortController().signal })).resolves.toMatchObject({ exitCode: 1 })
     const expected = join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
     expect(runtime.resolutions.at(-1)?.command).toBe(expected)
     expect(runtime.commands.at(-1)).toEqual([expected, '--noEmit'])
@@ -226,7 +239,7 @@ describe('worker commit capability', () => {
     writeFileSync(join(root, 'prisma', 'schemas', 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'), 'untrusted nested fixture\n')
     const runtime = registeredRuntime(root, 'task')
     const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
-    await expect(execute({ command: 'tsc', args: ['--noEmit'], cwd: 'prisma/schemas' }, { signal: new AbortController().signal })).rejects.toThrow('command failed')
+    await expect(execute({ command: 'tsc', args: ['--noEmit'], cwd: 'prisma/schemas' }, { signal: new AbortController().signal })).resolves.toMatchObject({ exitCode: 1 })
     const resolution = runtime.resolutions.at(-1)!
     const pathName = Object.hasOwn(resolution.environment, 'Path') ? 'Path' : 'PATH'
     expect(resolution.environment[pathName]?.split(process.platform === 'win32' ? ';' : ':')[0]).toBe(join(root, 'node_modules', '.bin'))
