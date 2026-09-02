@@ -956,18 +956,20 @@ describe('controller state machine', () => {
     const suffix = Math.random().toString(16).slice(2)
     const flag = join(tmpdir(), `leppy-gate-${suffix}.flag`).replaceAll('\\', '/')
     const gateScript = join(tmpdir(), `leppy-gate-${suffix}.cjs`).replaceAll('\\', '/')
-    writeFileSync(gateScript, `process.exit(require('fs').existsSync('${flag}') ? 0 : 1)\n`)
+    writeFileSync(gateScript, `if(!require('fs').existsSync('${flag}')){console.error('GATE_EVIDENCE');process.exit(1)}\n`)
     const repo = repository(`- [~] Gate: controlled retry | gate=\`node ${gateScript}\`\n`)
     const worker = new FakeWorker()
     try {
       const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
-      expect(first.status).toBe('stalled')
+      expect(first).toMatchObject({ status: 'stalled', detail: expect.stringContaining('gate exited with code 1: GATE_EVIDENCE') })
+      expect(JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8')).lastError).toContain('GATE_EVIDENCE')
       expect(readFileSync(join(first.stateDir!, 'resume.json'), 'utf8')).toContain('--retry-gate')
 
       const unauthorized = await runLeppyLoop({
         tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
       }, { ...modelDeps, worker })
-      expect(unauthorized.status).toBe('stalled')
+      expect(unauthorized).toMatchObject({ status: 'stalled', detail: expect.stringContaining('gate retry requires') })
+      expect(JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8')).lastError).toContain('gate retry requires')
       expect(readFileSync(join(first.stateDir!, 'resume.json'), 'utf8')).toContain('gate-retry-authorization-required')
 
       await expect(runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false, retryGate: true }, { ...modelDeps, worker }))
@@ -989,7 +991,7 @@ describe('controller state machine', () => {
     }
   }, 90_000)
 
-  it('reopens the preceding closure in a fresh worker and retries the exact failed gate', async () => {
+  it('automatically repairs a failed gate within bounds before accepting explicitly widened scope', async () => {
     const suffix = Math.random().toString(16).slice(2)
     const gateScript = join(tmpdir(), `leppy-repair-gate-${suffix}.cjs`).replaceAll('\\', '/')
     writeFileSync(gateScript, "const fs=require('fs'); const path=require('path'); const flag=path.join(process.cwd(),'generated','gate-pass.flag'); if(!fs.existsSync(flag)){console.error('REPAIR_ME');process.exit(1)}\n")
@@ -999,6 +1001,7 @@ describe('controller state machine', () => {
     git(repo.root, 'add', '--', 'generated/.keep')
     git(repo.root, 'commit', '-m', 'chore: seed generated scope')
     let closureCalls = 0
+    let permitRepair = false
     const calls: WorkerRequest[] = []
     const worker: WorkerAdapter = {
       run: async request => {
@@ -1009,7 +1012,7 @@ describe('controller state machine', () => {
           git(request.worktree, 'commit', '-m', 'feat: finish ordinary task')
         } else {
           closureCalls += 1
-          if (closureCalls === 2) {
+          if (permitRepair) {
             expect(request.allowedPaths).toContain('generated')
             writeFileSync(join(request.worktree, 'generated', 'gate-pass.flag'), 'repaired\n')
             git(request.worktree, 'add', '--', 'generated/gate-pass.flag')
@@ -1020,7 +1023,8 @@ describe('controller state machine', () => {
       },
     }
     const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
-    expect(first.status).toBe('stalled')
+    expect(first).toMatchObject({ status: 'stalled', detail: expect.stringContaining('REPAIR_ME') })
+    expect(closureCalls).toBe(4)
     expect(readFileSync(join(first.stateDir!, 'resume.json'), 'utf8')).toContain('--repair-gate')
     writeFileSync(join(first.worktree!, 'src', 'value.txt'), 'unauthorized manual edit\n')
     await expect(runLeppyLoop({
@@ -1031,6 +1035,7 @@ describe('controller state machine', () => {
       tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId, repairGate: true, repairPaths: ['missing-scope'],
     }, { ...modelDeps, worker })).rejects.toThrow('--repair-path must name an existing path')
 
+    permitRepair = true
     const repaired = await runLeppyLoop({
       tasks: repo.tasks,
       syncBranch: 'main',
@@ -1041,21 +1046,21 @@ describe('controller state machine', () => {
       repairPaths: ['generated'],
     }, { ...modelDeps, worker })
     expect(repaired.status).toBe('completed')
-    expect(calls.map(call => call.task.kind)).toEqual(['task', 'closure', 'closure'])
+    expect(calls.map(call => call.task.kind)).toEqual(['task', 'closure', 'closure', 'closure', 'closure', 'closure'])
     expect(calls.at(-1)?.instructions.join('\n')).toContain('REPAIR_ME')
     expect(calls.at(-1)?.instructions.join('\n')).toContain('Direct human authorized these additional repair scopes: generated')
     expect(readFileSync(join(repaired.worktree!, 'tasks.task.md'), 'utf8').match(/\[x\]/g)).toHaveLength(3)
     expect(git(repaired.worktree!, 'status', '--short')).toBe('')
     const events = readFileSync(join(repaired.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
-    expect(events.filter(entry => entry.type === 'gate-start')).toHaveLength(2)
-    expect(events.some(entry => entry.type === 'recovery-done' && entry.data.gateRepair === true)).toBe(true)
+    expect(events.filter(entry => entry.type === 'gate-start')).toHaveLength(5)
+    expect(events.filter(entry => entry.type === 'recovery-done' && entry.data.gateRepair === true)).toHaveLength(4)
   }, 90_000)
 
-  it('chains a bounded number of fresh repair closures while the same gate reveals later failures', async () => {
+  it('automatically chains bounded fresh repair closures while a gate reveals later failures', async () => {
     const suffix = Math.random().toString(16).slice(2)
     const gateScript = join(tmpdir(), `leppy-multistage-gate-${suffix}.cjs`).replaceAll('\\', '/')
     writeFileSync(gateScript, "const fs=require('fs'); const path=require('path'); const file=path.join(process.cwd(),'generated','stage.txt'); const stage=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8').trim()):0; if(stage<3){console.error('NEED_STAGE_'+(stage+1));process.exit(1)}\n")
-    const repo = repository(`## Phase\n- [ ] Change \`src/value.txt\` | Done: value says done\n- [?] Closure: repair sequential gate failures | paths=src\n- [~] Gate: sequential repair | gate=\`node ${gateScript}\`\n`)
+    const repo = repository(`## Phase\n- [ ] Change \`src/value.txt\` | Done: value says done\n- [?] Closure: repair sequential gate failures | paths=src,generated\n- [~] Gate: sequential repair | gate=\`node ${gateScript}\`\n`)
     mkdirSync(join(repo.root, 'generated'), { recursive: true })
     writeFileSync(join(repo.root, 'generated', '.keep'), 'generated scope\n')
     git(repo.root, 'add', '--', 'generated/.keep')
@@ -1081,20 +1086,15 @@ describe('controller state machine', () => {
         return completedOutcome()
       },
     }
-    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
-    expect(first.status).toBe('stalled')
-    const repaired = await runLeppyLoop({
-      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
-      repairGate: true, repairCycles: 3, repairPaths: ['generated'],
-    }, { ...modelDeps, worker })
-    expect(repaired.status).toBe('completed')
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result.status).toBe('completed')
     expect(calls.map(call => call.task.kind)).toEqual(['task', 'closure', 'closure', 'closure', 'closure'])
     expect(calls.at(-2)?.instructions.join('\n')).toContain('NEED_STAGE_2')
     expect(calls.at(-1)?.instructions.join('\n')).toContain('NEED_STAGE_3')
-    const events = readFileSync(join(repaired.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    const events = readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(events.filter(entry => entry.type === 'gate-start')).toHaveLength(4)
     expect(events.filter(entry => entry.type === 'recovery-done' && entry.data.gateRepair === true).map(entry => entry.data.repairCycle)).toEqual([1, 2, 3])
-    expect(git(repaired.worktree!, 'status', '--short')).toBe('')
+    expect(git(result.worktree!, 'status', '--short')).toBe('')
   }, 90_000)
 
   it('rejects a changed recovered gate command instead of bypassing its recorded fingerprint', async () => {

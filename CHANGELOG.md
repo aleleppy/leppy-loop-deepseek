@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [0.3.43] - 2026-08-31
+
+### Fixed
+
+- Every deliberate stalled result now persists and returns an authenticated `detail`, including gate exit evidence, missing gate-retry authorization, human checkpoints, and iteration exhaustion. Successful gate recovery clears stale detail.
+- A failed gate with a completed adjacent closure now automatically reopens that closure and runs bounded fresh repair workers inside the same controller job. It stops only after the configured repair-cycle limit, while gate-only checklists still require explicit retry authorization.
+
 ## [0.3.42] - 2026-08-31
 
 ### Changed

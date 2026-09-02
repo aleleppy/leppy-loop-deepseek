@@ -782,7 +782,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   }
   let activeProgress: { task: ChecklistTask; totalTasks: number; attempt: number; taskAttempt: number; startedAtMs: number } | undefined
   let retryGateAuthorized = Boolean(options.retryGate || options.repairGate)
-  let repairCyclesRemaining = options.repairGate ? options.repairCycles : 0
+  let repairCyclesRemaining = options.repairCycles
   let repairCyclesUsed = 0
   const settleProgress = async (type: 'task-done' | 'task-failed', error?: string): Promise<void> => {
     const active = activeProgress
@@ -945,6 +945,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     })
     repairCyclesRemaining -= 1
     repairCyclesUsed += 1
+    retryGateAuthorized = true
     gateRepairContext = { schemaVersion: 1, gateIndex: gate.index, closureIndex: closure.index, instruction: latestGateFailureInstruction(stateDir, gate.index), additionalPaths }
     writeFileSync(join(state.worktree, checklistRelative), markTaskOpen(parsed, closure), 'utf8')
     await commitControllerChange(state.worktree, [checklistRelative], `chore(leppy-loop): reopen ${safeSlug(gate.phase)} repair closure`)
@@ -1153,10 +1154,11 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         const reason = 'human checkpoint requires direct approval; mark this row complete in the preserved worktree, then recover the same run'
         appendEvent(eventsPath, event(state.runId, 'stall', 'human', { reason, worktree: state.worktree }, task, state.attempt))
         state.status = 'stalled'
+        state.lastError = reason
         writeState(join(stateDir, 'run.json'), state)
         atomicWriteJson(join(stateDir, 'resume.json'), { runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: 'human', worktree: state.worktree, command: `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)}` })
         await settleProgress('task-failed', reason)
-        return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
+        return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics, detail: reason }
       }
       if (task.kind === 'gate') {
         const command = task.metadata.gate ?? options.phaseGateCommand!
@@ -1169,12 +1171,17 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         const repairCommand = `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)} --repair-gate --repair-cycles ${options.repairCycles}${repairPathArguments ? ` --repair-path${repairPathArguments}` : ''}`
         if (retryGateAuthorized && priorGateAttempts === 0) throw new Error('--retry-gate requires a recorded failed attempt for the current gate fingerprint')
         if (priorGateAttempts > 0 && !retryGateAuthorized) {
-          const reason = 'gate retry requires a direct human invocation with --retry-gate and the exact authenticated run ID'
+          const repairableClosure = parsed.tasks.filter(candidate => candidate.phase === task.phase && candidate.index < task.index && candidate.kind === 'closure').at(-1)
+          if (repairCyclesRemaining > 0 && repairableClosure?.mark === 'x') {
+            await reopenRepairClosure()
+            continue
+          }
+          const reason = 'gate retry requires explicit retry authorization because no completed adjacent closure is available for automatic bounded repair'
           appendEvent(eventsPath, event(state.runId, 'stall', 'gate', { reason }, task, state.attempt))
-          state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
+          state.status = 'stalled'; state.lastError = reason; writeState(join(stateDir, 'run.json'), state)
           atomicWriteJson(join(stateDir, 'resume.json'), { runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: 'gate-retry-authorization-required', worktree: state.worktree, command: retryCommand })
           await settleProgress('task-failed', reason)
-          return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
+          return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics, detail: reason }
         }
         state.gateAttempts[key] = priorGateAttempts + 1
         retryGateAuthorized = false
@@ -1186,22 +1193,24 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         mkdirSync(join(stateDir, 'receipts'), { recursive: true })
         atomicWriteJson(join(stateDir, 'receipts', `gate-${task.index}-${state.attempt}.json`), receipt)
         if (gate.exitCode !== 0) {
+          const evidence = redact([gate.stderr.trim(), gate.stdout.trim()].filter(Boolean).join('\n')).slice(-16 * 1024)
+          const reason = `gate exited with code ${gate.exitCode}${evidence ? `: ${evidence}` : ''}`
           appendEvent(eventsPath, event(state.runId, 'gate-failed', 'gate', {
             exitCode: gate.exitCode, repairCyclesUsed, repairCyclesRemaining,
           }, task, state.attempt))
-          await settleProgress('task-failed', `gate exited with code ${gate.exitCode}`)
-          if (options.repairGate && repairCyclesRemaining > 0) {
-            retryGateAuthorized = true
+          await settleProgress('task-failed', reason)
+          const repairableClosure = parsed.tasks.filter(candidate => candidate.phase === task.phase && candidate.index < task.index && candidate.kind === 'closure').at(-1)
+          if (repairCyclesRemaining > 0 && repairableClosure?.mark === 'x') {
             await reopenRepairClosure()
             continue
           }
-          state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
+          state.status = 'stalled'; state.lastError = reason; writeState(join(stateDir, 'run.json'), state)
           atomicWriteJson(join(stateDir, 'resume.json'), {
             runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: 'gate-failed', worktree: state.worktree,
             command: repairCommand, retryWithoutRepairCommand: retryCommand,
             repairCyclesUsed, repairCycleLimit: options.repairCycles,
           })
-          return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
+          return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics, detail: reason }
         }
         const completed = markTaskDone(parsed, task)
         const receiptRelative = join('.leppy-loop-receipts', `gate-${task.index}.json`)
@@ -1210,6 +1219,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         writeFileSync(checklistPath, completed, 'utf8')
         await commitControllerChange(state.worktree, [checklistRelative, receiptRelative], `chore(leppy-loop): record ${safeSlug(task.phase)} gate`)
         state.completedTasks += 1
+        delete state.lastError
         writeState(join(stateDir, 'run.json'), state)
         appendEvent(eventsPath, event(state.runId, 'gate-end', 'gate', { exitCode: 0 }, task, state.attempt))
         await settleProgress('task-done')
@@ -1584,9 +1594,10 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       }, task, outcomeAttempt))
       await settleProgress('task-done')
     }
-    appendEvent(eventsPath, event(state.runId, 'stall', 'complete', { reason: 'max iterations reached' }))
-    state.status = 'stalled'; writeState(join(stateDir, 'run.json'), state)
-    return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, ...(state.currentTask !== undefined ? { currentTask: state.currentTask } : {}), diagnostics }
+    const reason = 'max iterations reached'
+    appendEvent(eventsPath, event(state.runId, 'stall', 'complete', { reason }))
+    state.status = 'stalled'; state.lastError = reason; writeState(join(stateDir, 'run.json'), state)
+    return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, ...(state.currentTask !== undefined ? { currentTask: state.currentTask } : {}), diagnostics, detail: reason }
   } catch (error) {
     let message = redact(error instanceof Error ? error.message : String(error)).slice(-16 * 1024)
     if (message.includes(DIRECT_HUMAN_STOP_REASON) && state.lifecycleAuthority && state.lifecycleAuthority.revokedAt === undefined) {
