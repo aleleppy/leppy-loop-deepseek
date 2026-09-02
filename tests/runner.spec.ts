@@ -183,6 +183,38 @@ describe('controller state machine', () => {
     expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [x] Closure')
   }, 90_000)
 
+  it('restores out-of-scope validation side effects before and after a recovered closure worker', async () => {
+    const repo = repository('- [?] Closure: inspect `src` | paths=src\n')
+    mkdirSync(join(repo.root, 'generated'), { recursive: true })
+    writeFileSync(join(repo.root, 'generated', 'settings.json'), '{"stable":true}\n')
+    git(repo.root, 'add', '--', 'generated/settings.json')
+    git(repo.root, 'commit', '-m', 'chore: seed generated settings')
+    const blocked = new FakeWorker([{
+      status: 'blocked', output: 'validation side effects need controller cleanup', error: 'cleanup unavailable',
+      report: { status: 'blocked', summary: 'cleanup unavailable', validation: { status: 'failed', evidence: 'generator changed files outside scope' } },
+    }])
+    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker: blocked })
+    rmSync(join(first.worktree!, 'generated', 'settings.json'))
+    writeFileSync(join(first.worktree!, 'generated', 'temporary.txt'), 'transient\n')
+
+    const recoveredWorker: WorkerAdapter = { async run(request) {
+      expect(readFileSync(join(request.worktree, 'generated', 'settings.json'), 'utf8')).toBe('{"stable":true}\n')
+      expect(existsSync(join(request.worktree, 'generated', 'temporary.txt'))).toBe(false)
+      writeFileSync(join(request.worktree, 'generated', 'settings.json'), '{"mutated":true}\n')
+      writeFileSync(join(request.worktree, 'generated', 'temporary.txt'), 'transient again\n')
+      return completedOutcome('closure completed despite generated validation side effects')
+    } }
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
+    }, { ...modelDeps, worker: recoveredWorker })
+
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(readFileSync(join(recovered.worktree!, 'generated', 'settings.json'), 'utf8')).toBe('{"stable":true}\n')
+    expect(existsSync(join(recovered.worktree!, 'generated', 'temporary.txt'))).toBe(false)
+    expect(git(recovered.worktree!, 'status', '--short')).toBe('')
+    expect(readFileSync(join(recovered.stateDir!, 'events.jsonl'), 'utf8')).toContain('out-of-scope-validation-side-effects')
+  }, 90_000)
+
   it('stalls a blocked closure without marking the controller row done', async () => {
     const repo = repository('- [?] Closure: inspect `src` | paths=src\n')
     const worker = new FakeWorker([{

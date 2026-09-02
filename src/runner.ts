@@ -250,6 +250,34 @@ async function discardTransientValidationCache(worktree: string, signal?: AbortS
   rmSync(cache, { recursive: true, force: true })
 }
 
+function workerScopeContains(scopes: readonly string[], candidate: string): boolean {
+  const path = candidate.replaceAll('\\', '/').replace(/^\.\//u, '')
+  return scopes.some(raw => {
+    const scope = raw.replaceAll('\\', '/').replace(/\/$/u, '').replace(/^\.\//u, '')
+    return scope === '.' || path === scope || path.startsWith(`${scope}/`)
+  })
+}
+
+async function discardOutOfScopeWorkerChanges(worktree: string, scopes: readonly string[], signal?: AbortSignal): Promise<string[]> {
+  const [trackedResult, untrackedResult] = await Promise.all([
+    runFile('git', ['diff', '--name-only', '-z', 'HEAD', '--'], { cwd: worktree, signal }),
+    runFile('git', ['ls-files', '--others', '--exclude-standard', '-z', '--'], { cwd: worktree, signal }),
+  ])
+  const tracked = trackedResult.stdout.split('\0').filter(path => path && !workerScopeContains(scopes, path))
+  const untracked = untrackedResult.stdout.split('\0').filter(path => path && !workerScopeContains(scopes, path))
+  const changed = [...new Set([...tracked, ...untracked])].sort()
+  if (changed.length > 4_096) throw new Error('out-of-scope validation cleanup exceeds 4096 paths')
+  for (let index = 0; index < tracked.length; index += 64) {
+    await runFile('git', ['restore', '--source=HEAD', '--staged', '--worktree', '--', ...tracked.slice(index, index + 64)], { cwd: worktree, signal })
+  }
+  for (const path of untracked) {
+    const candidate = resolve(worktree, path)
+    if (!inside(worktree, candidate)) throw new Error(`out-of-scope validation artifact escapes the worktree: ${path}`)
+    rmSync(candidate, { recursive: true, force: true })
+  }
+  return changed
+}
+
 function taskProgress(
   state: RunState,
   task: ChecklistTask,
@@ -1082,6 +1110,17 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         return { runId: state.runId, status: 'completed', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, diagnostics, ...(state.pullRequestUrl ? { pullRequestUrl: state.pullRequestUrl } : {}) }
       }
       if (retryGateAuthorized && task.kind !== 'gate' && task.index !== gateRepairContext?.closureIndex) throw new Error('--retry-gate can only authorize the recovered failed gate or its controller-reopened repair closure')
+      if (task.kind !== 'gate' && task.kind !== 'human') {
+        const recoveryScopes = task.index === gateRepairContext?.closureIndex
+          ? [...new Set([...task.metadata.paths, ...(gateRepairContext.additionalPaths ?? [])])]
+          : task.metadata.paths
+        const restored = await discardOutOfScopeWorkerChanges(state.worktree, recoveryScopes, signal)
+        if (restored.length > 0) {
+          appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
+            workerArtifact: 'out-of-scope-validation-side-effects', paths: restored, automatic: true,
+          }, task, state.attempt))
+        }
+      }
       const selectedTaskKey = taskAttemptKey(task)
       const selectedChecklistDigest = digest(parsed.source)
       const pendingIdentity = state.pendingTaskValidation ?? state.activeTaskAttempt
@@ -1238,7 +1277,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         ...legacyCustomInstructions(state.worktree),
         ...await discoverInstructions(state.worktree, allowedPaths),
         ...(dependencyBridge.status === 'local' ? [
-          `The controller copied and verified an isolated node_modules against ${dependencyBridge.lockfile}. Use repository package scripts or bare local tools; do not install packages. leppy_exec resolves bare executable names local-first from the authenticated root node_modules/.bin and selects Windows shims. Package managers permit only explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, package-manager cache overrides, or create an in-worktree cache. If validation reports a missing .svelte-kit/tsconfig.json, run npm run prepare once before retrying. Otherwise never repeat an unchanged nonzero command: record its evidence and use engineering judgment; unavailable validation alone does not block completion.`,
+          `The controller copied and verified an isolated node_modules against ${dependencyBridge.lockfile}. Use repository package scripts or bare local tools; do not install packages. leppy_exec resolves bare executable names local-first from the authenticated root node_modules/.bin and selects Windows shims. Package managers permit only explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, package-manager cache overrides, or create an in-worktree cache. If validation reports a missing .svelte-kit/tsconfig.json, run the bare local command svelte-kit sync once before retrying; never run broad npm prepare for that condition. Do not run npm run refresh-reflector unless the Done contract explicitly requires regeneration and BACKEND_URL is already available. Otherwise never repeat an unchanged nonzero command: record its evidence and use engineering judgment; unavailable validation alone does not block completion. Validation commands may touch generated files outside task scope; record that once and return because the controller restores those out-of-scope side effects. Do not report blocked solely because you cannot restore them yourself.`,
         ] : []),
         ...(npmCacheQuarantined ? [
           'The controller moved the prior wholly-untracked .npm-cache into its private authenticated quarantine. Do not recreate it; invoke bare local tools through leppy_exec.',
@@ -1264,6 +1303,14 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           return await runAuthorizedWorker(workerRequest)
         } finally {
           await discardTransientValidationCache(workerRequest.worktree, signal)
+          if (workerRequest.mode !== 'verification') {
+            const restored = await discardOutOfScopeWorkerChanges(workerRequest.worktree, workerRequest.allowedPaths, signal)
+            if (restored.length > 0) {
+              appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
+                workerArtifact: 'out-of-scope-validation-side-effects', paths: restored, automatic: true,
+              }, workerRequest.task, workerRequest.attempt))
+            }
+          }
         }
       }
       const runCommittedVerification = async (pending: PendingTaskValidation, attempt: number): Promise<WorkerOutcome> => {

@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.44] - 2026-08-31
+
+### Fixed
+
+- The controller now restores tracked and non-ignored untracked changes outside a worker's authenticated scope before recovered work and after every ordinary worker. Validation generators can no longer strand a closure by deleting or rewriting unrelated generated files. Workers use narrow `svelte-kit sync` for missing `.svelte-kit` state, avoid broad `npm prepare`, and do not treat controller-owned cleanup as a blocker.
+
 ## [0.3.43] - 2026-08-31
 
 ### Fixed
