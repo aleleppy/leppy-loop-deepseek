@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -350,6 +350,27 @@ describe('worker commit capability', () => {
 
     await expect(commitTaskChanges(policy, 'fix: reconcile lossy commit output', runGit)).resolves.toBe(commitId)
     expect(commands.slice(-2).map(args => args[0])).toEqual(['commit', 'rev-parse'])
+  })
+
+  it('discards untracked svelte-check validation cache before scoped commit', async () => {
+    const root = repository()
+    writeFileSync(join(root, 'prisma', 'schemas', 'auth.prisma'), 'model AuthState { id Int @id }\n')
+    mkdirSync(join(root, '.svelte-check'))
+    writeFileSync(join(root, '.svelte-check', 'manifest.json'), '{"generated":true}\n')
+    const policy: WorkerPolicy = {
+      root,
+      repoRoot: root,
+      checklist: join(root, 'tasks.task.md'),
+      allowed: [join(root, 'prisma', 'schemas')],
+      mode: 'task',
+    }
+
+    await commitTaskChanges(policy, 'feat: persist auth state', runner(root))
+
+    expect(existsSync(join(root, '.svelte-check'))).toBe(false)
+    expect(git(root, 'show', '--pretty=format:', '--name-only', 'HEAD').split(/\r?\n/u).filter(Boolean)).toEqual([
+      'prisma/schemas/auth.prisma',
+    ])
   })
 
   it('force-adds only changed ignored files inside the declared task scope', async () => {

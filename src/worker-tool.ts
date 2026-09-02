@@ -160,6 +160,16 @@ function requireCompleteGitOutput(result: GitResult, operation: string): GitResu
 export async function commitTaskChanges(policy: WorkerPolicy, message: string, runGit: GitRunner): Promise<string> {
   if (policy.mode !== 'task') throw new Error(`${policy.mode} workers cannot commit`)
   if (!isConventional(message)) throw new Error('commit message must be conventional')
+  const svelteCheckCache = resolve(policy.root, '.svelte-check')
+  if (existsSync(svelteCheckCache)) {
+    const trackedCache = requireCompleteGitOutput(await runGit(['ls-files', '-z', '--', '.svelte-check']), 'transient cache inspection')
+    if (trackedCache.exitCode !== 0) throw new Error(`cannot inspect transient validation cache: ${trackedCache.stderr}`)
+    if (nulPaths(trackedCache.stdout).length === 0) {
+      const canonicalCache = realpathSync(svelteCheckCache)
+      if (!inside(policy.root, canonicalCache)) throw new Error('transient validation cache escapes the worktree')
+      rmSync(svelteCheckCache, { recursive: true, force: true })
+    }
+  }
   const relativeScopes = policy.allowed.map(path => relative(policy.root, path))
   const probes = (await Promise.all([
     runGit(['diff', '--name-only', '-z']),

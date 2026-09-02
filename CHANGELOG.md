@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.37] - 2026-08-31
+
+### Fixed
+
+- Task commits discard an untracked root `.svelte-check` validation cache after proving it contains no tracked paths and cannot escape the worktree. Generated manifests no longer consume tool failures or enter scoped commits.
+
 ## [0.3.36] - 2026-08-31
 
 ### Fixed
