@@ -249,7 +249,8 @@ export class HarnessWorkerAdapter implements WorkerAdapter {
       if (overflow) return { status: overflow, output, transcriptPath }
       if (runtimeFailure) return { status: workerStatusForFailure(runtimeFailure), output, transcriptPath, error: runtimeFailure }
       try {
-        const report = parseWorkerReport(output)
+        const advisoryValidation = request.mode !== 'verification' && request.mode !== 'publication-conflict'
+        const report = parseWorkerReport(output, advisoryValidation)
         if (report.status !== 'completed') return { status: report.status, output, transcriptPath, report, error: report.summary }
         return { status: 'completed', output, transcriptPath, report }
       } catch (error) {
@@ -292,8 +293,8 @@ function workerPrompt(request: WorkerRequest): string {
         : request.task.kind === 'task'
           ? 'Finish with exactly one conventional commit through leppy_commit and a clean working tree.'
           : 'If correction is needed, make at most one conventional commit and leave a clean tree. If no correction is needed, make no commit.',
-    ...(!publicationConflict && !verification && request.task.kind === 'task' && process.platform === 'win32' ? [
-      'When the Done contract requires Playwright on Windows, run other focused checks first, then create the one exact clean commit before the first direct playwright call. The Windows sandbox may classify Playwright named-pipe startup as infrastructure-unavailable; only a committed candidate can be preserved for detached capsule verification. Never report that classification as a passed test.',
+    ...(!publicationConflict && !verification ? [
+      'Validation informs your engineering decision but does not control the lifecycle. Attempt the focused checks, record every failure exactly, and distinguish implementation defects from unavailable tooling, sandbox limitations, or unrelated baseline failures. If the Done contract is satisfied in your judgment, commit and report completed even when validation is failed or not-run. Block only for a real unresolved implementation/scope/authority problem.',
     ] : []),
     ...request.instructions,
     'Applicable project instructions have already been injected above. Do not try to re-read CLAUDE.md, AGENTS.md, or instruction files unless an explicit writable path also authorizes them.',

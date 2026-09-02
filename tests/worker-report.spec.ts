@@ -10,6 +10,17 @@ describe('worker outcome protocol', () => {
     })
   })
 
+  it('lets ordinary workers complete with advisory validation while keeping verification strict', () => {
+    const taskContract = renderWorkerOutcomeContract('task').join('\n')
+    expect(taskContract).toContain('Validation is advisory')
+    expect(parseWorkerReport('Tests failed: spawn EPERM\nLEPPY_OUTCOME: {"status":"completed","summary":"implementation satisfied by inspection","validation":{"status":"failed","evidence":"Vitest startup failed with spawn EPERM"}}', true)).toMatchObject({
+      status: 'completed', validation: { status: 'failed' },
+    })
+    expect(parseWorkerReport('LEPPY_OUTCOME: {"status":"completed","summary":"implementation satisfied by inspection","validation":{"status":"not-run","evidence":"validator unavailable in sandbox"}}', true)).toMatchObject({
+      status: 'completed', validation: { status: 'not-run' },
+    })
+  })
+
   it('requires passed focused validation before verification can report completed', () => {
     const contract = renderWorkerOutcomeContract('verification').join('\n')
     expect(contract).toContain('existing committed task satisfies the Done contract')

@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.38] - 2026-08-31
+
+### Changed
+
+- Ordinary task and closure validation is advisory. Workers must attempt checks and report exact failures, but may complete and commit when engineering judgment says the Done contract is satisfied despite unavailable tooling, sandbox limitations, or unrelated baseline failures. Verification and publication-conflict workers remain strict.
+
 ## [0.3.37] - 2026-08-31
 
 ### Fixed

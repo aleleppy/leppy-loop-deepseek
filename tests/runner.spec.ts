@@ -203,34 +203,21 @@ describe('controller state machine', () => {
     expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).not.toContain('"type":"done"')
   }, 90_000)
 
-  it('never promotes a committed completion whose own validation failed after restart', async () => {
-    const repo = repository('- [ ] Change `src/value.txt` | Done: focused validation passes\n')
-    const contradictory: WorkerAdapter = { async run(request) {
-      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'known-failed\n')
+  it('adopts a committed task when the worker completes with advisory validation failure', async () => {
+    const repo = repository('- [ ] Change `src/value.txt` | Done: implementation is correct by focused inspection\n')
+    const advisory: WorkerAdapter = { async run(request) {
+      writeFileSync(join(request.worktree, 'src', 'value.txt'), 'implemented\n')
       git(request.worktree, 'add', '--', 'src/value.txt')
-      git(request.worktree, 'commit', '-m', 'feat: known failed candidate')
+      git(request.worktree, 'commit', '-m', 'feat: complete advisory candidate')
       return {
-        status: 'completed', output: 'contradictory completion',
-        report: { status: 'completed', summary: 'contradictory', validation: { status: 'failed', evidence: 'focused suite failed' } },
+        status: 'completed', output: 'Vitest startup failed with spawn EPERM; implementation inspected',
+        report: { status: 'completed', summary: 'implementation satisfies contract', validation: { status: 'failed', evidence: 'Vitest startup failed with spawn EPERM' } },
       }
     } }
-    const first = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker: contradictory })
-    expect(first).toMatchObject({ status: 'stalled', completedTasks: 0 })
-    const failedState = JSON.parse(readFileSync(join(first.stateDir!, 'run.json'), 'utf8'))
-    expect(failedState).not.toHaveProperty('activeTaskAttempt')
-    expect(failedState).not.toHaveProperty('pendingTaskValidation')
-
-    const recoveryModes: string[] = []
-    const failedAgain: WorkerAdapter = { async run(request) {
-      recoveryModes.push(request.mode ?? 'task')
-      return { status: 'failed', output: 'still failed', error: 'still failed', report: { status: 'failed', summary: 'still failed', validation: { status: 'failed', evidence: 'still failing' } } }
-    } }
-    const recovered = await runLeppyLoop({
-      tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
-    }, { ...modelDeps, worker: failedAgain })
-    expect(recovered).toMatchObject({ status: 'stalled', completedTasks: 0 })
-    expect(recoveryModes).toEqual(['task'])
-    expect(readFileSync(join(recovered.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [ ] Change')
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker: advisory })
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(readFileSync(join(result.worktree!, 'tasks.task.md'), 'utf8')).toContain('- [x] Change')
+    expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).toContain('Vitest startup failed with spawn EPERM')
   }, 90_000)
 
   it('verifies a blocked committed candidate in a disposable root and adopts it exactly once', async () => {

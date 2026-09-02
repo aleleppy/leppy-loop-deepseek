@@ -233,10 +233,10 @@ function reconcileDurableLifecycleAuthority(state: RunState, stateDir: string): 
   state.lifecycleAuthority = { ...durable.authority }
 }
 
-function assertCompletedWorkerReport(outcome: WorkerOutcome, label: string): void {
+function assertCompletedWorkerReport(outcome: WorkerOutcome, label: string, advisoryValidation = false): void {
   if (outcome.status !== 'completed') throw new Error(`${label} is not completed`)
   if (!outcome.report) throw new Error(`${label} completed without the required structured outcome report`)
-  if (outcome.report.status !== 'completed' || outcome.report.validation.status !== 'passed') {
+  if (outcome.report.status !== 'completed' || (!advisoryValidation && outcome.report.validation.status !== 'passed')) {
     throw new Error(`${label} reported ${outcome.report.status} with validation ${outcome.report.validation.status}`)
   }
 }
@@ -1457,8 +1457,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         if (signal.aborted) throw abortReason(signal)
         if (digest(readFileSync(checklistPath, 'utf8')) !== controllerHash) throw new Error('worker altered the controlling checklist')
       }
-      if (outcome.status === 'completed' && outcome.report?.validation.status === 'failed') {
-        outcome = { ...outcome, status: 'failed', error: 'worker completion contradicts its failed validation report' }
+      if (state.pendingTaskValidation && outcome.status === 'completed' && outcome.report?.validation.status === 'failed') {
+        outcome = { ...outcome, status: 'failed', error: 'verification worker completion contradicts its failed validation report' }
       }
       const active = state.activeTaskAttempt
       const materialCandidate = state.pendingTaskValidation === undefined
@@ -1514,7 +1514,11 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         await settleProgress('task-failed', failureDetail)
         return { runId: state.runId, status: state.status, branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics }
       }
-      assertCompletedWorkerReport(outcome, state.pendingTaskValidation ? 'committed task verification worker' : task.kind === 'closure' ? 'closure worker' : 'task worker')
+      assertCompletedWorkerReport(
+        outcome,
+        state.pendingTaskValidation ? 'committed task verification worker' : task.kind === 'closure' ? 'closure worker' : 'task worker',
+        state.pendingTaskValidation === undefined,
+      )
       if (state.pendingTaskValidation) {
         const marked = markTaskDone(parsed, task)
         state.pendingTaskValidation = {
