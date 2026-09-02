@@ -879,13 +879,15 @@ export function dependencyCacheMiss(detail: string | undefined): boolean {
 export function dependencyResolutionMiss(detail: string | undefined): boolean {
   return dependencyCacheMiss(detail)
     || (typeof detail === 'string' && detail.includes(DEPENDENCY_REPLACEMENT_PENDING_CODE))
+    || (typeof detail === 'string' && detail.includes(INVALID_WORKTREE_TREE_REASON))
     || (typeof detail === 'string' && /\bMODULE_NOT_FOUND\b/iu.test(detail) && /node_modules[\\/]/iu.test(detail))
 }
 
 export function dependencyHydrationAvailable(input: { repoRoot: string; worktree: string; dependencyBridgeActive?: boolean }): boolean {
   try {
-    const status = inspectWorktreeDependencies(input.repoRoot, input.worktree).status
-    return status === 'copyable' || status === 'installable'
+    const inspection = inspectWorktreeDependencies(input.repoRoot, input.worktree)
+    return inspection.status === 'copyable' || inspection.status === 'installable'
+      || (inspection.status === 'unavailable' && inspection.reason === INVALID_WORKTREE_TREE_REASON)
   } catch {
     return false
   }

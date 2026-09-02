@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.35] - 2026-08-31
+
+### Fixed
+
+- A stalled run whose existing worktree dependency tree no longer matches its authenticated npm lock is now classified as an exact dependency-repair transition. Resume can quarantine that owned invalid tree and publish a freshly verified physical tree before releasing another worker.
+
 ## [0.3.34] - 2026-08-31
 
 ### Fixed

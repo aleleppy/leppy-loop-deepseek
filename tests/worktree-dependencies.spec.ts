@@ -492,6 +492,10 @@ describe('worktree dependency hydration', () => {
     expect(dependencyBridgeRecoveryAvailable({ repoRoot: root, worktree, detail: moduleMiss, dependencyBridgeActive: true })).toBe(true)
     await provisionWorktreeDependencies(root, worktree, { stagingRoot: staging(root) })
     expect(dependencyBridgeRecoveryAvailable({ repoRoot: root, worktree, detail: moduleMiss, dependencyBridgeActive: true })).toBe(false)
+    rmSync(join(worktree, 'node_modules', 'typescript'), { recursive: true, force: true })
+    const invalidTree = 'worktree node_modules exists but is not a physical npm tree matching its lockfile'
+    expect(dependencyResolutionMiss(invalidTree)).toBe(true)
+    expect(dependencyBridgeRecoveryAvailable({ repoRoot: root, worktree, detail: invalidTree, dependencyBridgeActive: true })).toBe(true)
     expect(dependencyBridgeRecoveryAvailable({ repoRoot: root, worktree, detail: 'command failed with exit 1' })).toBe(false)
   })
 })
