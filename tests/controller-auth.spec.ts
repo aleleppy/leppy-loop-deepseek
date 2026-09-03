@@ -147,12 +147,14 @@ describe('authenticated controller lifecycle authority integrity', () => {
   it('migrates legacy ownership once and rejects later recovery-state tampering', async () => {
     const legacy = repository(false)
     const statePath = join(legacy.stateDir, 'run.json')
-    const legacyState = JSON.parse(readFileSync(statePath, 'utf8')) as { stateProof?: { value?: string }; lastError?: string; autoRecoveryBlocked?: boolean; dependencyBridgeActive?: boolean; windowsArgvBridgeActive?: boolean; ignoredBaselineBridge?: { schemaVersion: 1; phase: 'prepared' | 'consumed'; authorityEpoch: number; authorityTransition: number; requestDigest: string; conditionDigest: string; activeAttemptDigest: string } }
+    const legacyState = JSON.parse(readFileSync(statePath, 'utf8')) as { stateProof?: { value?: string }; lastError?: string; autoRecoveryBlocked?: boolean; dependencyBridgeActive?: boolean; windowsArgvBridgeActive?: boolean; ignoredBaselineBridge?: { schemaVersion: 1; phase: 'prepared' | 'consumed'; authorityEpoch: number; authorityTransition: number; requestDigest: string; conditionDigest: string; activeAttemptDigest: string }; gateCacheTransaction?: unknown; gateEvidence?: unknown }
     legacyState.lastError = 'forged legacy failure'
     legacyState.autoRecoveryBlocked = true
     legacyState.dependencyBridgeActive = true
     legacyState.windowsArgvBridgeActive = true
     legacyState.ignoredBaselineBridge = { schemaVersion: 1, phase: 'consumed', authorityEpoch: 1, authorityTransition: 1, requestDigest: 'c'.repeat(64), conditionDigest: 'a'.repeat(64), activeAttemptDigest: 'b'.repeat(64) }
+    legacyState.gateCacheTransaction = { schemaVersion: 1, context: 'publication', rollbackHead: 'a'.repeat(40), entries: [{ path: '.svelte-kit/.svelte-check', quarantineRelative: '../../attacker', digest: 'b'.repeat(64) }] }
+    legacyState.gateEvidence = { schemaVersion: 1, receiptDigest: 'c'.repeat(64), exitCode: 0 }
     writeFileSync(statePath, `${JSON.stringify(legacyState)}\n`)
 
     await migrateRunStateSecurityProof(legacy.root, legacy.runId)
@@ -163,6 +165,8 @@ describe('authenticated controller lifecycle authority integrity', () => {
     expect(migrated.dependencyBridgeActive).toBeUndefined()
     expect(migrated.windowsArgvBridgeActive).toBeUndefined()
     expect(migrated.ignoredBaselineBridge).toBeUndefined()
+    expect(migrated.gateCacheTransaction).toBeUndefined()
+    expect(migrated.gateEvidence).toBeUndefined()
     expect(migrated.stateProof?.value).toMatch(/^[A-Za-z0-9_-]{43}$/u)
     unlinkSync(join(legacy.stateDir, 'ownership.hmac'))
     await expect(inspectAuthenticatedControllers(legacy.root)).resolves.toHaveLength(1)

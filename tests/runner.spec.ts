@@ -1,8 +1,8 @@
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import * as gitModule from '../src/git.js'
 import { workerIgnoredBaselineBridgeIdentity } from '../src/ignored-artifacts.js'
@@ -94,11 +94,14 @@ const modelDeps = {
   runId: () => `test${Math.random().toString(16).slice(2, 8)}`,
 }
 
-async function seedLegacyFailedGate(): Promise<{ repo: { root: string; tasks: string }; runId: string; stateDir: string; worktree: string; command: string }> {
+async function seedLegacyFailedGate(gateBody = "process.exit(1)\n"): Promise<{ repo: { root: string; tasks: string }; runId: string; stateDir: string; worktree: string; command: string }> {
   const gateScript = join(tmpdir(), `leppy-legacy-advisory-${Math.random().toString(16).slice(2)}.cjs`).replaceAll('\\', '/')
-  writeFileSync(gateScript, "process.exit(1)\n")
+  writeFileSync(gateScript, gateBody)
   const command = `node ${gateScript}`
   const repo = repository(`- [~] Gate: legacy advisory recovery | gate=\`${command}\`\n`)
+  writeFileSync(join(repo.root, '.gitignore'), '.svelte-kit/\n')
+  git(repo.root, 'add', '--', '.gitignore')
+  git(repo.root, 'commit', '-m', 'chore: ignore legacy validation cache')
   const completed = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker: new FakeWorker() })
   git(completed.worktree!, 'reset', '--hard', 'HEAD^')
   const receiptName = readdirSync(join(completed.stateDir!, 'receipts')).find(name => /^gate-0-\d+\.json$/u.test(name))!
@@ -1143,7 +1146,7 @@ describe('controller state machine', () => {
   it('records an unrepairable local gate failure as advisory and advances in the same run', async () => {
     const suffix = Math.random().toString(16).slice(2)
     const gateScript = join(tmpdir(), `leppy-advisory-gate-${suffix}.cjs`).replaceAll('\\', '/')
-    writeFileSync(gateScript, "const fs=require('fs');fs.mkdirSync('.svelte-kit',{recursive:true});fs.writeFileSync('.svelte-kit/generated.txt','cache');console.error('GATE_EVIDENCE');process.exit(1)\n")
+    writeFileSync(gateScript, "const fs=require('fs');fs.mkdirSync('.svelte-kit/.svelte-check',{recursive:true});fs.writeFileSync('.svelte-kit/.svelte-check/manifest.json','cache');console.error('GATE_EVIDENCE');process.exit(1)\n")
     const repo = repository(`## Validation\n- [~] Gate: advisory evidence | gate=\`node ${gateScript}\`\n## Follow-up\n- [ ] Change \`src/value.txt\` | Done: value says done\n`)
     writeFileSync(join(repo.root, '.gitignore'), '.svelte-kit/\n')
     git(repo.root, 'add', '--', '.gitignore')
@@ -1164,7 +1167,8 @@ describe('controller state machine', () => {
     const events = readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(events.filter(entry => entry.type === 'gate-failed')).toHaveLength(1)
     expect(events.filter(entry => entry.type === 'gate-end').at(-1)?.data).toMatchObject({ exitCode: 1, advisory: true })
-    expect(events.some(entry => entry.type === 'recovery-done' && entry.data.workerArtifact === 'local-gate-ignored-side-effects')).toBe(true)
+    expect(events.some(entry => entry.type === 'recovery-done' && entry.data.workerArtifact === 'transient-validation-cache'
+      && entry.data.paths.includes('.svelte-kit/.svelte-check'))).toBe(true)
     expect(existsSync(join(result.worktree!, '.svelte-kit'))).toBe(false)
     expect(existsSync(join(result.stateDir!, 'resume.json'))).toBe(false)
     expect(git(result.worktree!, 'status', '--short')).toBe('')
@@ -1221,8 +1225,10 @@ describe('controller state machine', () => {
     expect(events.filter(entry => entry.type === 'gate-end').at(-1)?.data).toMatchObject({ exitCode: 1, advisory: true })
   }, 90_000)
 
-  it('reruns a legacy stalled gate exactly once to mint authenticated advisory evidence', async () => {
+  it('reruns a legacy stalled gate exactly once while preserving its pre-existing nested svelte-check cache', async () => {
     const seeded = await seedLegacyFailedGate()
+    mkdirSync(join(seeded.worktree, '.svelte-kit', '.svelte-check'), { recursive: true })
+    writeFileSync(join(seeded.worktree, '.svelte-kit', '.svelte-check', 'manifest.json'), '{"stale":true}\n')
     const startsBefore = readFileSync(join(seeded.stateDir, 'events.jsonl'), 'utf8').split('\n').filter(line => line.includes('"type":"gate-start"')).length
     const worker = new FakeWorker()
     const result = await runLeppyLoop({
@@ -1236,7 +1242,217 @@ describe('controller state machine', () => {
     expect(JSON.parse(readFileSync(join(seeded.worktree, '.leppy-loop-receipts', 'gate-0.json'), 'utf8')))
       .toMatchObject({ exitCode: 1, advisory: true })
     expect(JSON.parse(readFileSync(join(seeded.stateDir, 'run.json'), 'utf8')).gateEvidence).toMatchObject({ exitCode: 1 })
+    expect(readFileSync(join(seeded.worktree, '.svelte-kit', '.svelte-check', 'manifest.json'), 'utf8')).toBe('{"stale":true}\n')
     expect(git(seeded.worktree, 'status', '--short')).toBe('')
+  }, 90_000)
+
+  it('restores an authenticated validation-cache quarantine after a controller crash', async () => {
+    const seeded = await seedLegacyFailedGate()
+    const manifest = join(seeded.worktree, '.svelte-kit', '.svelte-check', 'manifest.json')
+    mkdirSync(dirname(manifest), { recursive: true })
+    writeFileSync(manifest, '{"preserve":"me"}\n')
+    await expect(runLeppyLoop({
+      tasks: seeded.repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: seeded.runId,
+    }, {
+      ...modelDeps,
+      worker: new FakeWorker(),
+      afterGateCachesQuarantined: () => { throw new Error('simulated cache-quarantine crash') },
+    })).rejects.toThrow('simulated cache-quarantine crash')
+    expect(existsSync(manifest)).toBe(false)
+    const crashedState = JSON.parse(readFileSync(join(seeded.stateDir, 'run.json'), 'utf8'))
+    expect(crashedState.gateCacheTransaction).toMatchObject({ phase: 'ready', entries: [{ path: '.svelte-kit/.svelte-check' }], ignoredBaseline: { digest: expect.stringMatching(/^[0-9a-f]{64}$/u) } })
+    expect(existsSync(join(seeded.stateDir, crashedState.gateCacheTransaction.entries[0].quarantineRelative))).toBe(true)
+
+    const result = await runLeppyLoop({
+      tasks: seeded.repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: seeded.runId,
+    }, { ...modelDeps, worker: new FakeWorker() })
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(readFileSync(manifest, 'utf8')).toBe('{"preserve":"me"}\n')
+    expect(JSON.parse(readFileSync(join(seeded.stateDir, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
+  }, 90_000)
+
+  it('rolls back a local gate commit before adopting a new baseline after controller death', async () => {
+    const suffix = Math.random().toString(16).slice(2)
+    const runId = `localcrash${suffix.slice(0, 6)}`
+    const counter = join(tmpdir(), `leppy-local-gate-crash-${suffix}.txt`).replaceAll('\\', '/')
+    const gateScript = join(tmpdir(), `leppy-local-gate-crash-${suffix}.cjs`).replaceAll('\\', '/')
+    writeFileSync(gateScript, `const fs=require('fs');const cp=require('child_process');const p='${counter}';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8'))+1:1;fs.writeFileSync(p,String(n));if(n===1){fs.mkdirSync('.svelte-kit/.svelte-check',{recursive:true});fs.writeFileSync('.svelte-kit/.svelte-check/manifest.json','forbidden');fs.writeFileSync('src/gate.txt','forbidden');fs.writeFileSync('.gate-poison','poison');cp.execFileSync('git',['add','-f','.svelte-kit/.svelte-check/manifest.json','src/gate.txt']);cp.execFileSync('git',['commit','-m','test: forbidden local gate commit']);cp.execFileSync('git',['switch','--detach']);}process.exit(n===1||fs.existsSync('.gate-poison')?0:1)\n`)
+    const repo = repository(`- [~] Gate: local crash rollback | gate=\`node ${gateScript}\`\n`)
+    writeFileSync(join(repo.root, '.gitignore'), '.svelte-kit/\n.gate-poison\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore local gate cache')
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, runId: () => runId, worker: new FakeWorker(), simulateLocalCrashAfterGate: true },
+    )).rejects.toThrow('simulated local gate controller crash')
+    const stateDir = join(repo.root, '.git', 'leppy-loop', 'runs', runId)
+    const crashed = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(crashed.gateCacheTransaction).toMatchObject({ context: 'local', rollbackHead: expect.stringMatching(/^[0-9a-f]{40}$/u) })
+    expect(git(crashed.worktree, 'rev-parse', 'HEAD')).not.toBe(crashed.gateCacheTransaction.rollbackHead)
+    expect(git(crashed.worktree, 'branch', '--show-current')).toBe('')
+    expect(existsSync(join(crashed.worktree, 'src', 'gate.txt'))).toBe(true)
+    expect(readFileSync(join(crashed.worktree, '.gate-poison'), 'utf8')).toBe('poison')
+
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: runId,
+    }, { ...modelDeps, worker: new FakeWorker() })
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(existsSync(join(crashed.worktree, 'src', 'gate.txt'))).toBe(false)
+    expect(existsSync(join(crashed.worktree, '.svelte-kit'))).toBe(false)
+    expect(existsSync(join(crashed.worktree, '.gate-poison'))).toBe(false)
+    expect(JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
+    expect(git(crashed.worktree, 'status', '--short')).toBe('')
+    expect(git(crashed.worktree, 'branch', '--show-current')).toBe(crashed.branch)
+  }, 90_000)
+
+  it('recovers a gate process reservation that died before bootstrap spawn', async () => {
+    const counter = join(tmpdir(), `leppy-reserved-gate-${Math.random().toString(16).slice(2)}.txt`).replaceAll('\\', '/')
+    const seeded = await seedLegacyFailedGate(`const fs=require('fs');const p='${counter}';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8'))+1:1;fs.writeFileSync(p,String(n));process.exit(1)\n`)
+    const manifest = join(seeded.worktree, '.svelte-kit', '.svelte-check', 'manifest.json')
+    mkdirSync(dirname(manifest), { recursive: true })
+    writeFileSync(manifest, 'reserved-original')
+    await expect(runLeppyLoop({
+      tasks: seeded.repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: seeded.runId,
+    }, {
+      ...modelDeps,
+      worker: new FakeWorker(),
+      simulateLocalCrashAfterGateProcessReserved: true,
+    })).rejects.toThrow('simulated controller death after gate process reservation')
+    const crashed = JSON.parse(readFileSync(join(seeded.stateDir, 'run.json'), 'utf8'))
+    expect(crashed.gateCacheTransaction).toMatchObject({
+      phase: 'ready', gateProcess: { phase: 'reserved', permitRelative: expect.stringContaining('gate-process-permits/') },
+    })
+    expect(existsSync(manifest)).toBe(false)
+
+    const recovered = await runLeppyLoop({
+      tasks: seeded.repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: seeded.runId,
+    }, { ...modelDeps, worker: new FakeWorker() })
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(readFileSync(manifest, 'utf8')).toBe('reserved-original')
+    expect(JSON.parse(readFileSync(join(seeded.stateDir, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
+  }, 90_000)
+
+  it('settles an authenticated live gate tree before crash rollback and ignored cleanup', async () => {
+    const suffix = Math.random().toString(16).slice(2)
+    const runId = `livegate${suffix.slice(0, 6)}`
+    const counter = join(tmpdir(), `leppy-live-gate-${suffix}.txt`).replaceAll('\\', '/')
+    const marker = join(tmpdir(), `leppy-live-gate-${suffix}.ready`).replaceAll('\\', '/')
+    const gateScript = join(tmpdir(), `leppy-live-gate-${suffix}.cjs`).replaceAll('\\', '/')
+    writeFileSync(gateScript, `const fs=require('fs');const p='${counter}';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8'))+1:1;fs.writeFileSync(p,String(n));if(n===1){fs.writeFileSync('.gate-poison','live');fs.writeFileSync('${marker}','ready');setInterval(()=>fs.writeFileSync('.gate-poison','still-live'),25);}else{process.exit(fs.existsSync('.gate-poison')?0:1)}\n`)
+    const repo = repository(`- [~] Gate: live process crash | gate=\`node ${gateScript}\`\n`)
+    writeFileSync(join(repo.root, '.gitignore'), '.gate-poison\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore live gate sentinel')
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      {
+        ...modelDeps,
+        runId: () => runId,
+        worker: new FakeWorker(),
+        simulateLocalCrashWithLiveGate: true,
+        afterGateProcessReleased: async () => {
+          for (let check = 0; check < 100 && !existsSync(marker); check += 1) {
+            await new Promise(resolvePromise => setTimeout(resolvePromise, 20))
+          }
+          if (!existsSync(marker)) throw new Error('live gate did not reach its marker')
+        },
+      },
+    )).rejects.toThrow('authenticated gate process alive')
+    const stateDir = join(repo.root, '.git', 'leppy-loop', 'runs', runId)
+    const crashed = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(crashed.gateCacheTransaction.gateProcess).toMatchObject({
+      pid: expect.any(Number), processStart: expect.any(String), permitRelative: expect.stringContaining('gate-process-permits/'),
+    })
+    expect(existsSync(join(crashed.worktree, '.gate-poison'))).toBe(true)
+
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: runId,
+    }, { ...modelDeps, worker: new FakeWorker() })
+    expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(existsSync(join(crashed.worktree, '.gate-poison'))).toBe(false)
+    expect(JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
+    expect(git(crashed.worktree, 'status', '--short')).toBe('')
+  }, 90_000)
+
+  it('settles a detached gate descendant before accepting normal validation', async () => {
+    const suffix = Math.random().toString(16).slice(2)
+    const launched = join(tmpdir(), `leppy-daemon-gate-${suffix}.launched`).replaceAll('\\', '/')
+    const late = join(tmpdir(), `leppy-daemon-gate-${suffix}.late`).replaceAll('\\', '/')
+    const gateScript = join(tmpdir(), `leppy-daemon-gate-${suffix}.cjs`).replaceAll('\\', '/')
+    const daemon = `const fs=require('fs');setTimeout(()=>{fs.writeFileSync('.gate-poison','late');fs.writeFileSync('${late}','late')},750);setTimeout(()=>{},5000)`
+    writeFileSync(gateScript, `const fs=require('fs');const cp=require('child_process');cp.spawn(process.execPath,['-e',${JSON.stringify(daemon)}],{detached:true,stdio:'ignore'}).unref();fs.writeFileSync('${launched}','launched')\n`)
+    const repo = repository(`- [~] Gate: detached descendant containment | gate=\`node ${gateScript}\`\n`)
+    writeFileSync(join(repo.root, '.gitignore'), '.gate-poison\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore detached gate sentinel')
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false },
+      { ...modelDeps, worker: new FakeWorker() },
+    )
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(existsSync(launched)).toBe(true)
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 1_200))
+    expect(existsSync(late)).toBe(false)
+    expect(existsSync(join(result.worktree!, '.gate-poison'))).toBe(false)
+    expect(git(result.worktree!, 'status', '--short')).toBe('')
+  }, 90_000)
+
+  it('restores the original cache before hard-stopping a committed same-path gate replacement', async () => {
+    const counter = join(tmpdir(), `leppy-cache-replacement-${Math.random().toString(16).slice(2)}.txt`).replaceAll('\\', '/')
+    const seeded = await seedLegacyFailedGate(`const fs=require('fs');const cp=require('child_process');const p='${counter}';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8'))+1:1;fs.writeFileSync(p,String(n));if(n>1){fs.mkdirSync('.svelte-kit/.svelte-check',{recursive:true});fs.writeFileSync('.svelte-kit/.svelte-check/manifest.json','committed-replacement');cp.execFileSync('git',['add','-f','.svelte-kit/.svelte-check/manifest.json']);cp.execFileSync('git',['commit','-m','test: forbidden gate cache commit']);}process.exit(1)\n`)
+    const manifest = join(seeded.worktree, '.svelte-kit', '.svelte-check', 'manifest.json')
+    mkdirSync(dirname(manifest), { recursive: true })
+    writeFileSync(manifest, 'original-wip')
+    await expect(runLeppyLoop({
+      tasks: seeded.repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: seeded.runId,
+    }, { ...modelDeps, worker: new FakeWorker() })).rejects.toThrow('validation cache contains tracked content')
+    expect(readFileSync(manifest, 'utf8')).toBe('original-wip')
+    expect(JSON.parse(readFileSync(join(seeded.stateDir, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
+    expect(readdirSync(join(seeded.stateDir, 'gate-cache-quarantine')).some(name => name.length > 0)).toBe(true)
+  }, 90_000)
+
+  it('restores nested cache inside the worktree when a gate replaces its parent with an external symlink', async () => {
+    const counter = join(tmpdir(), `leppy-cache-symlink-${Math.random().toString(16).slice(2)}.txt`).replaceAll('\\', '/')
+    const external = mkdtempSync(join(tmpdir(), 'leppy-cache-external-')).replaceAll('\\', '/')
+    const seeded = await seedLegacyFailedGate(`const fs=require('fs');const p='${counter}';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8'))+1:1;fs.writeFileSync(p,String(n));if(n>1)fs.symlinkSync('${external}','.svelte-kit','junction');process.exit(1)\n`)
+    const manifest = join(seeded.worktree, '.svelte-kit', '.svelte-check', 'manifest.json')
+    mkdirSync(dirname(manifest), { recursive: true })
+    writeFileSync(manifest, 'original-inside-worktree')
+    await expect(runLeppyLoop({
+      tasks: seeded.repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: seeded.runId,
+    }, {
+      ...modelDeps,
+      worker: new FakeWorker(),
+      afterGateCommandSettled: () => { throw new Error('simulated crash with parent symlink') },
+    })).rejects.toThrow('simulated crash with parent symlink')
+    expect(readFileSync(manifest, 'utf8')).toBe('original-inside-worktree')
+    expect(lstatSync(join(seeded.worktree, '.svelte-kit')).isSymbolicLink()).toBe(false)
+    expect(existsSync(join(external, '.svelte-check'))).toBe(false)
+    expect(JSON.parse(readFileSync(join(seeded.stateDir, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
+  }, 90_000)
+
+  it('never moves original cache through a private quarantine parent symlink', async () => {
+    const seeded = await seedLegacyFailedGate()
+    const manifest = join(seeded.worktree, '.svelte-kit', '.svelte-check', 'manifest.json')
+    mkdirSync(dirname(manifest), { recursive: true })
+    writeFileSync(manifest, 'stay-private')
+    const external = mkdtempSync(join(tmpdir(), 'leppy-private-cache-external-'))
+    symlinkSync(external, join(seeded.stateDir, 'gate-cache-quarantine'), 'junction')
+    await expect(runLeppyLoop({
+      tasks: seeded.repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: seeded.runId,
+    }, { ...modelDeps, worker: new FakeWorker() })).rejects.toThrow('validation-cache quarantine parent escapes its root')
+    expect(readFileSync(manifest, 'utf8')).toBe('stay-private')
+    expect(readdirSync(external)).toEqual([])
+    expect(JSON.parse(readFileSync(join(seeded.stateDir, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
   }, 90_000)
 
   it('fails closed instead of adopting a legacy gate receipt with changed command identity', async () => {
@@ -1734,9 +1950,9 @@ describe('controller state machine', () => {
   it('rejects ignored artifacts created by the strict publication gate', async () => {
     const suffix = Math.random().toString(16).slice(2)
     const gateScript = join(tmpdir(), `leppy-publication-ignored-${suffix}.cjs`).replaceAll('\\', '/')
-    writeFileSync(gateScript, "const fs=require('fs');fs.mkdirSync('.publication-cache',{recursive:true});fs.writeFileSync('.publication-cache/poison','x');process.exit(0)\n")
+    writeFileSync(gateScript, "const fs=require('fs');fs.mkdirSync('.publication-cache',{recursive:true});fs.writeFileSync('.publication-cache/poison','x');fs.mkdirSync('.svelte-kit/.svelte-check',{recursive:true});fs.writeFileSync('.svelte-kit/.svelte-check/manifest.json','generated');process.exit(0)\n")
     const repo = repository(`- [~] Gate: ignored publication side effect | gate=\`node ${gateScript}\`\n`)
-    writeFileSync(join(repo.root, '.gitignore'), '.publication-cache/\n')
+    writeFileSync(join(repo.root, '.gitignore'), '.publication-cache/\n.svelte-kit/\n')
     git(repo.root, 'add', '--', '.gitignore')
     git(repo.root, 'commit', '-m', 'chore: ignore publication cache')
     let remoteMutations = 0
@@ -1746,6 +1962,9 @@ describe('controller state machine', () => {
         ...modelDeps,
         worker: new FakeWorker(),
         publishPullRequest: async (request, _signal, hooks) => {
+          const manifest = join(request.worktree, '.svelte-kit', '.svelte-check', 'manifest.json')
+          mkdirSync(dirname(manifest), { recursive: true })
+          writeFileSync(manifest, 'pre-existing')
           await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
           remoteMutations += 1
           return { url: 'https://example.invalid/must-not-publish', validationReceipt: 'impossible' }
@@ -1755,6 +1974,161 @@ describe('controller state machine', () => {
     expect(result).toMatchObject({ status: 'stalled', detail: expect.stringContaining('created ignored artifacts') })
     expect(remoteMutations).toBe(0)
     expect(existsSync(join(result.worktree!, '.publication-cache'))).toBe(false)
+    expect(readFileSync(join(result.worktree!, '.svelte-kit', '.svelte-check', 'manifest.json'), 'utf8')).toBe('pre-existing')
+  }, 90_000)
+
+  it('rolls publication Git state back before restoring a pre-existing same-path cache', async () => {
+    const suffix = Math.random().toString(16).slice(2)
+    const counter = join(tmpdir(), `leppy-publication-cache-${suffix}.txt`).replaceAll('\\', '/')
+    const gateScript = join(tmpdir(), `leppy-publication-cache-${suffix}.cjs`).replaceAll('\\', '/')
+    writeFileSync(gateScript, `const fs=require('fs');const cp=require('child_process');const p='${counter}';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8'))+1:1;fs.writeFileSync(p,String(n));if(n>1){fs.mkdirSync('.svelte-kit/.svelte-check',{recursive:true});fs.writeFileSync('.svelte-kit/.svelte-check/manifest.json','publication-commit');cp.execFileSync('git',['add','-f','.svelte-kit/.svelte-check/manifest.json']);cp.execFileSync('git',['commit','-m','test: forbidden publication cache commit']);}process.exit(0)\n`)
+    const repo = repository(`- [~] Gate: publication cache rollback | gate=\`node ${gateScript}\`\n`)
+    writeFileSync(join(repo.root, '.gitignore'), '.svelte-kit/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore publication validation cache')
+    let expectedHead = ''
+    let remoteMutations = 0
+    const result = await runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true },
+      {
+        ...modelDeps,
+        worker: new FakeWorker(),
+        publishPullRequest: async (request, _signal, hooks) => {
+          expectedHead = git(request.worktree, 'rev-parse', 'HEAD')
+          const manifest = join(request.worktree, '.svelte-kit', '.svelte-check', 'manifest.json')
+          mkdirSync(dirname(manifest), { recursive: true })
+          writeFileSync(manifest, 'publication-original-wip')
+          await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
+          remoteMutations += 1
+          return { url: 'https://example.invalid/must-not-publish', validationReceipt: 'impossible' }
+        },
+      },
+    )
+    expect(result).toMatchObject({ status: 'stalled', detail: expect.stringContaining('validation cache contains tracked content') })
+    expect(remoteMutations).toBe(0)
+    expect(git(result.worktree!, 'rev-parse', 'HEAD')).toBe(expectedHead)
+    expect(readFileSync(join(result.worktree!, '.svelte-kit', '.svelte-check', 'manifest.json'), 'utf8')).toBe('publication-original-wip')
+    expect(git(result.worktree!, 'status', '--short')).toBe('')
+    expect(JSON.parse(readFileSync(join(result.stateDir!, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
+  }, 90_000)
+
+  it('rolls back publication Git before restoring cache after a simulated controller death', async () => {
+    const suffix = Math.random().toString(16).slice(2)
+    const counter = join(tmpdir(), `leppy-publication-crash-${suffix}.txt`).replaceAll('\\', '/')
+    const gateScript = join(tmpdir(), `leppy-publication-crash-${suffix}.cjs`).replaceAll('\\', '/')
+    writeFileSync(gateScript, `const fs=require('fs');const cp=require('child_process');const p='${counter}';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8'))+1:1;fs.writeFileSync(p,String(n));if(n>1){fs.mkdirSync('.svelte-kit/.svelte-check',{recursive:true});fs.writeFileSync('.svelte-kit/.svelte-check/manifest.json','crash-replacement');cp.execFileSync('git',['add','-f','.svelte-kit/.svelte-check/manifest.json']);cp.execFileSync('git',['commit','-m','test: publication crash replacement']);}process.exit(0)\n`)
+    const repo = repository(`- [~] Gate: publication crash cache | gate=\`node ${gateScript}\`\n`)
+    writeFileSync(join(repo.root, '.gitignore'), '.svelte-kit/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore crash validation cache')
+    let rollbackHead = ''
+    let stateDir = ''
+    let worktree = ''
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', fetch: false, openPullRequest: true },
+      {
+        ...modelDeps,
+        worker: new FakeWorker(),
+        simulatePublicationCrashAfterGate: true,
+        publishPullRequest: async (request, _signal, hooks) => {
+          rollbackHead = git(request.worktree, 'rev-parse', 'HEAD')
+          const manifest = join(request.worktree, '.svelte-kit', '.svelte-check', 'manifest.json')
+          mkdirSync(dirname(manifest), { recursive: true })
+          writeFileSync(manifest, 'crash-original-wip')
+          try {
+            await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
+          } finally {
+            worktree = request.worktree
+            const common = git(request.worktree, 'rev-parse', '--git-common-dir')
+            const runs = resolve(request.worktree, common, 'leppy-loop', 'runs')
+            stateDir = join(runs, readdirSync(runs)[0]!)
+          }
+          return { url: 'https://example.invalid/must-not-publish', validationReceipt: 'impossible' }
+        },
+      },
+    )).rejects.toThrow('simulated publication controller crash')
+    const crashed = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(crashed.gateCacheTransaction).toMatchObject({ context: 'publication', rollbackHead })
+    expect(git(worktree, 'rev-parse', 'HEAD')).not.toBe(rollbackHead)
+    expect(readFileSync(join(worktree, '.svelte-kit', '.svelte-check', 'manifest.json'), 'utf8')).toBe('crash-replacement')
+
+    await expect(runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: crashed.runId,
+    }, {
+      ...modelDeps,
+      worker: new FakeWorker(),
+      simulatePublicationCrashRollbackFailure: true,
+    })).rejects.toThrow('simulated publication crash rollback failure')
+    const failedRollback = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(failedRollback.gateCacheTransaction).toMatchObject({ context: 'publication', rollbackHead })
+    expect(readFileSync(join(worktree, '.svelte-kit', '.svelte-check', 'manifest.json'), 'utf8')).toBe('crash-replacement')
+
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: crashed.runId,
+    }, { ...modelDeps, worker: new FakeWorker() })
+    expect(recovered.status).toBe('completed')
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(rollbackHead)
+    expect(readFileSync(join(worktree, '.svelte-kit', '.svelte-check', 'manifest.json'), 'utf8')).toBe('crash-original-wip')
+    expect(git(worktree, 'status', '--short')).toBe('')
+    expect(JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
+  }, 90_000)
+
+  it('recovers an empty cache baseline and active rebase against the authenticated publication target', async () => {
+    const suffix = Math.random().toString(16).slice(2)
+    const counter = join(tmpdir(), `leppy-publication-target-${suffix}.txt`).replaceAll('\\', '/')
+    const gateScript = join(tmpdir(), `leppy-publication-target-${suffix}.cjs`).replaceAll('\\', '/')
+    writeFileSync(gateScript, `const fs=require('fs');const cp=require('child_process');const p='${counter}';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8'))+1:1;fs.writeFileSync(p,String(n));if(n>1){fs.mkdirSync('.svelte-kit/.svelte-check',{recursive:true});fs.writeFileSync('.svelte-kit/.svelte-check/manifest.json','attempt-generated');cp.execFileSync('git',['update-ref','refs/remotes/origin/release','refs/heads/release-next']);cp.spawnSync('git',['rebase','origin/release'],{stdio:'inherit'});}process.exit(n>1?1:0)\n`)
+    const repo = repository(`- [~] Gate: retargeted publication crash | gate=\`node ${gateScript}\`\n`)
+    writeFileSync(join(repo.root, '.gitignore'), '.svelte-kit/\n')
+    git(repo.root, 'add', '--', '.gitignore')
+    git(repo.root, 'commit', '-m', 'chore: ignore retargeted validation cache')
+    git(repo.root, 'branch', 'release')
+    git(repo.root, 'update-ref', 'refs/remotes/origin/release', 'refs/heads/release')
+    git(repo.root, 'checkout', '-b', 'release-next')
+    writeFileSync(join(repo.root, 'src', 'value.txt'), 'release\n')
+    git(repo.root, 'add', '--', 'src/value.txt')
+    git(repo.root, 'commit', '-m', 'feat: release target change')
+    git(repo.root, 'checkout', 'main')
+    writeFileSync(join(repo.root, 'src', 'value.txt'), 'main\n')
+    git(repo.root, 'add', '--', 'src/value.txt')
+    git(repo.root, 'commit', '-m', 'feat: main branch change')
+    let stateDir = ''
+    let worktree = ''
+    await expect(runLeppyLoop(
+      { tasks: repo.tasks, syncBranch: 'main', publicationTarget: 'origin/release', fetch: false, openPullRequest: true },
+      {
+        ...modelDeps,
+        worker: new FakeWorker(),
+        simulatePublicationCrashAfterGate: true,
+        publishPullRequest: async (request, _signal, hooks) => {
+          worktree = request.worktree
+          const common = git(request.worktree, 'rev-parse', '--git-common-dir')
+          const runs = resolve(request.worktree, common, 'leppy-loop', 'runs')
+          stateDir = join(runs, readdirSync(runs)[0]!)
+          await hooks.validateBeforePush(git(request.worktree, 'rev-parse', request.syncBranch))
+          return { url: 'https://example.invalid/must-not-publish', validationReceipt: 'impossible' }
+        },
+      },
+    )).rejects.toThrow('simulated publication controller crash')
+    const crashed = JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8'))
+    expect(crashed.gateCacheTransaction).toMatchObject({
+      context: 'publication', publicationTarget: 'origin/release', entries: [],
+      absentPaths: ['.svelte-check', '.svelte-kit/.svelte-check'],
+    })
+    expect(existsSync(join(worktree, '.svelte-kit', '.svelte-check', 'manifest.json'))).toBe(true)
+    expect(existsSync(resolve(worktree, git(worktree, 'rev-parse', '--git-path', 'rebase-merge')))).toBe(true)
+
+    const recovered = await runLeppyLoop({
+      tasks: repo.tasks, syncBranch: 'main', fetch: false,
+      recoverExistingWip: true, recoverRunId: crashed.runId,
+    }, { ...modelDeps, worker: new FakeWorker() })
+    expect(recovered.status).toBe('completed')
+    expect(existsSync(join(worktree, '.svelte-kit'))).toBe(false)
+    expect(JSON.parse(readFileSync(join(stateDir, 'run.json'), 'utf8')).gateCacheTransaction).toBeUndefined()
+    expect(existsSync(resolve(worktree, git(worktree, 'rev-parse', '--git-path', 'rebase-merge')))).toBe(false)
+    expect(git(worktree, 'status', '--short')).toBe('')
   }, 90_000)
 
   it('reruns and rejects an advisory final gate before reconciling an existing pull request', async () => {

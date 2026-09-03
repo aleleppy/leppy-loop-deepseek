@@ -12,7 +12,7 @@ import {
   separateRunStateProofMatches, type EmbeddedRunStateProof,
 } from './run-state-proof.js'
 import { acquireLock, atomicWriteJson } from './state.js'
-import type { ActiveTaskAttempt, ChecklistTask, IgnoredBaselineBridgeAdmission, IgnoredBaselineBridgeIdentity, LifecycleAuthority, PendingTaskValidation, RunResult } from './types.js'
+import type { ActiveTaskAttempt, AuthenticatedGateEvidence, ChecklistTask, GateCacheTransaction, IgnoredBaselineBridgeAdmission, IgnoredBaselineBridgeIdentity, LifecycleAuthority, PendingTaskValidation, RunResult } from './types.js'
 
 interface StoredRunState {
   schemaVersion: 1
@@ -42,6 +42,8 @@ interface StoredRunState {
   dependencyBridgeActive?: boolean
   windowsArgvBridgeActive?: boolean
   ignoredBaselineBridge?: IgnoredBaselineBridgeAdmission
+  gateCacheTransaction?: GateCacheTransaction
+  gateEvidence?: AuthenticatedGateEvidence
   updatedAt: string
 }
 
@@ -239,6 +241,8 @@ export async function migrateRunStateSecurityProof(cwd: string, runId: string): 
     delete target.dependencyBridgeActive
     delete target.windowsArgvBridgeActive
     delete target.ignoredBaselineBridge
+    delete target.gateCacheTransaction
+    delete target.gateEvidence
     if (status === 'invalid' && !separateRunStateProofMatches(stateDir, target, key)) {
       throw new Error(`run ${runId} has an invalid ownership proof`)
     }

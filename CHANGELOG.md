@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [0.3.49] - 2026-09-03
+
+### Fixed
+
+- Local and final publication gates now HMAC-bind the complete present/absent baseline for `.svelte-check` and nested `.svelte-kit/.svelte-check`, move pre-existing caches into a private transaction, execute against a clean baseline, discard only attempt-generated cache bytes, then restore and digest-check the originals automatically. Before gate execution the transaction also HMAC-binds the complete ignored-artifact baseline. Each opaque gate starts behind a private permit only after its PID/start identity is HMAC-bound; pre-spawn reservations recover without ceremony, Windows Job Objects use kill-on-close, and Linux subreaper containment prevents detached descendants from surviving normal exit or controller death; unsupported gate-host platforms fail closed before WIP movement or process spawn. Crash recovery settles that exact process tree before reattaching the authenticated branch, reverting Git, discarding newly generated ignored artifacts, and reconciling the same cache transaction. Every existing worktree/private parent is `lstat`-walked and physically contained before directory creation and again before rename, including conflicting tracked outputs and junctions; all other changed pre-existing ignored artifacts remain fail-closed.
+- Empty attempt-generated cache parents are pruned so advisory validation leaves neither worktree state nor visual log residue. On any gate failure or controller death, the HMAC transaction retains the exact rollback HEAD; publication also retains its effective target. Recovery authenticates/aborts the matching rebase and reverts publication Git before restoring ignored WIP, preventing `reset --hard` from deleting it. Legacy proof migration strips both gate evidence and cache transactions before signing, so identity-only state cannot mint either capability.
+
 ## [0.3.48] - 2026-09-03
 
 ### Changed

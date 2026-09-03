@@ -298,6 +298,32 @@ export interface PullRequestRequest {
   priorRemoteHead?: string
 }
 
+export interface GateCacheTransactionEntry {
+  path: string
+  quarantineRelative: string
+  generatedQuarantineRelative?: string
+  generatedSourcePath?: string
+  digest: string
+}
+
+export interface GateCacheTransaction {
+  schemaVersion: 1
+  runId: string
+  taskIndex: number
+  attempt: number
+  context: 'local' | 'publication'
+  rollbackHead?: string
+  publicationTarget?: string
+  phase: 'prepared' | 'quarantined' | 'ready'
+  ignoredBaseline?: { entries: readonly string[]; digest: string }
+  gateProcess?:
+    | { phase: 'reserved'; permitRelative: string }
+    | { phase: 'running'; pid: number; processStart: string; permitRelative: string }
+  absentPaths: string[]
+  generatedEntries: Array<{ path: string; sourcePath: string; quarantineRelative: string }>
+  entries: GateCacheTransactionEntry[]
+}
+
 export interface AuthenticatedGateEvidence {
   schemaVersion: 1
   taskIndex: number
@@ -322,6 +348,22 @@ export interface RunDependencies {
   awaitAuthenticatedLeaseSettlement?: (stateDir: string, runId: string) => Promise<void>
   /** Test seam for controller-owned npm lock materialization; production uses npm ci with scripts disabled. */
   installNpmDependencies?: (installRoot: string, cacheRoot: string, signal?: AbortSignal) => Promise<void>
+  /** Test seam for a crash after validation caches enter authenticated quarantine but before gate execution. */
+  afterGateCachesQuarantined?: () => void | Promise<void>
+  /** Test seam for a crash after an opaque gate exits but before generated-cache cleanup. */
+  afterGateCommandSettled?: () => void | Promise<void>
+  /** Test-only process-death seam after gate-process reservation and before spawn. */
+  simulateLocalCrashAfterGateProcessReserved?: boolean
+  /** Test seam after the authenticated gate bootstrap releases its shell. */
+  afterGateProcessReleased?: () => void | Promise<void>
+  /** Test-only process-death seam that leaves a live authenticated local-gate tree for recovery. */
+  simulateLocalCrashWithLiveGate?: boolean
+  /** Test-only process-death seam that bypasses in-process local-gate rollback after the gate exits. */
+  simulateLocalCrashAfterGate?: boolean
+  /** Test-only process-death seam that bypasses in-process publication rollback after the gate exits. */
+  simulatePublicationCrashAfterGate?: boolean
+  /** Test-only transient failure inside publication crash rollback. */
+  simulatePublicationCrashRollbackFailure?: boolean
   /** Test seam for a crash after authenticated gate evidence is persisted but before controller adoption. */
   afterGateEvidencePersisted?: (receiptPath: string) => void | Promise<void>
   signal?: AbortSignal

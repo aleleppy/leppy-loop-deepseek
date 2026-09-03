@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
-import { runFileTree, runOpaqueShell, terminateProcessTreeAndWait } from '../src/process.js'
+import { assertOpaqueGateContainmentPlatform, runFileTree, runOpaqueShell, terminateProcessTreeAndWait } from '../src/process.js'
 
 describe('opaque gate process cancellation', () => {
+  it('fails closed before gate execution on platforms without proven descendant containment', () => {
+    expect(() => assertOpaqueGateContainmentPlatform('darwin')).toThrow('containment is unavailable on darwin')
+    expect(() => assertOpaqueGateContainmentPlatform('freebsd')).toThrow('containment is unavailable on freebsd')
+    expect(() => assertOpaqueGateContainmentPlatform('win32')).not.toThrow()
+    expect(() => assertOpaqueGateContainmentPlatform('linux')).not.toThrow()
+  })
+
   it('rejects a pre-aborted signal before spawning the shell', async () => {
     const control = new AbortController()
     control.abort(new Error('gate canceled'))

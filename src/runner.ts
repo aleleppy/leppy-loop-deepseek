@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   assertSourceReady, assertTaskCommit, branch as gitBranch, commitControllerChange,
@@ -8,10 +8,10 @@ import {
   status as gitStatus, summarizeDiff, writeChecklistAndAmend,
 } from './git.js'
 import { lintChecklist, markTaskDone, markTaskOpen, parseChecklist, selectTask } from './checklist.js'
-import { appendEvent, acquireLock, atomicWriteJson, createLeaseKey, inspectProcessIdentity, statePath, verifyLease } from './state.js'
+import { appendEvent, acquireLock, atomicWriteJson, createLeaseKey, inspectProcessIdentity, requireFoundProcessIdentity, statePath, verifyLease } from './state.js'
 import type { ProcessIdentityInspection, SignedLease } from './state.js'
 import { fingerprint, redact, scrubEnvironment } from './security.js'
-import { runFile, runOpaqueShell } from './process.js'
+import { assertOpaqueGateContainmentPlatform, OpaqueShellOrphanedError, runFile, runOpaqueShell, terminateProcessTreeAndWait } from './process.js'
 import { physicalRelative } from './path.js'
 import { createEmbeddedRunStateProof, ensureRunStateProofRequired, inspectRunStateProof, type EmbeddedRunStateProof } from './run-state-proof.js'
 import { abortInterruptedPublicationRebase, isAuthenticatedPublicationRebase } from './publish.js'
@@ -24,6 +24,7 @@ import {
   inspectWorktreeDependencies, provisionWorktreeDependencies,
 } from './worktree-dependencies.js'
 import { windowsQuotedExecutableFailure } from './windows-command.js'
+import { containWindowsGateProcess, settleWindowsGateJob } from './windows-job.js'
 import {
   quarantineWorkerNpmCache, recordWorkerNpmCacheBaseline, workerNpmCacheRecovery, workerNpmCacheTransactionPresent,
 } from './worker-artifacts.js'
@@ -33,9 +34,12 @@ import {
 } from './ignored-artifacts.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import type {
-  ActiveTaskAttempt, AuthenticatedGateEvidence, ChecklistTask, IgnoredBaselineBridgeAdmission, LeppyLoopOptions, LifecycleAuthority, ModelCapability, PendingTaskValidation, RunDependencies, RunEvent,
+  ActiveTaskAttempt, AuthenticatedGateEvidence, ChecklistTask, GateCacheTransaction, IgnoredBaselineBridgeAdmission, LeppyLoopOptions, LifecycleAuthority, ModelCapability, PendingTaskValidation, RunDependencies, RunEvent,
   PublicationConflict, RunEventType, RunProgress, RunResult, WorkerOutcome, WorkerRequest,
 } from './types.js'
+
+class SimulatedLocalGateControllerCrash extends Error {}
+class SimulatedPublicationControllerCrash extends Error {}
 
 const DEFAULTS = {
   maxIterations: 64,
@@ -85,6 +89,7 @@ interface RunState {
   dependencyBridgeActive?: boolean
   windowsArgvBridgeActive?: boolean
   ignoredBaselineBridge?: IgnoredBaselineBridgeAdmission
+  gateCacheTransaction?: GateCacheTransaction
   gateEvidence?: AuthenticatedGateEvidence
   updatedAt: string
 }
@@ -536,6 +541,403 @@ function writeState(path: string, state: RunState): void {
   if (!existsSync(requiredPath)) ensureRunStateProofRequired(stateDir, state.runId, key)
 }
 
+const GATE_VALIDATION_CACHE_PATHS = ['.svelte-check', '.svelte-kit/.svelte-check'] as const
+
+function gateCacheTreeDigest(root: string): string {
+  const records: string[] = []
+  const queue: Array<{ absolute: string; relative: string }> = [{ absolute: root, relative: '' }]
+  let files = 0
+  let bytes = 0
+  while (queue.length > 0) {
+    const current = queue.pop()!
+    const metadata = lstatSync(current.absolute)
+    if (metadata.isSymbolicLink()) {
+      records.push(`${current.relative}\0link\0${readlinkSync(current.absolute)}`)
+      continue
+    }
+    if (metadata.isDirectory()) {
+      records.push(`${current.relative}\0directory`)
+      const children = readdirSync(current.absolute).sort().reverse()
+      for (const child of children) queue.push({ absolute: join(current.absolute, child), relative: current.relative ? `${current.relative}/${child}` : child })
+      continue
+    }
+    if (!metadata.isFile()) throw new Error(`validation cache contains an unsupported filesystem entry: ${current.relative || '.'}`)
+    files += 1
+    bytes += metadata.size
+    if (files > 100_000 || bytes > 512 * 1024 * 1024) throw new Error('validation cache exceeds quarantine limits')
+    const content = readFileSync(current.absolute)
+    const after = lstatSync(current.absolute)
+    if (metadata.dev !== after.dev || metadata.ino !== after.ino || metadata.size !== after.size || metadata.mtimeMs !== after.mtimeMs) {
+      throw new Error(`validation cache changed while being authenticated: ${current.relative || '.'}`)
+    }
+    records.push(`${current.relative}\0file\0${metadata.mode}\0${createHash('sha256').update(content).digest('hex')}`)
+  }
+  return digest(records.join('\n'))
+}
+
+function pruneEmptyCacheParents(worktree: string, cache: string): void {
+  let parent = dirname(cache)
+  while (parent !== resolve(worktree) && inside(worktree, parent)) {
+    try {
+      rmdirSync(parent)
+      parent = dirname(parent)
+    } catch {
+      break
+    }
+  }
+}
+
+async function assertUntrackedGateCache(worktree: string, path: string, signal?: AbortSignal): Promise<void> {
+  const tracked = await runFile('git', ['ls-files', '-z', '--', path], { cwd: worktree, signal })
+  if (tracked.stdout.split('\0').some(Boolean)) throw new Error(`validation cache contains tracked content: ${path}`)
+  if (physicalRelative(worktree, join(worktree, path))?.replaceAll('\\', '/') !== path) {
+    throw new Error(`validation cache escapes the worktree: ${path}`)
+  }
+}
+
+function assertSafeDirectoryAncestors(root: string, target: string, label: string): void {
+  const relativeTarget = relative(root, target)
+  if (relativeTarget === '' || relativeTarget === '.') return
+  if (relativeTarget === '..' || relativeTarget.startsWith(`..${sep}`) || isAbsolute(relativeTarget)) throw new Error(`${label} escapes its root`)
+  let current = root
+  const traversed: string[] = []
+  for (const part of relativeTarget.split(sep)) {
+    current = join(current, part)
+    traversed.push(part)
+    let metadata
+    try {
+      metadata = lstatSync(current)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw error
+    }
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()
+      || physicalRelative(root, current)?.replaceAll('\\', '/') !== traversed.join('/')) {
+      throw new Error(`${label} escapes its root`)
+    }
+  }
+}
+
+async function restoreAuthenticatedGateGitState(
+  worktree: string, branch: string, rollbackHead: string, signal: AbortSignal, label: string,
+): Promise<void> {
+  await runFile('git', ['checkout', '--force', branch], { cwd: worktree, signal, timeoutMs: 30_000 })
+  await runFile('git', ['reset', '--hard', rollbackHead], { cwd: worktree, signal, timeoutMs: 30_000 })
+  if (await gitBranch(worktree) !== branch || await head(worktree) !== rollbackHead
+    || (await gitStatus(worktree)).trim() !== '') throw new Error(`${label} did not restore the authenticated Git state`)
+}
+
+async function quarantineGateValidationCaches(
+  statePathname: string, stateDir: string, state: RunState, task: ChecklistTask, signal?: AbortSignal,
+  context: GateCacheTransaction['context'] = 'local', rollbackHead?: string, publicationTarget?: string,
+  afterQuarantined?: () => void | Promise<void>,
+): Promise<GateCacheTransaction> {
+  assertOpaqueGateContainmentPlatform()
+  if (state.gateCacheTransaction) throw new Error('validation-cache quarantine is already active')
+  const entries: GateCacheTransaction['entries'] = []
+  const absentPaths: string[] = []
+  for (const [index, path] of GATE_VALIDATION_CACHE_PATHS.entries()) {
+    const source = join(state.worktree, path)
+    if (!existsSync(source)) {
+      if (movableGateCacheSource(state.worktree, path)) throw new Error(`validation cache has an unsafe pre-existing ancestor: ${path}`)
+      absentPaths.push(path)
+      continue
+    }
+    await assertUntrackedGateCache(state.worktree, path, signal)
+    entries.push({
+      path,
+      quarantineRelative: `gate-cache-quarantine/${task.index}-${state.attempt}/${index}`,
+      digest: gateCacheTreeDigest(source),
+    })
+  }
+  const rollbackIdentity = typeof rollbackHead === 'string' && /^[0-9a-f]{40,64}$/u.test(rollbackHead)
+  const publicationIdentity = typeof publicationTarget === 'string' && publicationTarget.length > 0
+    && publicationTarget.length <= 512 && !publicationTarget.includes('\0')
+  if (!rollbackIdentity || ((context === 'publication') !== publicationIdentity)) {
+    throw new Error('validation-cache quarantine rollback identity is invalid')
+  }
+  const transaction: GateCacheTransaction = {
+    schemaVersion: 1, runId: state.runId, taskIndex: task.index, attempt: state.attempt, context,
+    ...(rollbackHead ? { rollbackHead } : {}), ...(publicationTarget ? { publicationTarget } : {}),
+    phase: 'prepared', absentPaths, generatedEntries: [], entries,
+  }
+  state.gateCacheTransaction = transaction
+  writeState(statePathname, state)
+  try {
+    for (const entry of entries) {
+      const source = join(state.worktree, entry.path)
+      const destination = join(stateDir, entry.quarantineRelative)
+      if (existsSync(destination)) throw new Error(`validation-cache quarantine destination already exists: ${entry.quarantineRelative}`)
+      assertSafeDirectoryAncestors(stateDir, dirname(destination), 'validation-cache quarantine parent')
+      mkdirSync(dirname(destination), { recursive: true })
+      const destinationParentRelative = relative(stateDir, dirname(destination)).replaceAll('\\', '/')
+      if (physicalRelative(stateDir, dirname(destination))?.replaceAll('\\', '/') !== destinationParentRelative) {
+        throw new Error('validation-cache quarantine parent escapes private state')
+      }
+      if (statSync(dirname(source)).dev !== statSync(dirname(destination)).dev) throw new Error('validation-cache quarantine crosses filesystems')
+      renameSync(source, destination)
+      pruneEmptyCacheParents(state.worktree, source)
+    }
+    transaction.phase = 'quarantined'
+    writeState(statePathname, state)
+    transaction.ignoredBaseline = await ignoredPathSnapshot(state.worktree, signal)
+    transaction.phase = 'ready'
+    writeState(statePathname, state)
+  } catch (error) {
+    await restoreGateValidationCaches(statePathname, stateDir, state)
+    throw error
+  }
+  await afterQuarantined?.()
+  return transaction
+}
+
+async function runAuthenticatedGateShell(
+  command: string, statePathname: string, stateDir: string, state: RunState, transaction: GateCacheTransaction,
+  signal: AbortSignal, dependencies: RunDependencies, orphanAfterRelease = false,
+): Promise<Awaited<ReturnType<typeof runOpaqueShell>>> {
+  const permitRelative = `gate-process-permits/${transaction.taskIndex}-${transaction.attempt}-${randomUUID()}.permit`
+  const permitPath = join(stateDir, permitRelative)
+  assertSafeDirectoryAncestors(stateDir, dirname(permitPath), 'gate process permit parent')
+  mkdirSync(dirname(permitPath), { recursive: true })
+  const permitParentRelative = relative(stateDir, dirname(permitPath)).replaceAll('\\', '/')
+  if (physicalRelative(stateDir, dirname(permitPath))?.replaceAll('\\', '/') !== permitParentRelative) {
+    throw new Error('gate process permit parent escapes private state')
+  }
+  if (existsSync(permitPath)) throw new Error('gate process permit already exists')
+  transaction.gateProcess = { phase: 'reserved', permitRelative }
+  writeState(statePathname, state)
+  if (dependencies.simulateLocalCrashAfterGateProcessReserved) {
+    throw new OpaqueShellOrphanedError('simulated controller death after gate process reservation')
+  }
+  let bootstrapPid: number | undefined
+  let windowsContainmentCreated = false
+  const settleContainment = async (): Promise<void> => {
+    if (bootstrapPid === undefined) return
+    if (process.platform === 'win32') {
+      if (!windowsContainmentCreated) return
+      if (!settleWindowsGateJob(bootstrapPid)) throw new Error('authenticated gate process lost its Windows Job containment')
+    } else {
+      await terminateProcessTreeAndWait(bootstrapPid, () => {
+        try { process.kill(bootstrapPid!, 'SIGTERM') } catch { /* process group already settled */ }
+      })
+    }
+  }
+  try {
+    const result = await runOpaqueShell(command, state.worktree, signal, scrubEnvironment(process.env), {
+      permitPath,
+      onSpawn: async pid => {
+        bootstrapPid = pid
+        containWindowsGateProcess(pid)
+        windowsContainmentCreated = process.platform === 'win32'
+        const processStart = requireFoundProcessIdentity(
+          await inspectProcessIdentity(pid), 'cannot authenticate gate process identity',
+        )
+        transaction.gateProcess = { phase: 'running', pid, processStart, permitRelative }
+        writeState(statePathname, state)
+      },
+      ...(dependencies.afterGateProcessReleased ? { afterRelease: dependencies.afterGateProcessReleased } : {}),
+      orphanAfterRelease,
+    })
+    await settleContainment()
+    delete transaction.gateProcess
+    rmSync(permitPath, { force: true })
+    writeState(statePathname, state)
+    return result
+  } catch (error) {
+    if (error instanceof OpaqueShellOrphanedError) throw error
+    await settleContainment()
+    delete transaction.gateProcess
+    rmSync(permitPath, { force: true })
+    writeState(statePathname, state)
+    throw error
+  }
+}
+
+async function settleAuthenticatedGateProcess(
+  statePathname: string, stateDir: string, state: RunState,
+): Promise<void> {
+  const transaction = state.gateCacheTransaction
+  const gateProcess = transaction?.gateProcess
+  if (!transaction || !gateProcess) return
+  if (!gateProcess.permitRelative.startsWith('gate-process-permits/') || gateProcess.permitRelative.includes('..')) {
+    throw new Error('authenticated gate process permit identity is invalid')
+  }
+  if (gateProcess.phase === 'running') {
+    if (!Number.isSafeInteger(gateProcess.pid) || gateProcess.pid <= 0 || gateProcess.processStart.length < 1) {
+      throw new Error('authenticated gate process identity is invalid')
+    }
+    settleWindowsGateJob(gateProcess.pid)
+    let inspection = await inspectProcessIdentity(gateProcess.pid)
+    if (inspection.status === 'error') throw new Error(`gate process identity inspection failed: ${inspection.detail}`)
+    if (inspection.status === 'found' && inspection.identity === gateProcess.processStart) {
+      await terminateProcessTreeAndWait(gateProcess.pid, () => {
+        try { process.kill(gateProcess.pid, 'SIGTERM') } catch { /* process already settled */ }
+      })
+      for (let check = 0; check < 20; check += 1) {
+        inspection = await inspectProcessIdentity(gateProcess.pid)
+        if (inspection.status === 'error') throw new Error(`gate process settlement inspection failed: ${inspection.detail}`)
+        if (inspection.status === 'absent' || inspection.identity !== gateProcess.processStart) break
+        await new Promise(resolvePromise => setTimeout(resolvePromise, 100))
+      }
+      if (inspection.status === 'found' && inspection.identity === gateProcess.processStart) {
+        throw new Error('authenticated gate process remained live after tree termination')
+      }
+    }
+  } else if (gateProcess.phase !== 'reserved') {
+    throw new Error('authenticated gate process phase is invalid')
+  }
+  const permit = join(stateDir, gateProcess.permitRelative)
+  if (!inside(stateDir, permit)) throw new Error('gate process permit escapes private state')
+  assertSafeDirectoryAncestors(stateDir, dirname(permit), 'gate process permit recovery parent')
+  const permitParentRelative = relative(stateDir, dirname(permit)).replaceAll('\\', '/')
+  if (physicalRelative(stateDir, dirname(permit))?.replaceAll('\\', '/') !== permitParentRelative) {
+    throw new Error('gate process permit recovery parent escapes private state')
+  }
+  rmSync(permit, { force: true })
+  delete transaction.gateProcess
+  writeState(statePathname, state)
+}
+
+async function discardAttemptGeneratedGateCaches(worktree: string, signal?: AbortSignal): Promise<string[]> {
+  const removed: string[] = []
+  for (const path of GATE_VALIDATION_CACHE_PATHS) {
+    const cache = join(worktree, path)
+    if (!existsSync(cache)) continue
+    await assertUntrackedGateCache(worktree, path, signal)
+    rmSync(cache, { recursive: true, force: true })
+    pruneEmptyCacheParents(worktree, cache)
+    removed.push(path)
+  }
+  return removed
+}
+
+function movableGateCacheSource(worktree: string, path: string): { absolute: string; relative: string } | undefined {
+  const parts = path.split('/')
+  let current = worktree
+  for (const [index, part] of parts.entries()) {
+    current = join(current, part)
+    let metadata
+    try {
+      metadata = lstatSync(current)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw error
+    }
+    if (metadata.isSymbolicLink()) return { absolute: current, relative: parts.slice(0, index + 1).join('/') }
+    if (index < parts.length - 1 && !metadata.isDirectory()) return { absolute: current, relative: parts.slice(0, index + 1).join('/') }
+  }
+  return { absolute: join(worktree, path), relative: path }
+}
+
+async function restoreGateValidationCaches(
+  statePathname: string, stateDir: string, state: RunState,
+): Promise<string[]> {
+  const transaction = state.gateCacheTransaction
+  if (!transaction) return []
+  const baselinePaths = [...transaction.entries.map(entry => entry.path), ...(transaction.absentPaths ?? [])].sort()
+  const expectedPaths = [...GATE_VALIDATION_CACHE_PATHS].sort()
+  const rollbackIdentity = typeof transaction.rollbackHead === 'string' && /^[0-9a-f]{40,64}$/u.test(transaction.rollbackHead)
+  const publicationIdentity = typeof transaction.publicationTarget === 'string' && transaction.publicationTarget.length > 0
+    && transaction.publicationTarget.length <= 512 && !transaction.publicationTarget.includes('\0')
+  const validGeneratedEntries = Array.isArray(transaction.generatedEntries) && transaction.generatedEntries.every(entry =>
+    GATE_VALIDATION_CACHE_PATHS.includes(entry.path as typeof GATE_VALIDATION_CACHE_PATHS[number])
+      && (entry.sourcePath === entry.path || entry.path.startsWith(`${entry.sourcePath}/`))
+      && entry.quarantineRelative.startsWith(`gate-cache-quarantine/${transaction.taskIndex}-${transaction.attempt}/generated-`))
+  const validGateProcess = transaction.gateProcess === undefined
+    || (transaction.gateProcess.permitRelative.startsWith('gate-process-permits/')
+      && !transaction.gateProcess.permitRelative.includes('..')
+      && (transaction.gateProcess.phase === 'reserved'
+        || (transaction.gateProcess.phase === 'running' && Number.isSafeInteger(transaction.gateProcess.pid)
+          && transaction.gateProcess.pid > 0 && transaction.gateProcess.processStart.length > 0)))
+  const validIgnoredBaseline = transaction.phase === 'ready'
+    ? transaction.ignoredBaseline !== undefined && Array.isArray(transaction.ignoredBaseline.entries)
+      && /^[0-9a-f]{64}$/u.test(transaction.ignoredBaseline.digest)
+      && digest(JSON.stringify(transaction.ignoredBaseline.entries)) === transaction.ignoredBaseline.digest
+    : (transaction.phase === 'prepared' || transaction.phase === 'quarantined') && transaction.ignoredBaseline === undefined
+  if (transaction.schemaVersion !== 1 || transaction.runId !== state.runId || transaction.attempt !== state.attempt
+    || !Number.isSafeInteger(transaction.taskIndex) || !Array.isArray(transaction.entries)
+    || !Array.isArray(transaction.absentPaths) || !validGeneratedEntries || !validIgnoredBaseline || !validGateProcess
+    || JSON.stringify(baselinePaths) !== JSON.stringify(expectedPaths)
+    || !rollbackIdentity || !['local', 'publication'].includes(transaction.context)
+    || ((transaction.context === 'publication') !== publicationIdentity)) {
+    throw new Error('validation-cache quarantine identity is invalid')
+  }
+  const restored: string[] = []
+  for (const [index, entry] of transaction.entries.entries()) {
+    if (!GATE_VALIDATION_CACHE_PATHS.includes(entry.path as typeof GATE_VALIDATION_CACHE_PATHS[number])
+      || !entry.quarantineRelative.startsWith(`gate-cache-quarantine/${transaction.taskIndex}-${transaction.attempt}/`)) {
+      throw new Error('validation-cache quarantine path is invalid')
+    }
+    const source = join(state.worktree, entry.path)
+    const destination = join(stateDir, entry.quarantineRelative)
+    const movable = movableGateCacheSource(state.worktree, entry.path)
+    const destinationExists = existsSync(destination)
+    if (movable && destinationExists) {
+      let generatedRelative = entry.generatedQuarantineRelative
+      let generatedDestination = generatedRelative ? join(stateDir, generatedRelative) : undefined
+      if (!generatedDestination || existsSync(generatedDestination)) {
+        generatedRelative = `gate-cache-quarantine/${transaction.taskIndex}-${transaction.attempt}/generated-${index}-${randomUUID()}`
+        generatedDestination = join(stateDir, generatedRelative)
+      }
+      const authenticatedGeneratedRelative = generatedRelative!
+      const authenticatedGeneratedDestination = generatedDestination!
+      entry.generatedQuarantineRelative = authenticatedGeneratedRelative
+      entry.generatedSourcePath = movable.relative
+      writeState(statePathname, state)
+      assertSafeDirectoryAncestors(stateDir, dirname(authenticatedGeneratedDestination), 'generated validation-cache quarantine parent')
+      mkdirSync(dirname(authenticatedGeneratedDestination), { recursive: true })
+      const generatedParentRelative = relative(stateDir, dirname(authenticatedGeneratedDestination)).replaceAll('\\', '/')
+      if (physicalRelative(stateDir, dirname(authenticatedGeneratedDestination))?.replaceAll('\\', '/') !== generatedParentRelative) {
+        throw new Error('generated validation-cache quarantine parent escapes private state')
+      }
+      if (statSync(dirname(movable.absolute)).dev !== statSync(dirname(authenticatedGeneratedDestination)).dev) throw new Error('generated validation-cache quarantine crosses filesystems')
+      renameSync(movable.absolute, authenticatedGeneratedDestination)
+      pruneEmptyCacheParents(state.worktree, movable.absolute)
+    } else if (!movable && !destinationExists) {
+      throw new Error(`validation-cache quarantine lost both copies: ${entry.path}`)
+    } else if (movable && !destinationExists
+      && (movable.relative !== entry.path || physicalRelative(state.worktree, source)?.replaceAll('\\', '/') !== entry.path)) {
+      throw new Error(`validation-cache restored through an unsafe path: ${entry.path}`)
+    }
+    if (existsSync(destination)) {
+      assertSafeDirectoryAncestors(state.worktree, dirname(source), `validation-cache restore parent for ${entry.path}`)
+      mkdirSync(dirname(source), { recursive: true })
+      const parentRelative = relative(state.worktree, dirname(source)).replaceAll('\\', '/')
+      if (physicalRelative(state.worktree, dirname(source))?.replaceAll('\\', '/') !== parentRelative) {
+        throw new Error(`validation-cache restore parent escapes the worktree: ${entry.path}`)
+      }
+      if (physicalRelative(stateDir, destination)?.replaceAll('\\', '/') !== entry.quarantineRelative) {
+        throw new Error(`validation-cache quarantine source escapes private state: ${entry.path}`)
+      }
+      if (statSync(dirname(source)).dev !== statSync(dirname(destination)).dev) throw new Error('validation-cache restore crosses filesystems')
+      renameSync(destination, source)
+    }
+    if (physicalRelative(state.worktree, source)?.replaceAll('\\', '/') !== entry.path
+      || gateCacheTreeDigest(source) !== entry.digest) throw new Error(`validation-cache restore digest mismatch: ${entry.path}`)
+    restored.push(entry.path)
+  }
+  for (const [index, path] of transaction.absentPaths.entries()) {
+    const movable = movableGateCacheSource(state.worktree, path)
+    if (!movable) continue
+    const generatedRelative = `gate-cache-quarantine/${transaction.taskIndex}-${transaction.attempt}/generated-absent-${index}-${randomUUID()}`
+    const generatedDestination = join(stateDir, generatedRelative)
+    transaction.generatedEntries.push({ path, sourcePath: movable.relative, quarantineRelative: generatedRelative })
+    writeState(statePathname, state)
+    assertSafeDirectoryAncestors(stateDir, dirname(generatedDestination), 'generated absent-cache quarantine parent')
+    mkdirSync(dirname(generatedDestination), { recursive: true })
+    const generatedParentRelative = relative(stateDir, dirname(generatedDestination)).replaceAll('\\', '/')
+    if (physicalRelative(stateDir, dirname(generatedDestination))?.replaceAll('\\', '/') !== generatedParentRelative) {
+      throw new Error('generated absent-cache quarantine parent escapes private state')
+    }
+    if (statSync(dirname(movable.absolute)).dev !== statSync(dirname(generatedDestination)).dev) throw new Error('generated absent-cache quarantine crosses filesystems')
+    renameSync(movable.absolute, generatedDestination)
+    pruneEmptyCacheParents(state.worktree, movable.absolute)
+  }
+  delete state.gateCacheTransaction
+  writeState(statePathname, state)
+  return restored
+}
+
 interface LeaseSettlementOperations {
   inspect?: (pid: number) => Promise<ProcessIdentityInspection>
   wait?: () => Promise<void>
@@ -601,12 +1003,16 @@ async function recoverState(base: string, repoRoot: string, checklistRelative: s
   if (!match) return undefined
   if (!existsSync(match.state.worktree)) throw new Error('authenticated run worktree no longer exists')
   const attachedBranch = await gitBranch(match.state.worktree)
-  if (attachedBranch !== match.state.branch && !await isAuthenticatedPublicationRebase({
+  const recoverySyncBranch = match.state.gateCacheTransaction?.context === 'publication'
+    && typeof match.state.gateCacheTransaction.publicationTarget === 'string'
+    ? match.state.gateCacheTransaction.publicationTarget
+    : match.state.syncBranch
+  if (attachedBranch !== match.state.branch && !match.state.gateCacheTransaction && !await isAuthenticatedPublicationRebase({
     runId: match.state.runId,
     repoRoot: match.state.repoRoot,
     worktree: match.state.worktree,
     branch: match.state.branch,
-    syncBranch: match.state.syncBranch,
+    syncBranch: recoverySyncBranch,
   }, new AbortController().signal)) throw new Error('authenticated run worktree or publication rebase no longer matches')
   return match
 }
@@ -717,6 +1123,25 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       applyLifecycleAuthority(state, options.lifecycleAuthority)
       if (dependencies.awaitAuthenticatedLeaseSettlement) await dependencies.awaitAuthenticatedLeaseSettlement(stateDir, state.runId)
       else await awaitAuthenticatedLeaseSettlement(stateDir, state.runId)
+      if (state.gateCacheTransaction) {
+        await settleAuthenticatedGateProcess(join(stateDir, 'run.json'), stateDir, state)
+        const cacheTransaction = state.gateCacheTransaction
+        if (cacheTransaction.context === 'publication') {
+          if (dependencies.simulatePublicationCrashRollbackFailure) throw new Error('simulated publication crash rollback failure')
+          await abortInterruptedPublicationRebase({
+            runId: state.runId, repoRoot: state.repoRoot, worktree: state.worktree, branch: state.branch, syncBranch: cacheTransaction.publicationTarget!,
+          }, signal)
+        }
+        await restoreAuthenticatedGateGitState(state.worktree, state.branch, cacheTransaction.rollbackHead!, signal, `${cacheTransaction.context} gate crash rollback`)
+        const restoredIgnored = cacheTransaction.phase === 'ready'
+          ? await discardGateIgnoredSideEffects(state.worktree, cacheTransaction.ignoredBaseline!, signal)
+          : []
+        const restoredCaches = await restoreGateValidationCaches(join(stateDir, 'run.json'), stateDir, state)
+        appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', {
+          workerArtifact: 'gate-validation-cache-quarantine', paths: restoredCaches, ignoredPaths: restoredIgnored, crashRecovery: true,
+          context: cacheTransaction.context,
+        }))
+      }
       const previousStatus = state.status
       state.status = 'running'
       delete state.lastError
@@ -1038,10 +1463,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   }
   const restorePrePublicationHead = async (): Promise<void> => {
     if (!publicationOriginalHead) throw new Error('publication rollback lacks the authenticated original HEAD')
-    await runFile('git', ['reset', '--hard', publicationOriginalHead], { cwd: state.worktree, timeoutMs: 30_000 })
-    if (await gitBranch(state.worktree) !== state.branch) throw new Error('publication rollback did not restore the authenticated branch')
-    if (await head(state.worktree) !== publicationOriginalHead) throw new Error('publication rollback did not restore the authenticated HEAD')
-    if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('publication rollback did not restore a clean worktree')
+    await restoreAuthenticatedGateGitState(state.worktree, state.branch, publicationOriginalHead, signal, 'publication rollback')
   }
   const validatePublicationBase = async (targetCommit: string): Promise<{ receipt: string; validatedHead: string }> => {
     if (!publicationChecklistDigest || !publicationOriginalHead || !publicationGate) throw new Error('publication requires a frozen completed checklist and final gate')
@@ -1053,13 +1475,18 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       const { task: gate, command } = publicationGate
       state.attempt += 1
       const key = `${gate.index}:${fingerprint(command)}`
+      const statePathname = join(stateDir, 'run.json')
+      const cacheTransaction = await quarantineGateValidationCaches(statePathname, stateDir, state, gate, signal, 'publication', publicationOriginalHead, options.publicationTarget ?? state.syncBranch, dependencies.afterGateCachesQuarantined)
       state.gateAttempts[key] = (state.gateAttempts[key] ?? 0) + 1
-      writeState(join(stateDir, 'run.json'), state)
+      writeState(statePathname, state)
       appendEvent(eventsPath, event(state.runId, 'gate-start', 'publish', { commandFingerprint: fingerprint(command), publicationValidation: true, targetCommit }, gate, state.attempt))
-      const publicationIgnoredBaseline = await ignoredPathSnapshot(state.worktree, signal)
-      const result = await runOpaqueShell(command, state.worktree, signal, scrubEnvironment(process.env))
-      const publicationIgnoredCreated = await discardGateIgnoredSideEffects(state.worktree, publicationIgnoredBaseline, signal)
-      const validationReceipt = createHash('sha256').update(JSON.stringify({
+      const publicationIgnoredBaseline = cacheTransaction.ignoredBaseline!
+        const result = await runAuthenticatedGateShell(command, statePathname, stateDir, state, cacheTransaction, signal, dependencies)
+        await dependencies.afterGateCommandSettled?.()
+        if (dependencies.simulatePublicationCrashAfterGate) throw new SimulatedPublicationControllerCrash('simulated publication controller crash')
+        await discardAttemptGeneratedGateCaches(state.worktree, signal)
+        const publicationIgnoredCreated = await discardGateIgnoredSideEffects(state.worktree, publicationIgnoredBaseline, signal)
+        const validationReceipt = createHash('sha256').update(JSON.stringify({
         runId: state.runId,
         head: currentHead,
         targetCommit,
@@ -1075,11 +1502,12 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       if (await head(state.worktree) !== currentHead) throw new Error('post-rebase publication gate changed the validated HEAD')
       if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('post-rebase publication gate left a dirty worktree')
       if (digest(readFileSync(join(state.worktree, checklistRelative), 'utf8')) !== publicationChecklistDigest) throw new Error('post-rebase publication gate altered the controlling checklist')
+      if (cacheTransaction) await restoreGateValidationCaches(statePathname, stateDir, state)
       publicationValidationReceipt = validationReceipt
       state.publicationTargetCommit = targetCommit
       writeState(join(stateDir, 'run.json'), state)
       appendEvent(eventsPath, event(state.runId, 'gate-end', 'publish', { exitCode: 0, publicationValidation: true, targetCommit }, gate, state.attempt))
-    return { receipt: validationReceipt, validatedHead: currentHead }
+      return { receipt: validationReceipt, validatedHead: currentHead }
   }
   const reopenRepairClosure = async (): Promise<void> => {
     if (repairCyclesRemaining < 1) throw new Error('gate repair cycle limit exhausted')
@@ -1240,10 +1668,25 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             writeState(join(stateDir, 'run.json'), state)
             appendEvent(eventsPath, event(state.runId, 'publish-done', 'publish', { url: state.pullRequestUrl }))
           } catch (error) {
+            if (error instanceof SimulatedPublicationControllerCrash) throw error
             let failure = error instanceof Error ? error.message : String(error)
+            let publicationRollbackSucceeded = false
             if (publicationOriginalHead) {
-              try { await restorePrePublicationHead() }
-              catch (rollbackError) { failure = `${failure}; publication rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}` }
+              try {
+                await restorePrePublicationHead()
+                publicationRollbackSucceeded = true
+              } catch (rollbackError) {
+                failure = `${failure}; publication rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+              }
+            }
+            if (state.gateCacheTransaction && publicationRollbackSucceeded) {
+              try {
+                if (state.gateCacheTransaction.phase === 'ready') {
+                  await discardGateIgnoredSideEffects(state.worktree, state.gateCacheTransaction.ignoredBaseline!, signal)
+                }
+                await restoreGateValidationCaches(join(stateDir, 'run.json'), stateDir, state)
+              }
+              catch (cacheRestoreError) { failure = `${failure}; validation-cache restore failed: ${cacheRestoreError instanceof Error ? cacheRestoreError.message : String(cacheRestoreError)}` }
             }
             const message = redact(failure).slice(-16 * 1024)
             state.status = 'stalled'
@@ -1419,26 +1862,53 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           }
           if (recovered) repairCyclesRemaining = 0
         }
-        state.gateAttempts[key] = priorGateAttempts + 1
         retryGateAuthorized = false
-        writeState(join(stateDir, 'run.json'), state)
         const targetHead = await head(state.worktree)
         const checklistDigest = digest(parsed.source)
-        const ignoredBaseline = await ignoredPathSnapshot(state.worktree, signal)
-        appendEvent(eventsPath, event(state.runId, 'gate-start', 'gate', { commandFingerprint: fingerprint(command), ...(priorGateAttempts > 0 ? { retry: true } : {}) }, task, state.attempt))
-        const gate = await runOpaqueShell(command, state.worktree, signal, scrubEnvironment(process.env))
-        if (signal.aborted) throw abortReason(signal)
-        if (await gitBranch(state.worktree) !== state.branch) throw new Error('local gate changed the authenticated run branch')
-        const restored = await discardOutOfScopeWorkerChanges(state.worktree, [], [checklistRelative], signal)
-        if (restored.length > 0) appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
-          workerArtifact: 'local-gate-side-effects', paths: restored, automatic: true,
-        }, task, state.attempt))
-        const restoredIgnored = await discardGateIgnoredSideEffects(state.worktree, ignoredBaseline, signal)
-        if (restoredIgnored.length > 0) appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
-          workerArtifact: 'local-gate-ignored-side-effects', paths: restoredIgnored, automatic: true,
-        }, task, state.attempt))
-        if (await head(state.worktree) !== targetHead) throw new Error('local gate created or changed commits')
-        if (digest(readFileSync(checklistPath, 'utf8')) !== checklistDigest) throw new Error('local gate changed the controlling checklist')
+        const statePathname = join(stateDir, 'run.json')
+        const cacheTransaction = await quarantineGateValidationCaches(statePathname, stateDir, state, task, signal, 'local', targetHead, undefined, dependencies.afterGateCachesQuarantined)
+        state.gateAttempts[key] = priorGateAttempts + 1
+        writeState(statePathname, state)
+        let gate!: Awaited<ReturnType<typeof runOpaqueShell>>
+        let simulatedProcessDeath = false
+        let gateProcessingError: unknown
+        try {
+          const ignoredBaseline = cacheTransaction.ignoredBaseline!
+          appendEvent(eventsPath, event(state.runId, 'gate-start', 'gate', { commandFingerprint: fingerprint(command), ...(priorGateAttempts > 0 ? { retry: true } : {}) }, task, state.attempt))
+          gate = await runAuthenticatedGateShell(
+            command, statePathname, stateDir, state, cacheTransaction, signal, dependencies,
+            dependencies.simulateLocalCrashWithLiveGate === true,
+          )
+          await dependencies.afterGateCommandSettled?.()
+          if (dependencies.simulateLocalCrashAfterGate) {
+            simulatedProcessDeath = true
+            throw new SimulatedLocalGateControllerCrash('simulated local gate controller crash')
+          }
+          if (signal.aborted) throw abortReason(signal)
+          if (await gitBranch(state.worktree) !== state.branch) throw new Error('local gate changed the authenticated run branch')
+          const restored = await discardOutOfScopeWorkerChanges(state.worktree, [], [checklistRelative], signal)
+          if (restored.length > 0) appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
+            workerArtifact: 'local-gate-side-effects', paths: restored, automatic: true,
+          }, task, state.attempt))
+          const generatedCaches = await discardAttemptGeneratedGateCaches(state.worktree, signal)
+            if (generatedCaches.length > 0) appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
+            workerArtifact: 'transient-validation-cache', paths: generatedCaches, automatic: true,
+          }, task, state.attempt))
+          const restoredIgnored = await discardGateIgnoredSideEffects(state.worktree, ignoredBaseline, signal)
+          if (restoredIgnored.length > 0) appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
+            workerArtifact: 'local-gate-ignored-side-effects', paths: restoredIgnored, automatic: true,
+          }, task, state.attempt))
+          if (await head(state.worktree) !== targetHead) throw new Error('local gate created or changed commits')
+          if (digest(readFileSync(checklistPath, 'utf8')) !== checklistDigest) throw new Error('local gate changed the controlling checklist')
+        } catch (error) {
+          if (error instanceof OpaqueShellOrphanedError) simulatedProcessDeath = true
+          gateProcessingError = error
+        }
+        if (simulatedProcessDeath) throw gateProcessingError
+        await restoreAuthenticatedGateGitState(state.worktree, state.branch, cacheTransaction.rollbackHead!, signal, 'local gate rollback')
+        await discardGateIgnoredSideEffects(state.worktree, cacheTransaction.ignoredBaseline!, signal)
+        await restoreGateValidationCaches(statePathname, stateDir, state)
+        if (gateProcessingError) throw gateProcessingError
         const receipt: PhaseGateReceipt = { schemaVersion: 1, runId: state.runId, taskIndex: task.index, attempt: state.attempt, commandFingerprint: fingerprint(command), exitCode: gate.exitCode, stdout: redact(gate.stdout), stderr: redact(gate.stderr), timestamp: new Date().toISOString(), targetHead, checklistDigest }
         const gateReceiptPath = join(stateDir, 'receipts', `gate-${task.index}-${state.attempt}.json`)
         mkdirSync(dirname(gateReceiptPath), { recursive: true })

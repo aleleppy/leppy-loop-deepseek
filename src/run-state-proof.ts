@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import type { ActiveTaskAttempt, AuthenticatedGateEvidence, IgnoredBaselineBridgeAdmission, PendingTaskValidation } from './types.js'
+import type { ActiveTaskAttempt, AuthenticatedGateEvidence, GateCacheTransaction, IgnoredBaselineBridgeAdmission, PendingTaskValidation } from './types.js'
 
 export interface EmbeddedRunStateProof {
   schemaVersion: 1
@@ -35,6 +35,7 @@ export interface RunStateProofInput {
   dependencyBridgeActive?: boolean
   windowsArgvBridgeActive?: boolean
   ignoredBaselineBridge?: IgnoredBaselineBridgeAdmission
+  gateCacheTransaction?: GateCacheTransaction
   gateEvidence?: AuthenticatedGateEvidence
   updatedAt: string
 }
@@ -70,7 +71,8 @@ export function runStateSecurityPayload(state: RunStateProofInput): string {
     failureStreak: state.failureStreak, activeTaskAttempt: state.activeTaskAttempt,
     pendingTaskValidation: state.pendingTaskValidation, autoRecoveryBlocked: state.autoRecoveryBlocked,
     dependencyBridgeActive: state.dependencyBridgeActive, windowsArgvBridgeActive: state.windowsArgvBridgeActive,
-    ignoredBaselineBridge: state.ignoredBaselineBridge, gateEvidence: state.gateEvidence, updatedAt: state.updatedAt,
+    ignoredBaselineBridge: state.ignoredBaselineBridge, gateCacheTransaction: state.gateCacheTransaction,
+    gateEvidence: state.gateEvidence, updatedAt: state.updatedAt,
   })
 }
 
