@@ -298,6 +298,18 @@ export interface PullRequestRequest {
   priorRemoteHead?: string
 }
 
+export interface AuthenticatedGateEvidence {
+  schemaVersion: 1
+  taskIndex: number
+  attempt: number
+  gateAttempt: number
+  commandFingerprint: string
+  receiptDigest: string
+  targetHead: string
+  checklistDigest: string
+  exitCode: number
+}
+
 export interface RunDependencies {
   worker?: WorkerAdapter
   now?: () => Date
@@ -310,5 +322,7 @@ export interface RunDependencies {
   awaitAuthenticatedLeaseSettlement?: (stateDir: string, runId: string) => Promise<void>
   /** Test seam for controller-owned npm lock materialization; production uses npm ci with scripts disabled. */
   installNpmDependencies?: (installRoot: string, cacheRoot: string, signal?: AbortSignal) => Promise<void>
+  /** Test seam for a crash after authenticated gate evidence is persisted but before controller adoption. */
+  afterGateEvidencePersisted?: (receiptPath: string) => void | Promise<void>
   signal?: AbortSignal
 }

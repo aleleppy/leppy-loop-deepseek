@@ -2,6 +2,14 @@
 
 All notable changes are documented here.
 
+## [0.3.48] - 2026-09-03
+
+### Changed
+
+- Local phase gates retain bounded AI repair, but an exhausted or unrepairable nonzero result is now committed as advisory evidence and the same controller job advances. Gate-created validation artifacts are cleaned automatically; branch changes, commits, checklist drift, unmerged state, and malformed/mismatched receipts remain hard stops.
+- Ordinary resume adopts HMAC-bound gate evidence after a controller crash without rerunning it. Older stalled runs that predate authenticated gate evidence rerun the unchanged gate exactly once with repair disabled, mint current evidence, then advance; they never restart the repair lifecycle. Explicit retry/repair options remain fail-closed capabilities when deliberately selected.
+- Publication never accepts a local advisory receipt. Its final gate is rerun against the frozen checklist and HEAD even when an exact existing PR is reconciled; nonzero results or ignored gate side effects still block completion and every remote mutation.
+
 ## [0.3.47] - 2026-09-02
 
 ### Changed

@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import {
   assertSourceReady, assertTaskCommit, branch as gitBranch, commitControllerChange,
   commitCount, commitSubject, createRunWorktree, discardUnstartedRunWorktree,
-  head, ignoredPathDigest, isConventional, resolveRepoRoot,
+  head, ignoredPathDigest, ignoredPathSnapshot, isConventional, resolveRepoRoot,
   status as gitStatus, summarizeDiff, writeChecklistAndAmend,
 } from './git.js'
 import { lintChecklist, markTaskDone, markTaskOpen, parseChecklist, selectTask } from './checklist.js'
@@ -33,7 +33,7 @@ import {
 } from './ignored-artifacts.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import type {
-  ActiveTaskAttempt, ChecklistTask, IgnoredBaselineBridgeAdmission, LeppyLoopOptions, LifecycleAuthority, ModelCapability, PendingTaskValidation, RunDependencies, RunEvent,
+  ActiveTaskAttempt, AuthenticatedGateEvidence, ChecklistTask, IgnoredBaselineBridgeAdmission, LeppyLoopOptions, LifecycleAuthority, ModelCapability, PendingTaskValidation, RunDependencies, RunEvent,
   PublicationConflict, RunEventType, RunProgress, RunResult, WorkerOutcome, WorkerRequest,
 } from './types.js'
 
@@ -85,6 +85,7 @@ interface RunState {
   dependencyBridgeActive?: boolean
   windowsArgvBridgeActive?: boolean
   ignoredBaselineBridge?: IgnoredBaselineBridgeAdmission
+  gateEvidence?: AuthenticatedGateEvidence
   updatedAt: string
 }
 
@@ -167,20 +168,50 @@ function existingAncestor(path: string): string {
   return current
 }
 
-function latestGateFailureInstruction(stateDir: string, gateIndex: number): string {
+interface PhaseGateReceipt {
+  schemaVersion: 1
+  runId: string
+  taskIndex: number
+  attempt: number
+  commandFingerprint: string
+  exitCode: number
+  stdout: string
+  stderr: string
+  timestamp: string
+  targetHead?: string
+  checklistDigest?: string
+}
+
+function latestPhaseGateReceipt(stateDir: string, gateIndex: number): PhaseGateReceipt {
   const receiptsDir = join(stateDir, 'receipts')
-  const match = readdirSync(receiptsDir)
+  const match = existsSync(receiptsDir) ? readdirSync(receiptsDir)
     .map(name => ({ name, match: new RegExp(`^gate-${gateIndex}-(\\d+)\\.json$`, 'u').exec(name) }))
     .filter((entry): entry is { name: string; match: RegExpExecArray } => entry.match !== null)
-    .sort((left, right) => Number(right.match[1]) - Number(left.match[1]))[0]
-  if (!match) throw new Error('failed gate has no durable receipt')
-  const receipt = JSON.parse(readFileSync(join(receiptsDir, match.name), 'utf8')) as { exitCode?: unknown; stdout?: unknown; stderr?: unknown }
-  const stdout = typeof receipt.stdout === 'string' ? receipt.stdout : ''
-  const stderr = typeof receipt.stderr === 'string' ? receipt.stderr : ''
+    .sort((left, right) => Number(right.match[1]) - Number(left.match[1]))[0] : undefined
+  if (!match) throw new Error('attempted gate has no durable receipt')
+  const receipt = JSON.parse(readFileSync(join(receiptsDir, match.name), 'utf8')) as Partial<PhaseGateReceipt>
+  if (receipt.schemaVersion !== 1 || typeof receipt.runId !== 'string' || typeof receipt.taskIndex !== 'number'
+    || typeof receipt.attempt !== 'number' || typeof receipt.commandFingerprint !== 'string'
+    || typeof receipt.exitCode !== 'number' || typeof receipt.stdout !== 'string'
+    || typeof receipt.stderr !== 'string' || typeof receipt.timestamp !== 'string'
+    || (receipt.targetHead !== undefined && (typeof receipt.targetHead !== 'string' || !/^[0-9a-f]{40}$/u.test(receipt.targetHead)))
+    || (receipt.checklistDigest !== undefined && (typeof receipt.checklistDigest !== 'string' || !/^[0-9a-f]{64}$/u.test(receipt.checklistDigest)))) {
+    throw new Error('attempted gate has an invalid durable receipt')
+  }
+  return receipt as PhaseGateReceipt
+}
+
+function gateFailureReason(receipt: Pick<PhaseGateReceipt, 'exitCode' | 'stdout' | 'stderr'>): string {
+  const evidence = redact([receipt.stderr.trim(), receipt.stdout.trim()].filter(Boolean).join('\n')).slice(-16 * 1024)
+  return `gate exited with code ${receipt.exitCode}${evidence ? `: ${evidence}` : ''}`
+}
+
+function latestGateFailureInstruction(stateDir: string, gateIndex: number): string {
+  const receipt = latestPhaseGateReceipt(stateDir, gateIndex)
   return [
-    `A prior controller gate for this phase failed with exit code ${String(receipt.exitCode ?? 'unknown')}.`,
+    `A prior controller gate for this phase failed with exit code ${receipt.exitCode}.`,
     'Repair the concrete failures below only inside the closure scope, then commit at most one correction.',
-    `Gate stdout/stderr (bounded tail):\n${`${stdout}\n${stderr}`.slice(-24 * 1024)}`,
+    `Gate stdout/stderr (bounded tail):\n${`${receipt.stdout}\n${receipt.stderr}`.slice(-24 * 1024)}`,
   ].join('\n')
 }
 
@@ -311,6 +342,44 @@ async function discardOutOfScopeWorkerChanges(
     }
   }
   return changed
+}
+
+function ignoredSnapshotEntries(snapshot: Awaited<ReturnType<typeof ignoredPathSnapshot>>): Map<string, string> {
+  return new Map(snapshot.entries.map(entry => {
+    const separator = entry.indexOf('\0')
+    if (separator < 1) throw new Error('ignored artifact snapshot contains an invalid entry')
+    return [entry.slice(0, separator), entry] as const
+  }))
+}
+
+async function discardGateIgnoredSideEffects(
+  worktree: string, baseline: Awaited<ReturnType<typeof ignoredPathSnapshot>>, signal?: AbortSignal,
+): Promise<string[]> {
+  const after = await ignoredPathSnapshot(worktree, signal)
+  const beforeEntries = ignoredSnapshotEntries(baseline)
+  const afterEntries = ignoredSnapshotEntries(after)
+  const altered = [...beforeEntries].filter(([path, entry]) => afterEntries.get(path) !== entry).map(([path]) => path)
+  if (altered.length > 0) throw new Error(`local gate changed pre-existing ignored artifacts: ${altered.join(', ')}`)
+  const created = [...afterEntries.keys()].filter(path => !beforeEntries.has(path)).sort((left, right) => right.length - left.length)
+  for (const path of created) {
+    const candidate = resolve(worktree, path)
+    if (!inside(worktree, candidate) || physicalRelative(worktree, candidate)?.replaceAll('\\', '/') !== path.replaceAll('\\', '/')) {
+      throw new Error(`local gate ignored artifact escapes the worktree: ${path}`)
+    }
+    rmSync(candidate, { recursive: true, force: true })
+    let parent = dirname(candidate)
+    while (parent !== resolve(worktree) && inside(worktree, parent)) {
+      try {
+        rmdirSync(parent)
+        parent = dirname(parent)
+      } catch {
+        break
+      }
+    }
+  }
+  const reconciled = await ignoredPathSnapshot(worktree, signal)
+  if (reconciled.digest !== baseline.digest) throw new Error('local gate ignored artifact cleanup did not restore the authenticated baseline')
+  return created
 }
 
 async function adoptCompletedWorkerChanges(
@@ -987,7 +1056,9 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       state.gateAttempts[key] = (state.gateAttempts[key] ?? 0) + 1
       writeState(join(stateDir, 'run.json'), state)
       appendEvent(eventsPath, event(state.runId, 'gate-start', 'publish', { commandFingerprint: fingerprint(command), publicationValidation: true, targetCommit }, gate, state.attempt))
+      const publicationIgnoredBaseline = await ignoredPathSnapshot(state.worktree, signal)
       const result = await runOpaqueShell(command, state.worktree, signal, scrubEnvironment(process.env))
+      const publicationIgnoredCreated = await discardGateIgnoredSideEffects(state.worktree, publicationIgnoredBaseline, signal)
       const validationReceipt = createHash('sha256').update(JSON.stringify({
         runId: state.runId,
         head: currentHead,
@@ -999,6 +1070,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       const receipt = { schemaVersion: 1, runId: state.runId, taskIndex: gate.index, attempt: state.attempt, commandFingerprint: fingerprint(command), exitCode: result.exitCode, stdout: redact(result.stdout), stderr: redact(result.stderr), timestamp: new Date().toISOString(), publicationValidation: true, targetCommit, validationReceipt }
       mkdirSync(join(stateDir, 'receipts'), { recursive: true })
       atomicWriteJson(join(stateDir, 'receipts', `publication-gate-${state.attempt}.json`), receipt)
+      if (publicationIgnoredCreated.length > 0) throw new Error(`post-rebase publication gate created ignored artifacts: ${publicationIgnoredCreated.join(', ')}`)
       if (result.exitCode !== 0) throw new Error(`post-rebase publication gate failed (${result.exitCode}): ${redact(result.stderr || result.stdout)}`)
       if (await head(state.worktree) !== currentHead) throw new Error('post-rebase publication gate changed the validated HEAD')
       if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('post-rebase publication gate left a dirty worktree')
@@ -1160,7 +1232,10 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
                 writeState(join(stateDir, 'run.json'), state)
               },
             })
-            if (!published.reconciledExisting && (!publicationValidationReceipt || published.validationReceipt !== publicationValidationReceipt)) throw new Error('publisher did not consume the controller-owned final-gate receipt')
+            if (published.reconciledExisting && !publicationValidationReceipt) await validatePublicationBase(priorTargetCommit)
+            if (!publicationValidationReceipt || (!published.reconciledExisting && published.validationReceipt !== publicationValidationReceipt)) {
+              throw new Error('publisher did not consume the controller-owned final-gate receipt')
+            }
             state.pullRequestUrl = published.url
             writeState(join(stateDir, 'run.json'), state)
             appendEvent(eventsPath, event(state.runId, 'publish-done', 'publish', { url: state.pullRequestUrl }))
@@ -1291,63 +1366,105 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         const priorTaskGateKey = Object.keys(state.gateAttempts).find(candidate => candidate.startsWith(`${task.index}:`) && (state.gateAttempts[candidate] ?? 0) > 0)
         if (priorTaskGateKey && priorTaskGateKey !== key) throw new Error('recovered gate command fingerprint differs from its recorded attempt')
         const priorGateAttempts = state.gateAttempts[key] ?? 0
-        const retryCommand = `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)} --retry-gate`
-        const repairPathArguments = (gateRepairContext?.additionalPaths ?? []).map(path => ` ${commandArgument(path)}`).join('')
-        const repairCommand = `/leppy-loop --tasks ${commandArgument(checklistRelative)} --sync-branch ${commandArgument(state.syncBranch)} --recover-existing-wip --recover-run ${commandArgument(state.runId)} --repair-gate --repair-cycles ${options.repairCycles}${repairPathArguments ? ` --repair-path${repairPathArguments}` : ''}`
+        const completeLocalGate = async (receipt: PhaseGateReceipt, advisoryReason?: string): Promise<void> => {
+          if (receipt.runId !== state.runId || receipt.taskIndex !== task.index || receipt.commandFingerprint !== fingerprint(command)) {
+            throw new Error('attempted gate durable receipt does not match the authenticated run, task, and command')
+          }
+          if (await gitBranch(state.worktree) !== state.branch) throw new Error('gate adoption branch differs from the authenticated run branch')
+          if ((await gitStatus(state.worktree)).trim() !== '') throw new Error('gate adoption requires a clean worktree and index')
+          const currentHead = await head(state.worktree)
+          const currentChecklistDigest = digest(parsed.source)
+          const evidence = state.gateEvidence
+          if (!evidence || evidence.schemaVersion !== 1 || evidence.taskIndex !== task.index
+            || evidence.attempt !== receipt.attempt || evidence.gateAttempt !== (state.gateAttempts[key] ?? 0)
+            || evidence.commandFingerprint !== receipt.commandFingerprint
+            || evidence.receiptDigest !== digest(JSON.stringify(receipt))
+            || evidence.targetHead !== currentHead || evidence.targetHead !== receipt.targetHead
+            || evidence.checklistDigest !== currentChecklistDigest || evidence.checklistDigest !== receipt.checklistDigest
+            || evidence.exitCode !== receipt.exitCode) {
+            throw new Error('gate receipt does not match authenticated controller evidence')
+          }
+          const completed = markTaskDone(parsed, task)
+          const receiptRelative = join('.leppy-loop-receipts', `gate-${task.index}.json`)
+          const recordedReceipt = advisoryReason ? {
+            ...receipt, advisory: true, advisoryReason, gateAttempts: state.gateAttempts[key] ?? 0,
+            repairCyclesUsed, repairCycleLimit: options.repairCycles,
+          } : receipt
+          mkdirSync(dirname(join(state.worktree, receiptRelative)), { recursive: true })
+          writeFileSync(join(state.worktree, receiptRelative), `${JSON.stringify(recordedReceipt, null, 2)}\n`, 'utf8')
+          writeFileSync(checklistPath, completed, 'utf8')
+          await commitControllerChange(
+            state.worktree,
+            [checklistRelative, receiptRelative],
+            `chore(leppy-loop): record ${safeSlug(task.phase)} gate${advisoryReason ? ' advisory' : ''}`,
+          )
+          state.completedTasks += 1
+          delete state.lastError
+          writeState(join(stateDir, 'run.json'), state)
+          rmSync(join(stateDir, 'resume.json'), { force: true })
+          appendEvent(eventsPath, event(state.runId, 'gate-end', 'gate', {
+            exitCode: receipt.exitCode,
+            ...(advisoryReason ? { advisory: true, reason: advisoryReason, gateAttempts: state.gateAttempts[key] ?? 0 } : {}),
+          }, task, state.attempt))
+          await settleProgress('task-done')
+        }
         if (retryGateAuthorized && priorGateAttempts === 0) throw new Error('--retry-gate requires a recorded failed attempt for the current gate fingerprint')
         if (priorGateAttempts > 0 && !retryGateAuthorized) {
-          const repairableClosure = parsed.tasks.filter(candidate => candidate.phase === task.phase && candidate.index < task.index && candidate.kind === 'closure').at(-1)
-          if (repairCyclesRemaining > 0 && repairableClosure?.mark === 'x') {
-            await reopenRepairClosure()
+          const evidence = state.gateEvidence
+          if (evidence?.taskIndex === task.index && evidence.gateAttempt === priorGateAttempts
+            && evidence.commandFingerprint === fingerprint(command)) {
+            const priorReceipt = latestPhaseGateReceipt(stateDir, task.index)
+            await completeLocalGate(priorReceipt, priorReceipt.exitCode === 0 ? undefined : gateFailureReason(priorReceipt))
             continue
           }
-          const reason = 'gate retry requires explicit retry authorization because no completed adjacent closure is available for automatic bounded repair'
-          appendEvent(eventsPath, event(state.runId, 'stall', 'gate', { reason }, task, state.attempt))
-          state.status = 'stalled'; state.lastError = reason; writeState(join(stateDir, 'run.json'), state)
-          atomicWriteJson(join(stateDir, 'resume.json'), { runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: 'gate-retry-authorization-required', worktree: state.worktree, command: retryCommand })
-          await settleProgress('task-failed', reason)
-          return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics, detail: reason }
+          if (recovered) repairCyclesRemaining = 0
         }
         state.gateAttempts[key] = priorGateAttempts + 1
         retryGateAuthorized = false
         writeState(join(stateDir, 'run.json'), state)
+        const targetHead = await head(state.worktree)
+        const checklistDigest = digest(parsed.source)
+        const ignoredBaseline = await ignoredPathSnapshot(state.worktree, signal)
         appendEvent(eventsPath, event(state.runId, 'gate-start', 'gate', { commandFingerprint: fingerprint(command), ...(priorGateAttempts > 0 ? { retry: true } : {}) }, task, state.attempt))
         const gate = await runOpaqueShell(command, state.worktree, signal, scrubEnvironment(process.env))
         if (signal.aborted) throw abortReason(signal)
-        const receipt = { schemaVersion: 1, runId: state.runId, taskIndex: task.index, attempt: state.attempt, commandFingerprint: fingerprint(command), exitCode: gate.exitCode, stdout: redact(gate.stdout), stderr: redact(gate.stderr), timestamp: new Date().toISOString() }
-        mkdirSync(join(stateDir, 'receipts'), { recursive: true })
-        atomicWriteJson(join(stateDir, 'receipts', `gate-${task.index}-${state.attempt}.json`), receipt)
+        if (await gitBranch(state.worktree) !== state.branch) throw new Error('local gate changed the authenticated run branch')
+        const restored = await discardOutOfScopeWorkerChanges(state.worktree, [], [checklistRelative], signal)
+        if (restored.length > 0) appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
+          workerArtifact: 'local-gate-side-effects', paths: restored, automatic: true,
+        }, task, state.attempt))
+        const restoredIgnored = await discardGateIgnoredSideEffects(state.worktree, ignoredBaseline, signal)
+        if (restoredIgnored.length > 0) appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
+          workerArtifact: 'local-gate-ignored-side-effects', paths: restoredIgnored, automatic: true,
+        }, task, state.attempt))
+        if (await head(state.worktree) !== targetHead) throw new Error('local gate created or changed commits')
+        if (digest(readFileSync(checklistPath, 'utf8')) !== checklistDigest) throw new Error('local gate changed the controlling checklist')
+        const receipt: PhaseGateReceipt = { schemaVersion: 1, runId: state.runId, taskIndex: task.index, attempt: state.attempt, commandFingerprint: fingerprint(command), exitCode: gate.exitCode, stdout: redact(gate.stdout), stderr: redact(gate.stderr), timestamp: new Date().toISOString(), targetHead, checklistDigest }
+        const gateReceiptPath = join(stateDir, 'receipts', `gate-${task.index}-${state.attempt}.json`)
+        mkdirSync(dirname(gateReceiptPath), { recursive: true })
+        atomicWriteJson(gateReceiptPath, receipt)
+        state.gateEvidence = {
+          schemaVersion: 1, taskIndex: task.index, attempt: state.attempt,
+          gateAttempt: state.gateAttempts[key]!, commandFingerprint: fingerprint(command),
+          receiptDigest: digest(JSON.stringify(receipt)), targetHead, checklistDigest, exitCode: gate.exitCode,
+        }
+        writeState(join(stateDir, 'run.json'), state)
+        await dependencies.afterGateEvidencePersisted?.(gateReceiptPath)
         if (gate.exitCode !== 0) {
-          const evidence = redact([gate.stderr.trim(), gate.stdout.trim()].filter(Boolean).join('\n')).slice(-16 * 1024)
-          const reason = `gate exited with code ${gate.exitCode}${evidence ? `: ${evidence}` : ''}`
+          const reason = gateFailureReason(receipt)
           appendEvent(eventsPath, event(state.runId, 'gate-failed', 'gate', {
             exitCode: gate.exitCode, repairCyclesUsed, repairCyclesRemaining,
           }, task, state.attempt))
-          await settleProgress('task-failed', reason)
           const repairableClosure = parsed.tasks.filter(candidate => candidate.phase === task.phase && candidate.index < task.index && candidate.kind === 'closure').at(-1)
           if (repairCyclesRemaining > 0 && repairableClosure?.mark === 'x') {
+            await settleProgress('task-failed', reason)
             await reopenRepairClosure()
             continue
           }
-          state.status = 'stalled'; state.lastError = reason; writeState(join(stateDir, 'run.json'), state)
-          atomicWriteJson(join(stateDir, 'resume.json'), {
-            runId: state.runId, taskIndex: task.index, attempt: state.attempt, status: 'gate-failed', worktree: state.worktree,
-            command: repairCommand, retryWithoutRepairCommand: retryCommand,
-            repairCyclesUsed, repairCycleLimit: options.repairCycles,
-          })
-          return { runId: state.runId, status: 'stalled', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, currentTask: task.index, diagnostics, detail: reason }
+          await completeLocalGate(receipt, reason)
+          continue
         }
-        const completed = markTaskDone(parsed, task)
-        const receiptRelative = join('.leppy-loop-receipts', `gate-${task.index}.json`)
-        mkdirSync(dirname(join(state.worktree, receiptRelative)), { recursive: true })
-        writeFileSync(join(state.worktree, receiptRelative), `${JSON.stringify(receipt, null, 2)}\n`, 'utf8')
-        writeFileSync(checklistPath, completed, 'utf8')
-        await commitControllerChange(state.worktree, [checklistRelative, receiptRelative], `chore(leppy-loop): record ${safeSlug(task.phase)} gate`)
-        state.completedTasks += 1
-        delete state.lastError
-        writeState(join(stateDir, 'run.json'), state)
-        appendEvent(eventsPath, event(state.runId, 'gate-end', 'gate', { exitCode: 0 }, task, state.attempt))
-        await settleProgress('task-done')
+        await completeLocalGate(receipt)
         continue
       }
 

@@ -37,9 +37,9 @@ Do not silently “fix” an already authenticated run's checklist or base. For 
 
 - `status`: inspect availability and durable progress; this is read-only and requires no remembered job.
 - `start`: only after a direct human `/leppy-loop` permit and successful preflight.
-- `continue` + `resume`: recover an interrupted, stalled, or orphaned exact run.
-- `continue` + `retry-gate`: retry only the exact recorded failed gate.
-- `continue` + `repair-gate`: reopen the authenticated preceding closure within bounded repair authority.
+- `continue` + `resume`: recover an interrupted, stalled, or orphaned exact run. HMAC-bound failed-gate evidence is adopted without rerun; an older pre-evidence stalled gate runs exactly once with repair disabled, then advances advisory.
+- `continue` + `retry-gate`: deliberately retry only the exact recorded failed gate; ordinary advancement does not require it.
+- `continue` + `repair-gate`: deliberately reopen the authenticated preceding closure within bounded repair authority; automatic local repair already runs before advisory advancement.
 - Stop is not model-authorized. A human may use `/leppy-loop stop`; never attempt `operation: "stop"` from the model tool.
 
 Return after the Host accepts and starts a controller job. Do not monitor it with generic job tools; Leppy emits its own durable task cards and autonomous follow-ups.
