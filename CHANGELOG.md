@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.51] - 2026-09-03
+
+### Changed
+
+- Missing external vault context, `OBSIDIAN_VAULT_PATH`, or repository vault helper availability is advisory for ordinary workers. The controller tells workers to decide from repository evidence and retries a mistaken `implementation-impossible` vault disposition with fresh workers inside the same job; genuine implementation impossibility remains a bounded hard stop.
+
 ## [0.3.50] - 2026-09-03
 
 ### Changed

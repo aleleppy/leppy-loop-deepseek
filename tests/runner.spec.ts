@@ -310,6 +310,23 @@ describe('controller state machine', () => {
     expect(git(result.worktree!, 'rev-list', '--count', 'main..HEAD')).toBe('0')
   }, 90_000)
 
+  it('retries missing external vault context autonomously instead of stalling', async () => {
+    const repo = repository('- [ ] Refactor `src/value.txt` | Done: implementation is complete\n')
+    const worker = new FakeWorker([{
+      status: 'blocked', output: '', error: 'OBSIDIAN_VAULT_PATH ausente',
+      report: {
+        status: 'blocked', disposition: 'implementation-impossible', summary: 'O vault Pináculo obrigatório não está disponível nesta sessão',
+        validation: { status: 'not-run', evidence: 'scripts/vault-context.sh não conseguiu localizar o vault' },
+      },
+    }, completedOutcome('implemented from repository evidence')])
+
+    const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
+    expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
+    expect(worker.calls).toHaveLength(2)
+    expect(worker.calls[0]?.instructions.join('\n')).toContain('External vaults')
+    expect(worker.calls[1]?.instructions.join('\n')).toContain('continue autonomously from the repository')
+  }, 90_000)
+
   it('adopts a scoped committed task even when worker status follows advisory validation failure', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | Done: focused validation passes\n')
     const worker: WorkerAdapter = {

@@ -245,6 +245,12 @@ function reconcileDurableLifecycleAuthority(state: RunState, stateDir: string): 
   state.lifecycleAuthority = { ...durable.authority }
 }
 
+function externalContextUnavailable(outcome: WorkerOutcome): boolean {
+  const detail = [outcome.error, outcome.report?.summary, outcome.report?.validation.evidence]
+    .filter((value): value is string => value !== undefined).join('\n')
+  return /OBSIDIAN_VAULT_PATH|vault-context|vault[^\n]{0,80}(?:unavailable|not available|missing|ausente|não (?:está )?disponível)/iu.test(detail)
+}
+
 function assertCompletedWorkerReport(outcome: WorkerOutcome, label: string, advisoryValidation = false): void {
   if (outcome.status !== 'completed') throw new Error(`${label} is not completed`)
   if (!outcome.report) {
@@ -1891,6 +1897,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       const instructions = [
         ...legacyCustomInstructions(state.worktree),
         ...await discoverInstructions(state.worktree, allowedPaths),
+        'External vaults, OBSIDIAN_VAULT_PATH, vault-context helpers, and private knowledge bases are optional context, never prerequisites. If unavailable, continue autonomously from the repository, task contract, tests, and your own engineering judgment; do not report blocked for that absence.',
         ...(dependencyBridge.status === 'local' ? [
           `The isolated worktree already has node_modules verified against ${dependencyBridge.lockfile}. You may use any repository-local command or change any file needed to finish the task. Declared paths are guidance, not a write restriction; generated and ignored files never block controller adoption.`,
         ] : []),
@@ -1960,7 +1967,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         persistReturnedTaskOutcome(outcome, state.attempt)
         if (state.activeTaskAttempt) await reconcileIgnoredAttempt(state.activeTaskAttempt)
       for (let recoveryRound = 0;
-          outcome.status !== 'completed' && outcome.status !== 'interrupted' && outcome.report === undefined
+          outcome.status !== 'completed' && outcome.status !== 'interrupted'
+          && (outcome.report === undefined || externalContextUnavailable(outcome))
           && recoveryRound < options.repairCycles; recoveryRound += 1) {
           const materialAlreadyProduced = await commitCount(state.worktree, previousHead) > 0
             || (await gitStatus(state.worktree)).trim() !== ''
