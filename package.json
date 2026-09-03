@@ -1,6 +1,6 @@
 {
   "name": "leppy-loop-deepseek",
-  "version": "0.3.51",
+  "version": "0.3.52",
   "description": "Checklist-driven isolated worker loop for DeepSeek Harness",
   "type": "module",
   "license": "Apache-2.0",

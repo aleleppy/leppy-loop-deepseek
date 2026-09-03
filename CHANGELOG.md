@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.52] - 2026-09-03
+
+### Changed
+
+- Local advisory gates no longer snapshot, compare, restore, or reject ignored/generated artifacts. Gate commands may freely update framework outputs such as `.svelte-kit/ambient.d.ts` and `.svelte-kit/generated/**`; crash recovery also leaves that disposable state alone. Tracked Git, checklist, branch, process identity, authority, and strict final publication gates retain their existing hard boundaries.
+
 ## [0.3.51] - 2026-09-03
 
 ### Changed

@@ -670,7 +670,7 @@ async function quarantineGateValidationCaches(
     }
     transaction.phase = 'quarantined'
     writeState(statePathname, state)
-    transaction.ignoredBaseline = await ignoredPathSnapshot(state.worktree, signal)
+    if (context === 'publication') transaction.ignoredBaseline = await ignoredPathSnapshot(state.worktree, signal)
     transaction.phase = 'ready'
     writeState(statePathname, state)
   } catch (error) {
@@ -840,9 +840,10 @@ async function restoreGateValidationCaches(
         || (transaction.gateProcess.phase === 'running' && Number.isSafeInteger(transaction.gateProcess.pid)
           && transaction.gateProcess.pid > 0 && transaction.gateProcess.processStart.length > 0)))
   const validIgnoredBaseline = transaction.phase === 'ready'
-    ? transaction.ignoredBaseline !== undefined && Array.isArray(transaction.ignoredBaseline.entries)
-      && /^[0-9a-f]{64}$/u.test(transaction.ignoredBaseline.digest)
-      && digest(JSON.stringify(transaction.ignoredBaseline.entries)) === transaction.ignoredBaseline.digest
+    ? (transaction.context === 'local' && transaction.ignoredBaseline === undefined)
+      || (transaction.ignoredBaseline !== undefined && Array.isArray(transaction.ignoredBaseline.entries)
+        && /^[0-9a-f]{64}$/u.test(transaction.ignoredBaseline.digest)
+        && digest(JSON.stringify(transaction.ignoredBaseline.entries)) === transaction.ignoredBaseline.digest)
     : (transaction.phase === 'prepared' || transaction.phase === 'quarantined') && transaction.ignoredBaseline === undefined
   if (transaction.schemaVersion !== 1 || transaction.runId !== state.runId || transaction.attempt !== state.attempt
     || !Number.isSafeInteger(transaction.taskIndex) || !Array.isArray(transaction.entries)
@@ -1122,7 +1123,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           }, signal)
         }
         await restoreAuthenticatedGateGitState(state.worktree, state.branch, cacheTransaction.rollbackHead!, signal, `${cacheTransaction.context} gate crash rollback`)
-        const restoredIgnored = cacheTransaction.phase === 'ready'
+        const restoredIgnored = cacheTransaction.context === 'publication' && cacheTransaction.phase === 'ready'
           ? await discardGateIgnoredSideEffects(state.worktree, cacheTransaction.ignoredBaseline!, signal)
           : []
         const restoredCaches = await restoreGateValidationCaches(join(stateDir, 'run.json'), stateDir, state)
@@ -1821,7 +1822,6 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         let simulatedProcessDeath = false
         let gateProcessingError: unknown
         try {
-          const ignoredBaseline = cacheTransaction.ignoredBaseline!
           appendEvent(eventsPath, event(state.runId, 'gate-start', 'gate', { commandFingerprint: fingerprint(command), ...(priorGateAttempts > 0 ? { retry: true } : {}) }, task, state.attempt))
           gate = await runAuthenticatedGateShell(
             command, statePathname, stateDir, state, cacheTransaction, signal, dependencies,
@@ -1842,10 +1842,6 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             if (generatedCaches.length > 0) appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
             workerArtifact: 'transient-validation-cache', paths: generatedCaches, automatic: true,
           }, task, state.attempt))
-          const restoredIgnored = await discardGateIgnoredSideEffects(state.worktree, ignoredBaseline, signal)
-          if (restoredIgnored.length > 0) appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
-            workerArtifact: 'local-gate-ignored-side-effects', paths: restoredIgnored, automatic: true,
-          }, task, state.attempt))
           if (await head(state.worktree) !== targetHead) throw new Error('local gate created or changed commits')
           if (digest(readFileSync(checklistPath, 'utf8')) !== checklistDigest) throw new Error('local gate changed the controlling checklist')
         } catch (error) {
@@ -1854,7 +1850,6 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         }
         if (simulatedProcessDeath) throw gateProcessingError
         await restoreAuthenticatedGateGitState(state.worktree, state.branch, cacheTransaction.rollbackHead!, signal, 'local gate rollback')
-        await discardGateIgnoredSideEffects(state.worktree, cacheTransaction.ignoredBaseline!, signal)
         await restoreGateValidationCaches(statePathname, stateDir, state)
         if (gateProcessingError) throw gateProcessingError
         const receipt: PhaseGateReceipt = { schemaVersion: 1, runId: state.runId, taskIndex: task.index, attempt: state.attempt, commandFingerprint: fingerprint(command), exitCode: gate.exitCode, stdout: redact(gate.stdout), stderr: redact(gate.stderr), timestamp: new Date().toISOString(), targetHead, checklistDigest }
