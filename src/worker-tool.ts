@@ -66,7 +66,7 @@ function inside(parent: string, child: string): boolean {
   return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
 }
 
-function resolvePolicyPath(policy: WorkerPolicy, candidate: string, writing: boolean): string {
+function resolvePolicyPath(policy: WorkerPolicy, candidate: string): string {
   if (candidate.includes('\0') || isAbsolute(candidate)) throw new Error('path must be repo-relative')
   const absolute = resolve(policy.root, candidate)
   const { real, suffix } = nearestReal(absolute)
@@ -75,15 +75,15 @@ function resolvePolicyPath(policy: WorkerPolicy, candidate: string, writing: boo
   const repoRelative = relative(policy.root, canonical)
   if (repoRelative === '.git' || repoRelative.startsWith(`.git${sep}`)) throw new Error('Git metadata is denied')
   if (canonical === policy.checklist) throw new Error('controlling checklist is denied')
-  const permitted = !writing && policy.mode !== 'publication-conflict'
+  const permitted = policy.mode !== 'publication-conflict'
     ? true
-    : policy.allowed.some(scope => canonical === scope || (policy.mode !== 'publication-conflict' && inside(scope, canonical)))
+    : policy.allowed.some(scope => canonical === scope)
   if (!permitted) throw new Error(`path is outside this task write scope: ${candidate}`)
   return canonical
 }
 
 export function resolveAllowed(policy: WorkerPolicy, candidate: string, writing: boolean): string {
-  const canonical = resolvePolicyPath(policy, candidate, writing)
+  const canonical = resolvePolicyPath(policy, candidate)
   if (!writing && !existsSync(canonical)) throw new Error(`path does not exist: ${candidate}`)
   return canonical
 }
@@ -206,7 +206,7 @@ export function apply(ctx: Context): void {
   ctx.systemPrompt.variable('leppy_prompt', () => requiredEnv('LEPPY_SYSTEM_PROMPT'))
   ctx.tools.register(defineTool({
     name: 'leppy_read',
-    description: 'Read one UTF-8 file inside the current task path scope.',
+    description: 'Read one UTF-8 file anywhere inside the isolated worktree.',
     parameters: { path: { type: 'string', required: true } },
     output: { schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } }, render: (_args, value) => textOutput((value as { text: string }).text) },
     async execute(args) {
@@ -223,7 +223,7 @@ export function apply(ctx: Context): void {
     output: { schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } }, render: (_args, value) => textOutput((value as { text: string }).text) },
     async execute(args) {
       const requestedPaths = args.paths ?? []
-      const resolved = requestedPaths.map(candidate => ({ candidate, path: resolvePolicyPath(policy, candidate, false) }))
+      const resolved = requestedPaths.map(candidate => ({ candidate, path: resolvePolicyPath(policy, candidate) }))
       const existing = resolved.filter(candidate => existsSync(candidate.path))
       const missing = resolved.filter(candidate => !existsSync(candidate.path)).map(candidate => candidate.candidate)
       if (requestedPaths.length > 0 && existing.length === 0) return { text: `No requested search path exists: ${missing.join(', ')}` }
@@ -242,7 +242,7 @@ export function apply(ctx: Context): void {
   }))
   if (policy.mode === 'task') ctx.tools.register(defineTool({
     name: 'leppy_edit',
-    description: 'Replace exact UTF-8 text inside one writable task path. Prefer this over rewriting whole files or constructing patches.',
+    description: 'Replace exact UTF-8 text anywhere inside the isolated worktree. Prefer this over rewriting whole files.',
     parameters: {
       path: { type: 'string', required: true },
       oldText: { type: 'string', required: true },
@@ -263,7 +263,7 @@ export function apply(ctx: Context): void {
   }))
   if (policy.mode === 'task') ctx.tools.register(defineTool({
     name: 'leppy_commit',
-    description: 'Create the task conventional commit through a narrow Git-metadata capability after validating every changed path against this task scope.',
+    description: 'Create one conventional commit containing the worker changes from anywhere in the isolated worktree.',
     parameters: { message: { type: 'string', required: true } },
     output: { schema: { type: 'object', additionalProperties: false, properties: { commit: { type: 'string', required: true } } }, render: (_args, value) => textOutput(value) },
     async execute(args) {
@@ -273,7 +273,7 @@ export function apply(ctx: Context): void {
   }))
   if (policy.mode !== 'verification') ctx.tools.register(defineTool({
     name: 'leppy_write',
-    description: 'Replace one UTF-8 file inside the current task path scope. Parent directories are created.',
+    description: 'Replace one UTF-8 file anywhere inside the isolated worktree. Parent directories are created.',
     parameters: { path: { type: 'string', required: true }, content: { type: 'string', required: true } },
     output: { schema: { type: 'object', additionalProperties: false, properties: { bytes: { type: 'number', required: true } } }, render: (_args, value) => textOutput(value) },
     async execute(args) {
@@ -299,7 +299,7 @@ export function apply(ctx: Context): void {
     name: 'leppy_exec',
     description: policy.mode === 'verification'
       ? 'Run one direct already-materialized validation binary in the disposable verification worktree. Package managers, repository scripts, shells, interpreter frontends, remote clients, publication and dynamic evaluation are denied.'
-      : 'Run an exact local argv without a shell. Bare commands resolve local-first from the authenticated root node_modules/.bin; Windows shims select .cmd automatically. Keep command and args separate. The tool call itself returns exitCode 0 when observation succeeded; commandExitCode and advisory report the actual command result for your decision. Never repeat an unchanged nonzero command. Package managers permit only explicit run/test scripts; npx/dlx/corepack and alternate package frontends, install, cache overrides, remote, publication and dynamic-eval commands are denied.',
+      : 'Run any direct argv inside the isolated worktree. Bare commands resolve local-first from node_modules/.bin; Windows shims select .cmd automatically. Keep command and args separate. commandExitCode and advisory report the invoked command result.',
     parameters: {
       command: { type: 'string', required: true },
       args: { type: 'array', items: { type: 'string' }, required: true },
@@ -312,7 +312,7 @@ export function apply(ctx: Context): void {
     async execute(args, exec) {
       const cwd = resolveExecCwd(policy, args.cwd)
       const normalized = normalizeExecCommand(args.command, cwd)
-      validateArgv(normalized, args.args, cwd, policy.root, policy.gateFingerprint, policy.mode)
+      if (policy.mode !== 'task') validateArgv(normalized, args.args, cwd, policy.root, policy.gateFingerprint, policy.mode)
       const environment = workerExecEnvironment(policy)
       const command = await ctx.subprocess.resolveExecutable(explicitRepoExecutable(policy, cwd, normalized), environment, exec.signal)
       if (policy.mode === 'verification') {
@@ -323,7 +323,7 @@ export function apply(ctx: Context): void {
           throw new Error('verification executable did not resolve from authenticated root node_modules/.bin')
         }
       }
-      validateArgv(command, args.args, cwd, policy.root, undefined, policy.mode)
+      if (policy.mode !== 'task') validateArgv(command, args.args, cwd, policy.root, undefined, policy.mode)
       const execution = ctx.sandboxPolicy.resolve(exec.agent?.session ? { session: exec.agent.session } : {})
       if (execution.mode !== 'workspace-write') throw new Error(`worker requires workspace-write, got ${execution.mode}`)
       if (realpathSync(execution.workspaceRoot) !== policy.root) throw new Error('worker sandbox root does not match the authenticated worktree')

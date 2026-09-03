@@ -278,23 +278,25 @@ function workerPrompt(request: WorkerRequest): string {
     `You are one ephemeral Leppy Loop worker for ${publicationConflict ? 'a publication conflict resolution' : verification ? 'an isolated committed-task verification' : `a ${kind}`}.`,
     `Execute only this line: ${request.task.raw}`,
     request.task.metadata.done ? `Done contract: ${request.task.metadata.done}` : 'Closure contract: inspect the completed phase and correct only defects inside scope.',
-    `${verification ? 'Relevant' : 'Writable'} repo-relative paths: ${request.allowedPaths.map(path => JSON.stringify(path)).join(', ')}`,
+    `${verification || publicationConflict ? 'Authorized' : 'Suggested (non-binding)'} repo-relative paths: ${request.allowedPaths.map(path => JSON.stringify(path)).join(', ')}`,
     `Runtime platform: ${process.platform}.`,
     publicationConflict
       ? 'Use only the provided leppy_read, leppy_write, and leppy_delete tools. Every allowed path is exact; no directory descendants are authorized.'
       : verification
         ? 'Use only the provided leppy_read, leppy_search, and leppy_exec tools. This is verification-only: no write, edit, commit, or delete capability exists. Run the narrow focused validation required by the Done contract against the existing committed HEAD. Invoke already-materialized direct validation binaries such as playwright, vitest, or tsc; package managers, repository scripts, shells, and language interpreter frontends are denied.'
-        : 'Use only the provided leppy_read, leppy_write, leppy_edit, leppy_search, leppy_exec, and leppy_commit tools. Use leppy_search instead of rg/grep/find, leppy_edit instead of patches, and never invoke a shell command string. leppy_exec resolves bare local binaries from the authenticated root node_modules/.bin; invoke playwright, vitest, tsc, or similar directly. Package-manager commands are limited to explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, dependency installation, cache overrides, or an in-worktree package-manager cache.',
-    'Never read or edit the controlling checklist. Never push, publish, deploy, mutate PRs, fetch, merge, rebase, or manage worktrees. Never use git apply, restore, reset, clean, add, commit, or checkout through leppy_exec.',
+        : 'Use the provided leppy_read, leppy_write, leppy_edit, leppy_search, leppy_exec, and leppy_commit tools. You own the isolated worktree and may change any repository file or run any direct local command needed to finish. Suggested paths are context, not a write boundary.',
+    publicationConflict || verification
+      ? 'Never read or edit the controlling checklist. Never push, publish, deploy, mutate PRs, fetch, merge, rebase, or manage worktrees.'
+      : 'Never read or edit the controlling checklist and never push, publish, deploy, or mutate remote PRs. Local Git operations, dependency commands, generators, caches, and repository-wide refactors are allowed inside the isolated worktree.',
     publicationConflict
       ? 'Resolve the exact files and finish without staging or committing. The authenticated controller exclusively owns the Git index and rebase continuation.'
       : verification
         ? 'Do not change HEAD or any worktree file. Report completed only if focused validation passes and the existing commit satisfies the Done contract; report failed for a real validation failure and blocked with validation not-run when the environment still cannot execute it.'
         : request.task.kind === 'task'
-          ? 'Implement the Done contract inside scope. You may use leppy_commit, but the controller will safely adopt uncommitted in-scope changes when you finish.'
-          : 'Inspect and repair only inside scope. You may commit, but the controller also accepts uncommitted in-scope corrections and normalizes commit structure.',
+          ? 'Implement the Done contract anywhere in the isolated repository. You may commit, or leave changes for the controller to adopt automatically.'
+          : 'Inspect and repair the phase anywhere in the isolated repository. You may commit, or leave changes for the controller to adopt automatically.',
     ...(!publicationConflict && !verification ? [
-      'Validation informs your engineering decision but does not control the lifecycle. Attempt the focused checks, record every failure exactly, and distinguish implementation defects from unavailable tooling, sandbox limitations, or unrelated baseline failures. If the Done contract is satisfied in your judgment, finish the implementation and preferably report completed even when validation is failed or not-run. Block only for a real unresolved implementation/scope/authority problem.',
+      'Validation informs your engineering decision but does not control the lifecycle. Attempt useful checks and use judgment. If the Done contract is satisfied, finish even when validation is failed or unavailable. Block only for a real unresolved implementation or external-authority impossibility.',
     ] : []),
     ...request.instructions,
     'Applicable project instructions have already been injected above. Do not try to re-read CLAUDE.md, AGENTS.md, or instruction files unless an explicit writable path also authorizes them.',

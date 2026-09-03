@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [0.3.50] - 2026-09-03
+
+### Changed
+
+- Mutable task and closure workers now own the complete isolated worktree. Declared `paths=` are optional guidance rather than write authority; repository-wide edits, local Git, dependency commands, generators and arbitrary direct local argv are admitted. The controller adopts dirty work and consolidates commits without rejecting paths outside checklist metadata. The controlling checklist and every remote publication action remain controller-only.
+- Ordinary worker ignored/generated state no longer has a baseline, HMAC quarantine transaction, recovery bridge or adoption guard. Root and nested Svelte validation caches are disposable and removed automatically; all other ignored files may remain across retries without blocking progress or polluting lifecycle logs. Existing runs carrying old ignored-artifact fields resume without replaying that machinery.
+
 ## [0.3.49] - 2026-09-03
 
 ### Fixed

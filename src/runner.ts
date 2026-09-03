@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import {
   assertSourceReady, assertTaskCommit, branch as gitBranch, commitControllerChange,
   commitCount, commitSubject, createRunWorktree, discardUnstartedRunWorktree,
-  head, ignoredPathDigest, ignoredPathSnapshot, isConventional, resolveRepoRoot,
+  head, ignoredPathSnapshot, isConventional, resolveRepoRoot,
   status as gitStatus, summarizeDiff, writeChecklistAndAmend,
 } from './git.js'
 import { lintChecklist, markTaskDone, markTaskOpen, parseChecklist, selectTask } from './checklist.js'
@@ -26,12 +26,9 @@ import {
 import { windowsQuotedExecutableFailure } from './windows-command.js'
 import { containWindowsGateProcess, settleWindowsGateJob } from './windows-job.js'
 import {
-  quarantineWorkerNpmCache, recordWorkerNpmCacheBaseline, workerNpmCacheRecovery, workerNpmCacheTransactionPresent,
+  quarantineWorkerNpmCache, workerNpmCacheRecovery, workerNpmCacheTransactionPresent,
 } from './worker-artifacts.js'
-import {
-  recordWorkerIgnoredPathBaseline, reconcileWorkerIgnoredPaths, sameIgnoredBaselineBridge,
-  workerIgnoredBaselineBridgeIdentity,
-} from './ignored-artifacts.js'
+import { sameIgnoredBaselineBridge, workerIgnoredBaselineBridgeIdentity } from './ignored-artifacts.js'
 import { DIRECT_HUMAN_STOP_REASON } from './types.js'
 import type {
   ActiveTaskAttempt, AuthenticatedGateEvidence, ChecklistTask, GateCacheTransaction, IgnoredBaselineBridgeAdmission, LeppyLoopOptions, LifecycleAuthority, ModelCapability, PendingTaskValidation, RunDependencies, RunEvent,
@@ -151,17 +148,6 @@ async function assertChecklistAdoptionOnly(worktree: string, checklistRelative: 
   }
 }
 
-async function assertTaskCommitScope(worktree: string, baseHead: string, checklistRelative: string, allowedPaths: readonly string[], signal: AbortSignal): Promise<void> {
-  const changed = (await runFile('git', ['diff', '--name-only', '-z', baseHead, 'HEAD'], { cwd: worktree, signal })).stdout.split('\0').filter(Boolean)
-  const checklist = checklistRelative.replaceAll('\\', '/')
-  const allowed = allowedPaths.map(path => path.replaceAll('\\', '/').replace(/\/$/u, ''))
-  if (changed.length === 0) throw new Error('worker commit contains no task changes')
-  for (const path of changed) {
-    if (path === checklist || !allowed.some(scope => path === scope || path.startsWith(`${scope}/`))) {
-      throw new Error(`worker commit changed path outside authenticated task scope: ${path}`)
-    }
-  }
-}
 function inside(root: string, path: string): boolean { const rel = relative(root, path); return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel)) }
 function existingAncestor(path: string): string {
   let current = resolve(path)
@@ -271,12 +257,14 @@ function assertCompletedWorkerReport(outcome: WorkerOutcome, label: string, advi
 }
 
 async function discardTransientValidationCache(worktree: string, signal?: AbortSignal): Promise<void> {
-  const cache = join(worktree, '.svelte-check')
-  if (!existsSync(cache)) return
-  const tracked = await runFile('git', ['ls-files', '-z', '--', '.svelte-check'], { cwd: worktree, signal })
-  if (tracked.stdout.split('\0').some(Boolean)) return
-  if (physicalRelative(worktree, cache) !== '.svelte-check') throw new Error('transient validation cache escapes the worktree')
-  rmSync(cache, { recursive: true, force: true })
+  for (const relativePath of ['.svelte-check', '.svelte-kit/.svelte-check']) {
+    const cache = join(worktree, relativePath)
+    if (!existsSync(cache)) continue
+    const tracked = await runFile('git', ['ls-files', '-z', '--', relativePath], { cwd: worktree, signal })
+    if (tracked.stdout.split('\0').some(Boolean)) continue
+    if (physicalRelative(worktree, cache)?.replaceAll('\\', '/') !== relativePath) throw new Error('transient validation cache escapes the worktree')
+    rmSync(cache, { recursive: true, force: true })
+  }
 }
 
 function workerScopeContains(scopes: readonly string[], candidate: string): boolean {
@@ -388,7 +376,7 @@ async function discardGateIgnoredSideEffects(
 }
 
 async function adoptCompletedWorkerChanges(
-  worktree: string, previousHead: string, scopes: readonly string[], phase: string, signal?: AbortSignal,
+  worktree: string, previousHead: string, phase: string, signal?: AbortSignal,
 ): Promise<{ paths: string[]; amended: boolean } | undefined> {
   if ((await gitStatus(worktree)).trim() === '') return undefined
   const pending = await workerChangedPaths(worktree, signal)
@@ -396,9 +384,6 @@ async function adoptCompletedWorkerChanges(
   if (unmerged.length > 0) throw new Error(`ordinary worker left an unmerged Git index: ${unmerged.join(' | ')}`)
   const paths = pending.paths
   if (paths.length === 0) throw new Error(`ordinary worker has dirty status without parsed paths: ${pending.records.join(' | ') || '(no records)'}`)
-  if (paths.length > 4_096) throw new Error('ordinary worker adoption exceeds 4096 paths')
-  const outside = paths.filter(path => !workerScopeContains(scopes, path))
-  if (outside.length > 0) throw new Error(`ordinary worker left changes outside authenticated scope after cleanup: ${outside.join(', ')}`)
   const count = await commitCount(worktree, previousHead)
   for (let index = 0; index < paths.length; index += 64) {
     await runFile('git', ['add', '--', ...paths.slice(index, index + 64)], { cwd: worktree, signal })
@@ -410,7 +395,7 @@ async function adoptCompletedWorkerChanges(
 }
 
 async function normalizeCompletedWorkerCommits(
-  worktree: string, previousHead: string, checklistRelative: string, scopes: readonly string[], phase: string, signal: AbortSignal,
+  worktree: string, previousHead: string, phase: string, signal: AbortSignal,
 ): Promise<{ count: number; normalized: boolean }> {
   const count = await commitCount(worktree, previousHead)
   if (count === 0) return { count, normalized: false }
@@ -419,7 +404,6 @@ async function normalizeCompletedWorkerCommits(
     await runFile('git', ['reset', '--hard', previousHead], { cwd: worktree, signal })
     return { count: 0, normalized: true }
   }
-  await assertTaskCommitScope(worktree, previousHead, checklistRelative, scopes, signal)
   const conventional = isConventional(await commitSubject(worktree))
   if (count === 1 && conventional) return { count, normalized: false }
   await runFile('git', ['reset', '--soft', previousHead], { cwd: worktree, signal })
@@ -1107,7 +1091,6 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
   if (options.recoverExistingWip && !recovered) throw new Error('authenticated run disappeared during recovery')
   if (!recovered && !initialTask) throw new Error('checklist contains no open executable rows')
   let recoveryError: string | undefined
-  let npmCacheQuarantined = false
   if (recovered) {
     state = recovered.state
     stateDir = recovered.dir
@@ -1242,7 +1225,6 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         allowLegacyDigest: options.workerArtifactRecoveryDigest !== undefined && !activeCacheAttempt,
         key: createLeaseKey(stateDir),
       })
-      npmCacheQuarantined = true
       appendEvent(join(stateDir, 'events.jsonl'), event(state.runId, 'recovery-done', 'recovery', {
         workerArtifact: '.npm-cache', transactionId: quarantined.transactionId,
         resumed: quarantined.resumed, basis: quarantined.basis,
@@ -1546,9 +1528,6 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
     if (!pending || pending.phase !== 'validated') return false
     const checklistPath = join(state.worktree, checklistRelative)
     const eventTask = parsed.tasks.find(candidate => candidate.index === pending.taskIndex)
-    if (await ignoredPathDigest(state.worktree, signal) !== pending.ignoredPathsDigest) {
-      throw new Error('validated task ignored artifact set changed before controller adoption')
-    }
     const liveHead = await head(state.worktree)
     if (liveHead === pending.commitHead) {
       const checklistDigest = digest(parsed.source)
@@ -1617,12 +1596,8 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           || digest(parsed.source) !== legacyPending.checklistDigest) {
           throw new Error('legacy pending task identity changed before advisory adoption')
         }
-        if (await ignoredPathDigest(state.worktree, signal) !== legacyPending.ignoredPathsDigest) {
-          throw new Error('legacy pending task ignored artifact set changed before advisory adoption')
-        }
         if (await head(state.worktree) !== legacyPending.commitHead) throw new Error('legacy pending task HEAD changed before advisory adoption')
         await assertTaskCommit(state.worktree, legacyPending.baseHead, state.branch)
-        await assertTaskCommitScope(state.worktree, legacyPending.baseHead, checklistRelative, pendingTask.metadata.paths, signal)
         const marked = markTaskDone(parsed, pendingTask)
         state.pendingTaskValidation = {
           ...legacyPending,
@@ -1708,17 +1683,6 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         return { runId: state.runId, status: 'completed', branch: state.branch, worktree: state.worktree, stateDir, completedTasks: state.completedTasks, diagnostics, ...(state.pullRequestUrl ? { pullRequestUrl: state.pullRequestUrl } : {}) }
       }
       if (retryGateAuthorized && task.kind !== 'gate' && task.index !== gateRepairContext?.closureIndex) throw new Error('--retry-gate can only authorize the recovered failed gate or its controller-reopened repair closure')
-      if (task.kind !== 'gate' && task.kind !== 'human') {
-        const recoveryScopes = task.index === gateRepairContext?.closureIndex
-          ? [...new Set([...task.metadata.paths, ...(gateRepairContext.additionalPaths ?? [])])]
-          : task.metadata.paths
-        const restored = await discardOutOfScopeWorkerChanges(state.worktree, recoveryScopes, [checklistRelative], signal)
-        if (restored.length > 0) {
-          appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
-            workerArtifact: 'out-of-scope-validation-side-effects', paths: restored, automatic: true,
-          }, task, state.attempt))
-        }
-      }
       const selectedTaskKey = taskAttemptKey(task)
       const selectedChecklistDigest = digest(parsed.source)
       const pendingIdentity = state.pendingTaskValidation ?? state.activeTaskAttempt
@@ -1727,30 +1691,11 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         throw new Error('authenticated pending task identity no longer matches the controlling checklist')
       }
       const reconcileIgnoredAttempt = async (active: ActiveTaskAttempt): Promise<string> => {
-        const reconciled = await reconcileWorkerIgnoredPaths({
-          worktree: state.worktree, stateDir, runId: state.runId,
-          taskKey: active.taskKey, taskIndex: active.taskIndex, attempt: active.attempt,
-          expectedBaselineDigest: active.ignoredPathsDigest, legacyBaseHead: active.baseHead,
-          ...(active.ignoredArtifactTransaction ? { expectedTransaction: active.ignoredArtifactTransaction } : {}),
-          key: createLeaseKey(stateDir),
-          onTransactionPrepared: async transaction => {
-            const current = state.activeTaskAttempt
-            if (!current || current.taskKey !== active.taskKey || current.taskIndex !== active.taskIndex
-              || current.attempt !== active.attempt || current.ignoredPathsDigest !== active.ignoredPathsDigest) {
-              throw new Error('worker ignored transaction lost its authenticated active attempt')
-            }
-            current.ignoredArtifactTransaction = transaction
-            writeState(join(stateDir, 'run.json'), state)
-          },
-        })
-        if (reconciled.paths.length > 0) {
-          appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
-            workerArtifact: 'ignored-paths', paths: reconciled.paths,
-            quarantine: reconciled.quarantine ?? null, basis: reconciled.basis,
-            resumed: reconciled.resumed, automatic: true,
-          }, task, active.attempt))
-        }
-        return reconciled.digest
+        // Ordinary workers own their isolated worktree. Ignored and generated files are
+        // neither controller authority nor a reason to stall recovery.
+        await discardTransientValidationCache(state.worktree, signal)
+        delete active.ignoredArtifactTransaction
+        return active.ignoredPathsDigest
       }
       if (state.activeTaskAttempt) {
         const active = state.activeTaskAttempt
@@ -1759,12 +1704,9 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         if (liveHead === active.baseHead) {
           delete state.activeTaskAttempt
         } else {
-          await adoptCompletedWorkerChanges(state.worktree, active.baseHead, task.metadata.paths, task.phase, signal)
-          await normalizeCompletedWorkerCommits(
-            state.worktree, active.baseHead, checklistRelative, task.metadata.paths, task.phase, signal,
-          )
+          await adoptCompletedWorkerChanges(state.worktree, active.baseHead, task.phase, signal)
+          await normalizeCompletedWorkerCommits(state.worktree, active.baseHead, task.phase, signal)
           await assertTaskCommit(state.worktree, active.baseHead, state.branch)
-          await assertTaskCommitScope(state.worktree, active.baseHead, checklistRelative, task.metadata.paths, signal)
           const adoptedHead = await head(state.worktree)
           const marked = markTaskDone(parsed, task)
           state.pendingTaskValidation = {
@@ -1950,10 +1892,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         ...legacyCustomInstructions(state.worktree),
         ...await discoverInstructions(state.worktree, allowedPaths),
         ...(dependencyBridge.status === 'local' ? [
-          `The controller copied and verified an isolated node_modules against ${dependencyBridge.lockfile}. Use repository package scripts or bare local tools; do not install packages. leppy_exec resolves bare executable names local-first from the authenticated root node_modules/.bin and selects Windows shims. Package managers permit only explicit run/test scripts. Never use npx, dlx, corepack/alternate package frontends, package-manager cache overrides, or create an in-worktree cache. If validation reports a missing .svelte-kit/tsconfig.json, run the bare local command svelte-kit sync once before retrying; never run broad npm prepare for that condition. Do not run npm run refresh-reflector unless the Done contract explicitly requires regeneration and BACKEND_URL is already available. Otherwise never repeat an unchanged nonzero command: record its evidence and use engineering judgment; unavailable validation alone does not block completion. Validation commands may touch generated files outside task scope; record that once and return because the controller restores those out-of-scope side effects. Do not report blocked solely because you cannot restore them yourself.`,
-        ] : []),
-        ...(npmCacheQuarantined ? [
-          'The controller moved the prior wholly-untracked .npm-cache into its private authenticated quarantine. Do not recreate it; invoke bare local tools through leppy_exec.',
+          `The isolated worktree already has node_modules verified against ${dependencyBridge.lockfile}. You may use any repository-local command or change any file needed to finish the task. Declared paths are guidance, not a write restriction; generated and ignored files never block controller adoption.`,
         ] : []),
         ...(task.index === gateRepairContext?.closureIndex ? [
           gateRepairContext.instruction,
@@ -1984,33 +1923,14 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           if (!existsSync(checklistPath) || digest(readFileSync(checklistPath, 'utf8')) !== controllerHash) {
             throw new Error('worker altered the controlling checklist')
           }
+          const controllerChanges = (await workerChangedPaths(workerRequest.worktree, signal)).paths
+            .filter(path => path.replaceAll('\\', '/') === checklistRelative.replaceAll('\\', '/'))
+          if (controllerChanges.length > 0) throw new Error(`worker altered controller-owned Git paths: ${controllerChanges.join(', ')}`)
           await discardTransientValidationCache(workerRequest.worktree, signal)
-          if (workerRequest.mode !== 'verification') {
-            const restored = await discardOutOfScopeWorkerChanges(workerRequest.worktree, workerRequest.allowedPaths, [checklistRelative], signal)
-            if (restored.length > 0) {
-              appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
-                workerArtifact: 'out-of-scope-validation-side-effects', paths: restored, automatic: true,
-              }, workerRequest.task, workerRequest.attempt))
-            }
-          }
         }
         if (workerError !== undefined) throw workerError
         if (!workerOutcome) throw new Error('worker returned no outcome')
         return workerOutcome
-      }
-      const reconcileGeneratedWorkerCache = async (attempt: number, baselineAbsent: boolean, workerOutcome: WorkerOutcome): Promise<void> => {
-        if (!baselineAbsent || !existsSync(join(state.worktree, '.npm-cache'))) return
-        const quarantined = await quarantineWorkerNpmCache({
-          worktree: state.worktree, stateDir, runId: state.runId,
-          taskIndex: task.index, attempt,
-          recoveryErrorDigest: workerFailureSignature(workerOutcome),
-          allowLegacyDigest: false, key: createLeaseKey(stateDir),
-        })
-        npmCacheQuarantined = true
-        appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
-          workerArtifact: '.npm-cache', transactionId: quarantined.transactionId,
-          resumed: quarantined.resumed, basis: quarantined.basis, automatic: true,
-        }, task, attempt))
       }
       let outcomeAttempt = state.attempt
       let outcome: WorkerOutcome
@@ -2027,27 +1947,17 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
         writeState(join(stateDir, 'run.json'), state)
       }
       if (task.kind === 'task') {
-          const ignoredBaseline = await recordWorkerIgnoredPathBaseline({
-            worktree: state.worktree, stateDir, runId: state.runId,
-            taskKey: selectedTaskKey, taskIndex: task.index, attempt: state.attempt,
-            key: createLeaseKey(stateDir),
-          })
-          state.activeTaskAttempt = {
-            schemaVersion: 2, taskKey: selectedTaskKey, taskIndex: task.index,
-            baseHead: previousHead, checklistDigest: controllerHash,
-            ignoredPathsDigest: ignoredBaseline.digest, attempt: state.attempt,
-          }
-          writeState(join(stateDir, 'run.json'), state)
+        state.activeTaskAttempt = {
+          schemaVersion: 2, taskKey: selectedTaskKey, taskIndex: task.index,
+          baseHead: previousHead, checklistDigest: controllerHash,
+          ignoredPathsDigest: digest('ordinary-worker-owns-ignored-state'), attempt: state.attempt,
         }
-        const workerCacheBaseline = recordWorkerNpmCacheBaseline({
-          worktree: state.worktree, stateDir, runId: state.runId,
-          taskIndex: task.index, attempt: state.attempt, key: createLeaseKey(stateDir),
-        })
+        writeState(join(stateDir, 'run.json'), state)
+      }
         appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', { model: model.model, effort: model.effort ?? null, paths: allowedPaths }, task, state.attempt))
         if (signal.aborted) throw abortReason(signal)
         outcome = await runWorkerWithCleanup(request)
         persistReturnedTaskOutcome(outcome, state.attempt)
-        await reconcileGeneratedWorkerCache(state.attempt, workerCacheBaseline.cacheState === 'absent', outcome)
         if (state.activeTaskAttempt) await reconcileIgnoredAttempt(state.activeTaskAttempt)
       for (let recoveryRound = 0;
           outcome.status !== 'completed' && outcome.status !== 'interrupted' && outcome.report === undefined
@@ -2064,15 +1974,7 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
           outcomeAttempt += 1
           state.attempt = outcomeAttempt
           if (state.activeTaskAttempt) {
-            const retryIgnoredBaseline = await recordWorkerIgnoredPathBaseline({
-              worktree: state.worktree, stateDir, runId: state.runId,
-              taskKey: state.activeTaskAttempt.taskKey, taskIndex: state.activeTaskAttempt.taskIndex,
-              attempt: outcomeAttempt, key: createLeaseKey(stateDir),
-            })
-            state.activeTaskAttempt = {
-              ...state.activeTaskAttempt, attempt: outcomeAttempt,
-              ignoredPathsDigest: retryIgnoredBaseline.digest,
-            }
+            state.activeTaskAttempt = { ...state.activeTaskAttempt, attempt: outcomeAttempt }
             delete state.activeTaskAttempt.ignoredArtifactTransaction
             delete state.activeTaskAttempt.terminalOutcome
           }
@@ -2083,22 +1985,17 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
             attempt: outcomeAttempt,
             instructions: [
               ...request.instructions,
-              `A prior worker ended without completing this same line: ${priorFailure}. Continue from the current worktree and decide what remains. Git ceremony and ordinary validation are advisory; the controller will clean out-of-scope generator effects and adopt valid in-scope changes. Report blocked only for a concrete unresolved implementation, scope, or authority impossibility.`,
+              `A prior worker ended without completing this same line: ${priorFailure}. Continue from the current worktree and decide what remains. You own the isolated worktree: declared paths are guidance, Git ceremony and ordinary validation are advisory, and the controller adopts repository-wide changes. Report blocked only for a concrete unresolved implementation or external authority impossibility.`,
             ],
             ...(retryModel.effort ? { effort: retryModel.effort } : {}),
           }
           if (!retryModel.effort) delete retryRequest.effort
-          const retryCacheBaseline = recordWorkerNpmCacheBaseline({
-            worktree: state.worktree, stateDir, runId: state.runId,
-            taskIndex: task.index, attempt: outcomeAttempt, key: createLeaseKey(stateDir),
-          })
           appendEvent(eventsPath, event(state.runId, 'start', task.kind === 'closure' ? 'closure' : 'worker', {
             model: retryModel.model, effort: retryModel.effort ?? null, paths: allowedPaths,
             retry: 'ordinary-recovery', recoveryRound: recoveryRound + 1,
           }, task, outcomeAttempt))
           outcome = await runWorkerWithCleanup(retryRequest)
           persistReturnedTaskOutcome(outcome, outcomeAttempt)
-          await reconcileGeneratedWorkerCache(outcomeAttempt, retryCacheBaseline.cacheState === 'absent', outcome)
           if (state.activeTaskAttempt) await reconcileIgnoredAttempt(state.activeTaskAttempt)
           if (digest(readFileSync(checklistPath, 'utf8')) !== controllerHash) throw new Error('worker altered the controlling checklist')
         }
@@ -2157,15 +2054,13 @@ async function runLeppyLoopControlled(input: LeppyLoopOptions, dependencies: Run
       }
       assertCompletedWorkerReport(outcome, task.kind === 'closure' ? 'closure worker' : 'task worker', true)
       if (await gitBranch(state.worktree) !== state.branch) throw new Error('ordinary worker changed the run branch')
-      const adopted = await adoptCompletedWorkerChanges(state.worktree, previousHead, allowedPaths, task.phase, signal)
+      const adopted = await adoptCompletedWorkerChanges(state.worktree, previousHead, task.phase, signal)
       if (adopted) {
         appendEvent(eventsPath, event(state.runId, 'recovery-done', 'recovery', {
           workerArtifact: 'completed-worker-changes', paths: adopted.paths, amended: adopted.amended, automatic: true,
         }, task, outcomeAttempt))
       }
-      const normalized = await normalizeCompletedWorkerCommits(
-        state.worktree, previousHead, checklistRelative, allowedPaths, task.phase, signal,
-      )
+      const normalized = await normalizeCompletedWorkerCommits(state.worktree, previousHead, task.phase, signal)
       const ordinaryCommits = normalized.count
       if (ordinaryCommits === 1) await assertTaskCommit(state.worktree, previousHead, state.branch)
       if (normalized.normalized) {

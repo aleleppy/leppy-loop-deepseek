@@ -258,7 +258,7 @@ describe('controller state machine', () => {
     expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).toContain('completed-worker-changes')
   }, 90_000)
 
-  it('restores out-of-scope validation side effects before and after a recovered closure worker', async () => {
+  it('preserves and adopts repository-wide changes across a recovered closure worker', async () => {
     const repo = repository('- [?] Closure: inspect `src` | paths=src\n')
     mkdirSync(join(repo.root, 'generated'), { recursive: true })
     writeFileSync(join(repo.root, 'generated', 'settings.json'), '{"stable":true}\n')
@@ -276,8 +276,8 @@ describe('controller state machine', () => {
     writeFileSync(join(first.worktree!, 'generated', 'temporary.txt'), 'transient\n')
 
     const recoveredWorker: WorkerAdapter = { async run(request) {
-      expect(readFileSync(join(request.worktree, 'generated', 'settings.json'), 'utf8')).toBe('{"stable":true}\n')
-      expect(existsSync(join(request.worktree, 'generated', 'temporary.txt'))).toBe(false)
+      expect(existsSync(join(request.worktree, 'generated', 'settings.json'))).toBe(false)
+      expect(readFileSync(join(request.worktree, 'generated', 'temporary.txt'), 'utf8')).toBe('transient\n')
       writeFileSync(join(request.worktree, 'generated', 'settings.json'), '{"mutated":true}\n')
       writeFileSync(join(request.worktree, 'generated', 'temporary.txt'), 'transient again\n')
       return completedOutcome('closure completed despite generated validation side effects')
@@ -287,10 +287,10 @@ describe('controller state machine', () => {
     }, { ...modelDeps, worker: recoveredWorker })
 
     expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
-    expect(readFileSync(join(recovered.worktree!, 'generated', 'settings.json'), 'utf8')).toBe('{"stable":true}\n')
-    expect(existsSync(join(recovered.worktree!, 'generated', 'temporary.txt'))).toBe(false)
+    expect(readFileSync(join(recovered.worktree!, 'generated', 'settings.json'), 'utf8')).toBe('{"mutated":true}\n')
+    expect(readFileSync(join(recovered.worktree!, 'generated', 'temporary.txt'), 'utf8')).toBe('transient again\n')
     expect(git(recovered.worktree!, 'status', '--short')).toBe('')
-    expect(readFileSync(join(recovered.stateDir!, 'events.jsonl'), 'utf8')).toContain('out-of-scope-validation-side-effects')
+    expect(readFileSync(join(recovered.stateDir!, 'events.jsonl'), 'utf8')).not.toContain('out-of-scope-validation-side-effects')
   }, 90_000)
 
   it('stalls a blocked closure without marking the controller row done', async () => {
@@ -545,7 +545,7 @@ describe('controller state machine', () => {
     })).rejects.toThrow('identity inspection failed closed')
   })
 
-  it('quarantines a baseline-absent ignored side effect before directly adopting the candidate', async () => {
+  it('ignores generated artifacts and directly adopts the worker candidate', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: focused validation passes\n')
     writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
     git(repo.root, 'add', '--', '.gitignore')
@@ -575,15 +575,13 @@ describe('controller state machine', () => {
     expect(state).not.toHaveProperty('activeTaskAttempt')
     expect(state).not.toHaveProperty('pendingTaskValidation')
     expect(git(state.worktree, 'rev-parse', 'HEAD')).not.toBe(candidateHead)
-    expect(existsSync(join(state.worktree, 'ignored-worker-output', 'report.json'))).toBe(false)
-    const receipt = JSON.parse(readFileSync(join(stateDir, 'worker-ignored-path-recovery', '0-1.json'), 'utf8'))
-    expect(receipt).toMatchObject({ phase: 'quarantined', baselineDigest: expect.stringMatching(/^[0-9a-f]{64}$/u) })
-    expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'report.json'), 'utf8')).toBe('{"forged":true}\n')
+    expect(readFileSync(join(state.worktree, 'ignored-worker-output', 'report.json'), 'utf8')).toBe('{"forged":true}\n')
+    expect(existsSync(join(stateDir, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
   }, 90_000)
 
-  it('recovers a legacy active attempt when its authenticated digest proves an empty ignored baseline', async () => {
+  it('recovers a legacy active attempt despite changed ignored state and nested svelte cache', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
-    writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
+    writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n.svelte-kit/\n')
     git(repo.root, 'add', '--', '.gitignore')
     git(repo.root, 'commit', '-m', 'chore: ignore worker-local output')
     const first = await runLeppyLoop(
@@ -609,9 +607,12 @@ describe('controller state machine', () => {
     rmSync(join(first.stateDir!, 'worker-ignored-path-baselines'), { recursive: true, force: true })
     mkdirSync(join(first.worktree!, 'ignored-worker-output'), { recursive: true })
     writeFileSync(join(first.worktree!, 'ignored-worker-output', 'attempt-12.log'), 'legacy worker output\n')
+    mkdirSync(join(first.worktree!, '.svelte-kit', '.svelte-check'), { recursive: true })
+    writeFileSync(join(first.worktree!, '.svelte-kit', '.svelte-check', 'manifest.json'), 'changed generated cache\n')
 
     const worker: WorkerAdapter = { async run(request) {
-      expect(existsSync(join(request.worktree, 'ignored-worker-output', 'attempt-12.log'))).toBe(false)
+      expect(readFileSync(join(request.worktree, 'ignored-worker-output', 'attempt-12.log'), 'utf8')).toBe('legacy worker output\n')
+      expect(existsSync(join(request.worktree, '.svelte-kit', '.svelte-check'))).toBe(false)
       writeFileSync(join(request.worktree, 'src', 'value.txt'), 'completed after legacy ignored recovery\n')
       git(request.worktree, 'add', '--', 'src/value.txt')
       git(request.worktree, 'commit', '-m', 'fix: complete after ignored recovery')
@@ -621,12 +622,11 @@ describe('controller state machine', () => {
       tasks: repo.tasks, syncBranch: 'main', fetch: false, recoverExistingWip: true, recoverRunId: first.runId,
     }, { ...modelDeps, worker })
     expect(recovered).toMatchObject({ status: 'completed', completedTasks: 1 })
-    const receipt = JSON.parse(readFileSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`), 'utf8'))
-    expect(receipt).toMatchObject({ phase: 'quarantined' })
-    expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'attempt-12.log'), 'utf8')).toBe('legacy worker output\n')
+    expect(existsSync(join(first.stateDir!, 'worker-ignored-path-recovery', `0-${state.attempt}.json`))).toBe(false)
+    expect(readFileSync(join(first.worktree!, 'ignored-worker-output', 'attempt-12.log'), 'utf8')).toBe('legacy worker output\n')
   }, 90_000)
 
-  it('recovers a committed legacy attempt with an exact base-ignored tracked promotion plus four additions', async () => {
+  it.skip('obsolete: ignored-baseline subset proof no longer gates ordinary worker recovery', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt,config | Done: implementation committed\n')
     mkdirSync(join(repo.root, 'config'))
     writeFileSync(join(repo.root, 'config', '.gitignore'), 'worker-output/\n')
@@ -699,7 +699,7 @@ describe('controller state machine', () => {
     }
   }, 90_000)
 
-  it('discards non-ignored out-of-scope WIP but leaves ignored bytes when legacy proof fails', async () => {
+  it.skip('obsolete: legacy ignored proof no longer rejects repository-wide worker WIP', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
     writeFileSync(join(repo.root, '.gitignore'), 'generated/\n')
     git(repo.root, 'add', '--', '.gitignore')
@@ -805,7 +805,7 @@ describe('controller state machine', () => {
     expect(JSON.parse(readFileSync(statePath, 'utf8')).activeTaskAttempt).toMatchObject({ ignoredPathsDigest: authenticatedBaseline.digest })
   }, 90_000)
 
-  it('automatically quarantines task-generated ignored npm cache while preserving bytes in private state', async () => {
+  it('allows task-generated ignored npm cache without lifecycle receipts', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: implementation committed\n')
     writeFileSync(join(repo.root, '.gitignore'), '.npm-cache/\n')
     git(repo.root, 'add', '--', '.gitignore')
@@ -821,12 +821,9 @@ describe('controller state machine', () => {
 
     const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...modelDeps, worker })
     expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
-    expect(existsSync(join(result.worktree!, '.npm-cache'))).toBe(false)
+    expect(readFileSync(join(result.worktree!, '.npm-cache', '_logs', 'task.log'), 'utf8')).toBe('task-generated cache bytes\n')
     expect(git(result.worktree!, 'status', '--porcelain')).toBe('')
-    const receipt = JSON.parse(readFileSync(join(result.stateDir!, 'worker-npm-cache-recovery.json'), 'utf8'))
-    expect(receipt).toMatchObject({ runId: result.runId, phase: 'quarantined', basis: 'baseline-absent' })
-    expect(readFileSync(join(receipt.quarantine, '_logs', 'task.log'), 'utf8')).toBe('task-generated cache bytes\n')
-    expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).toContain('"automatic":true')
+    expect(existsSync(join(result.stateDir!, 'worker-npm-cache-recovery.json'))).toBe(false)
   }, 90_000)
 
   it('does not create a detached verifier or pollute the durable worktree after advisory validation', async () => {
@@ -1665,7 +1662,7 @@ describe('controller state machine', () => {
     })
   }, 90_000)
 
-  it('records a fresh ignored baseline before ordinary autonomous recovery', async () => {
+  it('keeps ignored worker state available across autonomous recovery without receipts', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
     writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
     git(repo.root, 'add', '--', '.gitignore')
@@ -1678,7 +1675,7 @@ describe('controller state machine', () => {
         writeFileSync(join(request.worktree, 'ignored-worker-output', 'first.log'), 'first attempt\n')
         return { status: 'unavailable', output: '', error: 'worker transport unavailable' }
       }
-      expect(existsSync(join(request.worktree, 'ignored-worker-output', 'first.log'))).toBe(false)
+      expect(readFileSync(join(request.worktree, 'ignored-worker-output', 'first.log'), 'utf8')).toBe('first attempt\n')
       writeFileSync(join(request.worktree, 'src', 'value.txt'), 'done after retry\n')
       git(request.worktree, 'add', '--', 'src/value.txt')
       git(request.worktree, 'commit', '-m', 'fix: finish after no-commit retry')
@@ -1687,10 +1684,9 @@ describe('controller state machine', () => {
     const result = await runLeppyLoop({ tasks: repo.tasks, syncBranch: 'main', fetch: false }, { ...adaptiveDeps, worker })
     expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
     expect(calls).toBe(2)
-    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-1.json'))).toBe(true)
-    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-2.json'))).toBe(true)
-    const receipt = JSON.parse(readFileSync(join(result.stateDir!, 'worker-ignored-path-recovery', '0-1.json'), 'utf8'))
-    expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'first.log'), 'utf8')).toBe('first attempt\n')
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-1.json'))).toBe(false)
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-2.json'))).toBe(false)
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
   }, 90_000)
 
   it('closes an already-satisfied task without a ceremonial second worker', async () => {
@@ -2317,7 +2313,7 @@ describe('controller state machine', () => {
     expect(worker.calls.map(call => call.model)).toEqual(['fake-model', 'fallback'])
   }, 90_000)
 
-  it('records a fresh ignored baseline before an availability retry', async () => {
+  it('keeps ignored worker state across an availability retry without receipts', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
     writeFileSync(join(repo.root, '.gitignore'), 'ignored-worker-output/\n')
     git(repo.root, 'add', '--', '.gitignore')
@@ -2330,7 +2326,7 @@ describe('controller state machine', () => {
         writeFileSync(join(request.worktree, 'ignored-worker-output', 'unavailable.log'), 'first model unavailable\n')
         return { status: 'unavailable', output: '', error: '429' }
       }
-      expect(existsSync(join(request.worktree, 'ignored-worker-output', 'unavailable.log'))).toBe(false)
+      expect(readFileSync(join(request.worktree, 'ignored-worker-output', 'unavailable.log'), 'utf8')).toBe('first model unavailable\n')
       writeFileSync(join(request.worktree, 'src', 'value.txt'), 'done after availability retry\n')
       git(request.worktree, 'add', '--', 'src/value.txt')
       git(request.worktree, 'commit', '-m', 'fix: finish after availability retry')
@@ -2342,10 +2338,9 @@ describe('controller state machine', () => {
     )
     expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
     expect(calls).toBe(2)
-    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-1.json'))).toBe(true)
-    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-2.json'))).toBe(true)
-    const receipt = JSON.parse(readFileSync(join(result.stateDir!, 'worker-ignored-path-recovery', '0-1.json'), 'utf8'))
-    expect(readFileSync(join(receipt.quarantineRoot, 'ignored-worker-output', 'unavailable.log'), 'utf8')).toBe('first model unavailable\n')
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-1.json'))).toBe(false)
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-baselines', '0-2.json'))).toBe(false)
+    expect(existsSync(join(result.stateDir!, 'worker-ignored-path-recovery', '0-1.json'))).toBe(false)
   }, 90_000)
 
   it('dry-run selects one literal line without starting a worker or creating a worktree', async () => {
@@ -2801,7 +2796,7 @@ describe('controller state machine', () => {
     }
   }, 90_000)
 
-  it('removes an out-of-scope npm cache and adopts preserved scoped WIP in the same job', async () => {
+  it('keeps ignored npm cache and adopts repository-wide WIP in the same job', async () => {
     const repo = repository('- [ ] Change `src/value.txt` | paths=src/value.txt | Done: value says done\n')
     const issuedAt = Date.now() - 1_000
     const expiresAt = Date.now() + 60_000
@@ -2833,10 +2828,10 @@ describe('controller state machine', () => {
       tasks: repo.tasks, syncBranch: 'main', fetch: false, lifecycleAuthority: authority(1),
     }, { ...modelDeps, worker })
     expect(result).toMatchObject({ status: 'completed', completedTasks: 1 })
-    expect(existsSync(join(result.worktree!, '.npm-cache'))).toBe(false)
+    expect(readFileSync(join(result.worktree!, '.npm-cache', '_logs', 'attempt.log'), 'utf8')).toBe('preserved cache bytes\n')
     expect(readFileSync(join(result.worktree!, 'src', 'value.txt'), 'utf8')).toBe('done\n')
     expect(workerCalls).toBe(1)
-    expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).toContain('out-of-scope-validation-side-effects')
+    expect(readFileSync(join(result.stateDir!, 'events.jsonl'), 'utf8')).not.toContain('out-of-scope-validation-side-effects')
   }, 90_000)
 
   it.skip('obsolete: ordinary cache side effects are removed in the same job', async () => {

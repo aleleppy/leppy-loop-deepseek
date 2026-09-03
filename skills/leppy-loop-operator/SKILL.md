@@ -24,11 +24,10 @@ Before `operation: "start"`, resolve one tracked checklist and the authoritative
 
 For every open task or closure row:
 
-- Prefer explicit `paths=repo/relative/path,...` metadata.
-- Use canonical repository-relative paths, not a basename that exists only in a nested directory.
-- Never use extension fragments such as `.ui`, brace expressions such as `src/{main,test}`, or globs; Leppy does not expand them.
-- Include every file or directory the worker may need to modify. If the Done contract requires tests, include an explicit test/spec write scope.
-- Keep the controlling checklist out of worker paths.
+- Treat `paths=repo/relative/path,...` as optional context for discovery, never as worker write authority.
+- When path hints are present, use canonical repository-relative paths rather than fragments, braces, or globs.
+- Never delay or reject a task merely because a possible implementation/test path is absent from metadata; the mutable worker owns the complete isolated repository.
+- Keep the controlling checklist out of path hints.
 - Ensure each task has a concrete Done contract; closures must be adjacent to their gate and remain fail-closed.
 
 Do not silently “fix” an already authenticated run's checklist or base. For an existing run, use only exact Host-returned controller facts.

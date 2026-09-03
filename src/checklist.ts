@@ -180,17 +180,6 @@ function unsupportedPathSyntax(path: string): string | undefined {
   return undefined
 }
 
-function requestsTestScope(task: ChecklistTask): boolean {
-  return /\b(?:test|tests|teste|testes|spec|specs)\b/iu.test(`${task.text} ${task.metadata.done ?? ''}`)
-}
-
-function scopeMayContainTests(path: string): boolean {
-  const normalized = path.replaceAll('\\', '/')
-  if (/(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:spec|test)\.[^/]+$/iu.test(normalized)) return true
-  const segments = normalized.split('/').filter(Boolean)
-  return !/\.[A-Za-z0-9_-]{1,12}$/u.test(normalized) && segments.length <= 2 && !segments.includes('main')
-}
-
 export function lintChecklist(parsed: ParsedChecklist, options: ChecklistLintOptions = {}): LintDiagnostic[] {
   const diagnostics: LintDiagnostic[] = []
   if (parsed.tasks.length === 0) diagnostics.push(diagnostic('empty-corpus', 'Checklist contains no executable checkbox lines.'))
@@ -205,13 +194,6 @@ export function lintChecklist(parsed: ParsedChecklist, options: ChecklistLintOpt
     }
     if (task.kind === 'task' && task.mark !== 'x' && (task.metadata.done === undefined || task.metadata.done.trim() === '')) {
       diagnostics.push(diagnostic('missing-done', 'Open task requires a non-empty Done: contract.', task))
-    }
-    if (task.kind !== 'gate' && task.kind !== 'human' && task.mark !== 'x' && task.metadata.paths.length === 0) {
-      diagnostics.push(diagnostic('missing-paths', 'Open worker line requires paths=... or repo-relative paths in backticks.', task))
-    }
-    if (task.kind !== 'gate' && task.kind !== 'human' && task.mark !== 'x'
-      && requestsTestScope(task) && !task.metadata.paths.some(scopeMayContainTests)) {
-      diagnostics.push(diagnostic('missing-test-scope', 'Task requires tests but no declared write scope can contain a test/spec file.', task))
     }
     for (const path of task.metadata.paths) {
       const unsupported = unsupportedPathSyntax(path)

@@ -66,19 +66,24 @@ describe('checklist parser and lint', () => {
     ]))
   })
 
-  it('rejects extension fragments, brace scopes, abbreviated inferred basenames and missing test write scope', () => {
+  it('rejects malformed optional path hints without requiring a test write scope', () => {
     const root = mkdtempSync(join(tmpdir(), 'leppy-strict-paths-'))
     mkdirSync(join(root, 'mod', 'src', 'main'), { recursive: true })
     writeFileSync(join(root, 'mod', 'src', 'main', 'Page.java'), 'class Page {}\n')
     const parsed = parseChecklist('- [ ] Update `mod/src/main/Page.java`/`Event.java` using grammar `.ui` and update tests | Done: tests pass\n- [?] Closure: audit `core/{main,test}/`\n')
     const codes = lintChecklist(parsed, { repoRoot: root }).map(item => item.code)
     expect(codes).toEqual(expect.arrayContaining([
-      'ambiguous-inferred-path', 'unsupported-path-syntax', 'missing-test-scope',
+      'ambiguous-inferred-path', 'unsupported-path-syntax',
     ]))
     expect(codes.filter(code => code === 'unsupported-path-syntax').length).toBeGreaterThanOrEqual(2)
   })
 
-  it('accepts explicit new source and test paths when their repository parent exists', () => {
+  it('accepts tasks without path declarations because workers own the isolated repository', () => {
+    const parsed = parseChecklist('- [ ] Add implementation and tests | Done: tests pass\n')
+    expect(lintChecklist(parsed)).toEqual([])
+  })
+
+  it('accepts optional explicit source and test path hints when their repository parent exists', () => {
     const root = mkdtempSync(join(tmpdir(), 'leppy-explicit-paths-'))
     mkdirSync(join(root, 'src'))
     const parsed = parseChecklist('- [ ] Add implementation and tests | Done: tests pass | paths=src/new.ts,src/new.test.ts\n')

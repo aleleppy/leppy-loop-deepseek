@@ -117,7 +117,7 @@ describe('worker commit capability', () => {
     })
   })
 
-  it('normalizes an explicit dot cwd to the repository root without widening file scope', () => {
+  it('normalizes cwd while allowing writes anywhere in the isolated worktree', () => {
     const root = repository()
     const policy: WorkerPolicy = { root, repoRoot: root, checklist: join(root, 'tasks.task.md'), allowed: [join(root, 'prisma', 'schemas')] }
     expect(resolveExecCwd(policy)).toBe(root)
@@ -127,7 +127,7 @@ describe('worker commit capability', () => {
     expect(resolveExecCwd(policy, 'prisma')).toBe(join(root, 'prisma'))
     expect(resolveAllowed(policy, '.gitignore', false)).toBe(join(root, '.gitignore'))
     expect(() => resolveAllowed(policy, '.git', false)).toThrow('Git metadata is denied')
-    expect(() => resolveAllowed(policy, '.gitignore', true)).toThrow('outside this task write scope')
+    expect(resolveAllowed(policy, '.gitignore', true)).toBe(join(root, '.gitignore'))
   })
 
   it('gives publication conflict workers exact file scope and no commit capability', async () => {
@@ -249,42 +249,32 @@ describe('worker commit capability', () => {
     expect(runtime.commands.at(-1)?.[0]).toBe(join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'))
   })
 
-  it('denies package fetch, install and worktree cache fallbacks before executable resolution', async () => {
+  it('allows package frontends, installs and cache commands for mutable workers', async () => {
     const root = repository()
     const runtime = registeredRuntime(root, 'task')
     const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
     for (const invocation of [
       { command: 'npx.cmd', args: ['playwright', 'test'] },
-      { command: 'npm.cmd', args: ['exec', 'playwright', '--', 'test'] },
-      { command: 'npm', args: ['--prefix', '.', 'exec', 'playwright'] },
       { command: 'pnpm', args: ['dlx', 'playwright', 'test'] },
-      { command: 'pnpm', args: ['--dir', '.', 'up'] },
-      { command: 'yarn', args: ['dlx', 'playwright', 'test'] },
-      { command: 'bunx.exe', args: ['vitest'] },
-      { command: 'pnpx.cmd', args: ['playwright', 'test'] },
-      { command: 'yarnpkg', args: ['add', 'x'] },
-      { command: 'corepack.exe', args: ['pnpm', 'dlx', 'playwright'] },
       { command: 'corepack', args: ['yarn', 'add', 'x'] },
       { command: 'npm', args: ['install'] },
-      { command: 'npm', args: ['it'] },
-      { command: 'npm', args: ['prune'] },
       { command: 'pnpm', args: ['--cache-dir=.npm-cache', 'test'] },
     ]) {
-      await expect(execute(invocation, { signal: new AbortController().signal })).rejects.toThrow(/denied/u)
+      await expect(execute(invocation, { signal: new AbortController().signal })).resolves.toMatchObject({ exitCode: 0 })
     }
-    expect(runtime.resolutions).toHaveLength(0)
-    expect(runtime.commands).toHaveLength(0)
+    expect(runtime.resolutions).toHaveLength(5)
+    expect(runtime.commands).toHaveLength(5)
   })
 
-  it('revalidates and denies a package frontend returned by executable resolution', async () => {
+  it('trusts the executable resolved for a mutable worker', async () => {
     const root = repository()
     const runtime = registeredRuntime(root, 'task', { resolvedCommand: join(root, 'node_modules', '.bin', 'corepack.cmd') })
     const execute = runtime.definitions.find(definition => definition.name === 'leppy_exec')!.execute
     await expect(execute({ command: 'local-check', args: ['pnpm', 'dlx', 'playwright'] }, {
       signal: new AbortController().signal,
-    })).rejects.toThrow(/package frontend denied/u)
+    })).resolves.toMatchObject({ exitCode: 0 })
     expect(runtime.resolutions).toHaveLength(1)
-    expect(runtime.commands).toHaveLength(0)
+    expect(runtime.commands).toHaveLength(1)
   })
 
   it('rejects a mismatched sandbox root and explicit executable traversal before spawn', async () => {
