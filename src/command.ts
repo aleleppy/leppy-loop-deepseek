@@ -109,6 +109,8 @@ export interface LeppyLoopControlResult {
   task?: string
   pendingValidation?: string
   branch?: string
+  tasks?: string
+  syncBranch?: string
 }
 
 interface JobRecord {
@@ -116,6 +118,8 @@ interface JobRecord {
   agent: Agent
   repoRoot: string
   runId: string
+  tasks: string
+  syncBranch: string
 }
 
 export interface LeppyLoopRuntime {
@@ -218,19 +222,28 @@ async function authenticatedController(runtime: LeppyLoopRuntime, cwd: string, r
   return controller
 }
 
+function technicalArguments(
+  args: LeppyLoopControlArguments,
+  cwd: string,
+  repoRoot: string,
+  controller?: AuthenticatedController,
+): { tasks: string; syncBranch: string } {
+  if (controller) {
+    const tasks = resolve(repoRoot, controller.checklistRelative)
+    if (args.tasks !== undefined && resolve(cwd, args.tasks) !== tasks) throw new Error('tool checklist does not match the human-authorized run')
+    if (args.syncBranch !== undefined && args.syncBranch !== controller.syncBranch) throw new Error('tool base does not match the human-authorized run')
+    return { tasks, syncBranch: controller.syncBranch }
+  }
+  return { tasks: requireString(args.tasks, 'tasks'), syncBranch: requireString(args.syncBranch, 'syncBranch') }
+}
+
 function validateTechnicalArguments(
   args: LeppyLoopControlArguments,
   cwd: string,
   repoRoot: string,
   controller?: AuthenticatedController,
 ): void {
-  if (args.operation === 'stop') return
-  const tasks = requireString(args.tasks, 'tasks')
-  const syncBranch = requireString(args.syncBranch, 'syncBranch')
-  if (controller) {
-    if (resolve(cwd, tasks) !== resolve(repoRoot, controller.checklistRelative)) throw new Error('tool checklist does not match the human-authorized run')
-    if (syncBranch !== controller.syncBranch) throw new Error('tool base does not match the human-authorized run')
-  }
+  if (args.operation !== 'stop') void technicalArguments(args, cwd, repoRoot, controller)
 }
 
 async function persistLifecycleAuthority(runtime: LeppyLoopRuntime, repoRoot: string, runId: string, authority: LifecycleAuthority): Promise<void> {
@@ -276,12 +289,7 @@ function controllerOptions(
   grant: ReturnType<HumanGrantStore['reserve']>['grant'],
   controller?: AuthenticatedController,
 ): LeppyLoopOptions {
-  const tasks = requireString(args.tasks, 'tasks')
-  const syncBranch = requireString(args.syncBranch, 'syncBranch')
-  if (controller) {
-    if (resolve(cwd, tasks) !== resolve(repoRoot, controller.checklistRelative)) throw new Error('tool checklist does not match the human-authorized run')
-    if (syncBranch !== controller.syncBranch) throw new Error('tool base does not match the human-authorized run')
-  }
+  const { tasks, syncBranch } = technicalArguments(args, cwd, repoRoot, controller)
   const recovery = recoveryOf(args)
   const options: LeppyLoopOptions = {
     tasks,
@@ -409,7 +417,7 @@ function startControllerJob(
     runtime.activeRepositories.delete(repoRoot)
     throw error
   }
-  runtime.jobs.push({ id, agent, repoRoot, runId })
+  runtime.jobs.push({ id, agent, repoRoot, runId, tasks: resolve(repoRoot, options.tasks), syncBranch: options.syncBranch })
   return id
 }
 
@@ -434,6 +442,8 @@ export async function executeLeppyLoopControl(
       )
       return {
         operation: 'status', status: job.status, jobStatus: job.status, runId: active.runId, jobId: String(active.id),
+        tasks: selected ? resolve(repoRoot, selected.checklistRelative) : active.tasks,
+        syncBranch: selected?.syncBranch ?? active.syncBranch,
         ...((job as { detail?: string }).detail ? { detail: (job as { detail: string }).detail } : {}),
         ...(selected ? {
           completedTasks: selected.completedTasks, attempt: selected.attempt, branch: selected.branch,
@@ -454,6 +464,7 @@ export async function executeLeppyLoopControl(
     return selected ? {
       operation: 'status', status: durableStatus!, runId: selected.runId,
       completedTasks: selected.completedTasks, attempt: selected.attempt, branch: selected.branch,
+      tasks: resolve(repoRoot, selected.checklistRelative), syncBranch: selected.syncBranch,
       ...(durableDetail ? { detail: durableDetail } : {}),
       ...(selected.currentTask === undefined ? {} : { currentTask: selected.currentTask }),
       ...(selected.openTask ? { task: selected.openTask.text } : {}),
@@ -492,6 +503,7 @@ export async function executeLeppyLoopControl(
     : undefined
   if (args.operation === 'stop' && (!record || record.runId !== runId)) throw new Error(`no active background controller job exists for run ${runId}`)
   validateTechnicalArguments(args, cwd, repoRoot, controller)
+  const resolvedTechnical = args.operation === 'stop' ? undefined : technicalArguments(args, cwd, repoRoot, controller)
   if (args.operation === 'stop') {
     const stopPermit = runtime.grants.permits(agent, repoRoot).find(permit => permit.runId === runId)
     if (!stopPermit) throw new Error(`no live lifecycle authority exists for run ${runId}`)
@@ -518,7 +530,7 @@ export async function executeLeppyLoopControl(
     ? workerIgnoredBaselineBridgeIdentity(controller?.detail, controller?.activeTaskAttempt)
     : undefined
   const ignoredBaselineRequestDigest = ignoredBaselineRepairIdentity === undefined ? undefined : createHash('sha256').update(JSON.stringify({
-    tasks: resolve(cwd, requireString(args.tasks, 'tasks')), syncBranch: requireString(args.syncBranch, 'syncBranch'),
+    tasks: resolvedTechnical!.tasks, syncBranch: resolvedTechnical!.syncBranch,
     recovery: recoveryOf(args), taskMatch: args.taskMatch ?? null, publish: args.publish === true,
     publicationTarget: args.publicationTarget ?? null, fetch: args.fetch !== false,
     workerPolicy: args.workerPolicy ?? 'adaptive',
@@ -653,8 +665,8 @@ function toolDefinition(ctx: Context, runtime: LeppyLoopRuntime) {
     description: 'Durable Leppy controller interface. Use status before any availability claim; never infer a job id or use subagents/generic jobs. Start needs a fresh /leppy-loop permit; continue uses only the same session-bound persisted lifecycle authority.',
     parameters: {
       operation: { type: 'string', enum: ['preflight', 'start', 'continue', 'status'], required: true },
-      tasks: { type: 'string', description: 'Resolved tracked checklist path for start/continue.' },
-      syncBranch: { type: 'string', description: 'Resolved authoritative Git base for start/continue.' },
+      tasks: { type: 'string', description: 'Resolved tracked checklist path. Required for preflight/start; optional assertion for continue because the authenticated controller supplies it.' },
+      syncBranch: { type: 'string', description: 'Authoritative Git base. Required for preflight/start; optional assertion for continue because the authenticated controller supplies it.' },
       runId: { type: 'string', description: 'Exact authenticated run for continue/status/stop.' },
       taskMatch: { type: 'string', description: 'Optional literal row selector for a new run.' },
       recovery: { type: 'string', enum: ['resume', 'retry-gate', 'repair-gate'], description: 'Technical recovery transition selected inside the bounded lifecycle.' },
@@ -670,6 +682,7 @@ function toolDefinition(ctx: Context, runtime: LeppyLoopRuntime) {
           operation: { type: 'string', required: true }, status: { type: 'string', required: true },
           runId: { type: 'string' }, jobId: { type: 'string' }, jobStatus: { type: 'string' }, detail: { type: 'string' }, completedTasks: { type: 'number' },
           currentTask: { type: 'number' }, attempt: { type: 'number' }, task: { type: 'string' }, branch: { type: 'string' },
+          tasks: { type: 'string' }, syncBranch: { type: 'string' },
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],

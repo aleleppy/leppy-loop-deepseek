@@ -534,6 +534,17 @@ describe('grant-validated background controller tool', () => {
     expect(jobs.starts).toHaveLength(0)
   })
 
+  it('still requires checklist and base identity for every new-run preflight or start', async () => {
+    const owner = agent('new-run-identity-agent')
+    const rt = runtime()
+    await expect(executeLeppyLoopControl(context(), rt, owner, {
+      operation: 'preflight', tasks: 'examples/feature.task.md',
+    })).rejects.toThrow('requires syncBranch')
+    await expect(executeLeppyLoopControl(context(), rt, owner, {
+      operation: 'start', syncBranch: 'origin/main',
+    })).rejects.toThrow('requires tasks')
+  })
+
   it('reports a durable running controller as orphaned when no owned Host job exists', async () => {
     const owner = agent('session-a')
     const value = await executeLeppyLoopControl(context(), runtime({
@@ -545,7 +556,10 @@ describe('grant-validated background controller tool', () => {
         },
       })],
     }), owner, { operation: 'status', runId: '44c85fb806c6' })
-    expect(value).toMatchObject({ status: 'orphaned', runId: '44c85fb806c6', detail: expect.stringContaining('no session-owned Host job') })
+    expect(value).toMatchObject({
+      status: 'orphaned', runId: '44c85fb806c6', detail: expect.stringContaining('no session-owned Host job'),
+      tasks: resolve(cwd, 'examples/feature.task.md'), syncBranch: 'origin/plugins',
+    })
     expect(value).not.toHaveProperty('jobId')
   })
 
@@ -566,7 +580,7 @@ describe('grant-validated background controller tool', () => {
     })).rejects.toThrow('belongs to another session')
   })
 
-  it('hydrates the same session-bound lifecycle permit and continues after a Host restart', async () => {
+  it('derives authenticated checklist and base when continuing after a Host restart', async () => {
     const owner = agent('session-a')
     const durable = controller({
       lifecycleAuthority: {
@@ -581,10 +595,13 @@ describe('grant-validated background controller tool', () => {
       run: async options => { observed = options; return { ...completed, runId: durable.runId } },
     })
     const value = await executeLeppyLoopControl(context(jobs), rt, owner, {
-      operation: 'continue', runId: durable.runId, tasks: durable.checklistRelative, syncBranch: durable.syncBranch,
+      operation: 'continue', runId: durable.runId,
     })
     expect(value).toMatchObject({ status: 'running', runId: durable.runId, jobId: 'leppy-loop-1' })
-    expect(observed?.lifecycleAuthority).toMatchObject({ sessionId: 'session-a', transitions: 2, allowPublication: true })
+    expect(observed).toMatchObject({
+      tasks: resolve(cwd, durable.checklistRelative), syncBranch: durable.syncBranch,
+      lifecycleAuthority: { sessionId: 'session-a', transitions: 2, allowPublication: true },
+    })
     await expect(jobs.starts[0]!.hooks.done).resolves.toMatchObject({ status: 'completed' })
   })
 
@@ -1149,6 +1166,35 @@ describe('grant-validated background controller tool', () => {
     expect(value.runId).not.toBe('606090827cf1')
   })
 
+  it('keeps derived existing-run identity in live status when durable inspection becomes unavailable', async () => {
+    const owner = agent('active-recovery-status-agent')
+    const jobs = new FakeJobs()
+    const durable = controller({
+      lifecycleAuthority: {
+        sessionId: 'active-recovery-status-agent', allowPublication: false, maxIterations: 64, maxRepairCycles: 3,
+        maxTransitions: 16, transitions: 1, issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
+      },
+    })
+    let inspections = 0
+    const rt = runtime({
+      run: async () => await new Promise<RunResult>(() => {}),
+      inspectControllers: async () => {
+        inspections += 1
+        if (inspections === 1) return [durable]
+        throw new Error('transient durable inspection failure')
+      },
+    })
+    const started = await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: durable.runId, publish: false,
+    })
+    const value = await executeLeppyLoopControl(context(jobs), rt, owner, { operation: 'status', runId: durable.runId })
+    expect(started).toMatchObject({ status: 'running', runId: durable.runId })
+    expect(value).toMatchObject({
+      status: 'running', runId: durable.runId, jobId: 'leppy-loop-1',
+      tasks: resolve(cwd, durable.checklistRelative), syncBranch: durable.syncBranch,
+    })
+  })
+
   it('rejects a duplicate live controller before repository-lock races', async () => {
     const owner = agent('duplicate-agent')
     const jobs = new FakeJobs()
@@ -1192,7 +1238,11 @@ describe('grant-validated background controller tool', () => {
     issueGrant(rt, owner, { runId: '44c85fb806c6' })
     await expect(executeLeppyLoopControl(context(), rt, owner, {
       operation: 'continue', recovery: 'resume', runId: '44c85fb806c6',
-      tasks: 'examples/feature.task.md', syncBranch: 'attacker/base',
+      tasks: 'attacker.task.md',
+    })).rejects.toThrow('tool checklist does not match')
+    await expect(executeLeppyLoopControl(context(), rt, owner, {
+      operation: 'continue', recovery: 'resume', runId: '44c85fb806c6',
+      syncBranch: 'attacker/base',
     })).rejects.toThrow('tool base does not match')
   })
 

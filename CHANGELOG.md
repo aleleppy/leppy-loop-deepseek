@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [0.3.47] - 2026-09-02
+
+### Changed
+
+- Existing-run `continue` calls now derive the checklist path and authoritative base directly from the authenticated controller. Callers need only the exact `runId` and lifecycle decision; optional `tasks` or `syncBranch` values are treated as assertions and still fail closed on mismatch.
+- Read-only `status` now returns the exact resolved `tasks` and `syncBranch` facts so operators never have to infer hidden controller identity. A live Host job retains that derived identity when durable controller inspection is transiently unavailable.
+
 ## [0.3.46] - 2026-09-02
 
 ### Changed
