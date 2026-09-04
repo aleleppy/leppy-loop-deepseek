@@ -355,7 +355,7 @@ async function scheduleLifecycleFollowup(runtime: LeppyLoopRuntime, agent: Agent
         mode: 'lifecycle', allowPublication: permit.allowPublication,
         naturalLanguage: recoverable
           ? 'Continue the already authorized lifecycle autonomously from its exact durable failure. Do not ask for another slash command.'
-          : 'The local lifecycle completed. Publish only if the human conversation requested delivery as a pull request; otherwise report local completion.',
+          : 'The lifecycle completed without a pull request. Ask the human exactly one concise question in their language: whether they want you to open the pull request. Do not call the controller or publish until the human answers.',
       }
       agent.followup(createUserMessage({
         content: [{ type: 'text', text: lifecyclePrompt(controller, intent) }],

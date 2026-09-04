@@ -652,6 +652,30 @@ describe('grant-validated background controller tool', () => {
     expect(followup).toHaveBeenCalled()
   })
 
+  it('asks one concise PR question after an authorized local completion', async () => {
+    const followup = vi.fn()
+    const owner = agent('publication-question-agent', followup)
+    const jobs = new FakeJobs()
+    let settled = false
+    const activeController = controller({ runId: 'run-web' })
+    const completedController = controller({ runId: 'run-web', status: 'completed', completedTasks: 3 })
+    delete completedController.openTask
+    const rt = runtime({
+      inspectControllers: async () => [settled ? completedController : activeController],
+      run: async () => { settled = true; return completed },
+    })
+    issueGrant(rt, owner, { runId: 'run-web', allowPublication: true })
+
+    await executeLeppyLoopControl(context(jobs), rt, owner, {
+      operation: 'continue', runId: 'run-web', tasks: 'examples/feature.task.md', syncBranch: 'origin/plugins', fetch: false,
+    })
+    await jobs.starts[0]!.hooks.done
+    await vi.waitFor(() => { expect(followup).toHaveBeenCalledOnce() }, { timeout: 2_000 })
+    const prompt = JSON.stringify(followup.mock.calls[0]?.[0])
+    expect(prompt).toContain('Ask the human exactly one concise question in their language')
+    expect(prompt).toContain('Do not call the controller or publish until the human answers')
+  })
+
   it('keeps read-only status available while the durable recovery circuit is open', async () => {
     const owner = agent('blocked-status-agent')
     const blocked = controller({

@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.3.53] - 2026-09-03
+
+### Changed
+
+- When an authorized lifecycle completes without a pull request, Leppy now asks the human exactly one concise question in their language: whether they want the PR opened. It waits for the answer instead of guessing or publishing immediately. Explicitly local-only lifecycles remain silent and cannot be widened autonomously.
+
 ## [0.3.52] - 2026-09-03
 
 ### Changed
